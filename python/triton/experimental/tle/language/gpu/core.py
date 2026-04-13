@@ -51,7 +51,6 @@ def alloc(
     dtype: tl.dtype,
     layout: Optional[tle.shared_layout] = None,
     scope: tle.scope = tle.smem,
-    init_value: Optional[tl.tensor] = None,
     nv_mma_shared_layout=True,
     _semantic=None,
 ) -> tle.buffered_tensor:
@@ -155,11 +154,7 @@ def alloc(
             layout_handle = layout.to_ir(_semantic.builder)
 
         if storage == tle.smem:
-            if init_value is not None:
-                mutable_ty = _semantic.builder.get_memdesc_type(full_shape, elem_type, layout_handle, "smem")
-                tensor_handle = _semantic.builder.create_local_alloc(mutable_ty, init_value.handle)
-            else:
-                tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle)
+            tensor_handle = _semantic.builder.create_local_alloc(full_shape, elem_type, layout_handle)
         else:
             raise ValueError(f"Storage type {storage} not yet supported")
 

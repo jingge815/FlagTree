@@ -15,9 +15,7 @@ add_triton_library(TritonTLETransforms
   TleLowerInsertTile.cpp
   TleLowerTmaCopy.cpp
   ConvertArgToMemDesc.cpp
-  RemoveRedundantCopy.cpp
   DSLRegionInline.cpp
-  TleUtility.cpp
 
   DEPENDS
   TritonTLETransformsIncGen

@@ -7,10 +7,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Value.h"
 #include "triton/Dialect/Triton/IR/Types.h"
-#include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include <type_traits>
-
-namespace ttg = mlir::triton::gpu;
 
 /* --------------- Definitions --------------- */
 
@@ -28,11 +25,6 @@ template <typename T> struct ProtocolT : public Protocol {
 
 namespace signature {
 struct RankedTensorPattern final : public ProtocolT<RankedTensorType> {
-  static SmallVector<Value> apply(TritonOpBuilder &builder, TypeRange &tgts,
-                                  TypedValue<E> src);
-};
-
-struct MemDescPattern final : public ProtocolT<ttg::MemDescType> {
   static SmallVector<Value> apply(TritonOpBuilder &builder, TypeRange &tgts,
                                   TypedValue<E> src);
 };
@@ -83,8 +75,8 @@ template <typename P, typename... Ps> struct ProtocolPatternT<P, Ps...> {
 };
 
 using SignaturePattern =
-    ProtocolPatternT<signature::RankedTensorPattern, signature::MemDescPattern,
-                     signature::PointerPattern, IntegerPattern, FloatPattern>;
+    ProtocolPatternT<signature::RankedTensorPattern, signature::PointerPattern,
+                     IntegerPattern, FloatPattern>;
 using ReturnPattern =
     ProtocolPatternT<ret::LLVMStructurePattern, IntegerPattern, FloatPattern>;
 
