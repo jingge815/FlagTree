@@ -290,7 +290,7 @@ third_party/Ascend/backend/spec/triton/compiler/compiler.py
 主干 `python/triton/compiler/__init__.py` 中有：
 ```python
 from triton.runtime.driver import spec_path
- 
+
 spec_path(__path__)
 ```
 
@@ -564,7 +564,7 @@ from ._utils import TRITON_MAX_TENSOR_NUMEL, validate_block_shape, get_primitive
 - `load_tensor_descriptor`
 - `store_tensor_descriptor`
 - `gather`
-- 
+-
 第五步：
 确认这些新增原语是否需要：
 - `@builtin`
