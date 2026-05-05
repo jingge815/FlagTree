@@ -9,7 +9,10 @@ from typing import Dict
 from .jit import KernelInterface
 from .errors import OutOfResources
 from .driver import driver
+from .adjust_kernel_param import auto_adjust_block_sizes
 
+# flagtree: aabs
+adjust_block_size: bool = os.getenv("FLAGTREE_AABS", True)
 
 class Autotuner(KernelInterface):
 
@@ -100,6 +103,7 @@ class Autotuner(KernelInterface):
         self.num_warmups = warmup
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
+        self.seen_tuned_metas = {}  # flagtree: deduplicate tuned meta
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -160,6 +164,18 @@ class Autotuner(KernelInterface):
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
         current = dict(meta, **config.all_kwargs())
+        # flagtree: aabs
+        if adjust_block_size:
+            def _unwrap_to_jitfunction(fn):
+                from triton.runtime.jit import JITFunction
+                while not isinstance(fn, JITFunction):
+                    fn = fn.fn
+                return fn
+            auto_adjust_block_sizes(self.nargs, _unwrap_to_jitfunction(self.fn), self.configs, current, config)
+        # flagtree: use self.seen_tuned_metas to deduplicate tuned meta
+        meta_key = tuple(sorted(current.items()))
+        if meta_key in self.seen_tuned_metas:
+            return self.seen_tuned_metas[meta_key]
         full_nargs = {**self.nargs, **current}
 
         def kernel_call():
