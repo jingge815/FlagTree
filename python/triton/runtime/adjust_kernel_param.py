@@ -821,7 +821,7 @@ def auto_adjust_block_sizes(nargs, fn, configs, current, config):
             import torch
             nargs_parts = list[str]()
             for k, v in nargs.items():
-                if support_tma and isinstance(v, (torch.Tensor, TensorDescriptor)):
+                if isinstance(v, torch.Tensor) or (support_tma and isinstance(v, TensorDescriptor)):
                     nargs_parts.append(k)
                 else:
                     nargs_parts.append(f'{k}={v}')
