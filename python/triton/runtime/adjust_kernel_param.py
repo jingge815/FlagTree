@@ -435,7 +435,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                 #   'offset_bn':.., 'offset_k':.., 'a_desc':.., 'b_desc':.., 'c_desc':..,
                 #   'acc':.., 'a':.., 'b':.., 'rm':.., 'rn':.., 'ram':.., 'rbn':..,
                 #   'prev_multiple':.., 'rk':.., 'mask_k':.., 'offsets':.., 'mask':..}
-                if var_name not in self.var_all_definitions: # or var_name.startswith("pid"):  # OK
+                if var_name not in self.var_all_definitions:
                     continue
                 bs_names_set = self._extract_arange_bs_recursive(var_name)
                 ts_names_set, _ = self.get_dependencies(var_name)
