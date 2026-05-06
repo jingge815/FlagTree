@@ -33,7 +33,7 @@ class Autotuner(KernelInterface):
         else:
             self.configs = configs
         if self.configs and (len(self.configs) > 0):
-            self.shared_config_pre_hook = self.configs[0].pre_hook  # flagtree: for aabs
+            self.shared_config_pre_hook = self.configs[0].pre_hook  # flagtree aabs
         self.keys = key
         self.cache: Dict[Tuple, Config] = {}
         self.arg_names = arg_names
@@ -94,7 +94,7 @@ class Autotuner(KernelInterface):
         self.num_warmups = warmup
         self.num_reps = rep
         self.use_cuda_graph = use_cuda_graph
-        self.seen_tuned_metas = {}  # flagtree: deduplicate tuned meta
+        self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -142,7 +142,7 @@ class Autotuner(KernelInterface):
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
         current = dict(meta, **config.all_kwargs())
-        # flagtree: aabs
+        # flagtree aabs: auto_adjust_block_sizes
         if knobs.autotuning.adjust_block_size:
             def _unwrap_to_jitfunction(fn):
                 from triton.runtime.jit import JITFunction
@@ -150,10 +150,9 @@ class Autotuner(KernelInterface):
                     fn = fn.fn
                 return fn
             auto_adjust_block_sizes(self.nargs, _unwrap_to_jitfunction(self.fn), self.configs, current, config)
-        # flagtree: use self.seen_tuned_metas to deduplicate tuned meta
         meta_key = tuple(sorted(current.items()))
         if meta_key in self.seen_tuned_metas:
-            return self.seen_tuned_metas[meta_key]
+            return self.seen_tuned_metas[meta_key]  # flagtree aabs: deduplicate tuned meta
         full_nargs = {**self.nargs, **current}
 
         def kernel_call():
@@ -181,7 +180,7 @@ class Autotuner(KernelInterface):
                 print(f"Autotuning failed with {e}")
             rett = [float("inf"), float("inf"), float("inf")]
 
-        self.seen_tuned_metas[meta_key] = rett  # flagtree: deduplicate tuned meta
+        self.seen_tuned_metas[meta_key] = rett  # flagtree aabs: deduplicate tuned meta
         return rett
 
     def check_disk_cache(self, tuning_key, configs, bench_fn):
@@ -242,7 +241,7 @@ class Autotuner(KernelInterface):
                 pruned_configs = self.prune_configs(kwargs)
 
                 def benchmark():
-                    self.seen_tuned_metas = {}  # flagtree: deduplicate tuned meta
+                    self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
                     bench_start = time.time()
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
@@ -265,14 +264,6 @@ class Autotuner(KernelInterface):
             print(f"Triton autotuning for function {self.base_fn.__name__},\nwith key as {key},\n"
                   f"finished after {self.bench_time:.2f}s,\nbest config selected: {self.best_config};")
 
-        # flagtree run: TODO
-        config_kwargs = config.all_kwargs()
-        nargs_with_kwargs = {**self.nargs, **kwargs}
-        if "N" in nargs_with_kwargs and "BLOCK_N" in config_kwargs:
-            N = nargs_with_kwargs["N"]
-            BLOCK_N = config_kwargs["BLOCK_N"]
-            print(f"#### flagtree run: N={N}, BLOCK_N={BLOCK_N}")
-
         if config.pre_hook is not None:
             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
             config.pre_hook(full_nargs)
@@ -285,7 +276,7 @@ class Autotuner(KernelInterface):
         return ret
 
     def prune_configs(self, kwargs: Dict) -> List[Config]:
-        # FIXME: use deepcopy to prevent modification of the original configs
+        # flagtree aabs: use deepcopy to prevent modification of the original configs
         import copy
         pruned_configs = copy.deepcopy(self.configs)
         # pruned_configs = self.configs
