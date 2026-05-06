@@ -1,7 +1,7 @@
 import ast
 import inspect
+from collections import deque
 from triton import knobs
-
 
 # ========
 # Analyzer
@@ -347,7 +347,8 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         return var_deps
 
     # Analyzer 3: tl.dot
-    def analyze_dot_dim(self, tma_map: dict[str, set[tuple[str, ...]]]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
+    def analyze_dot_dim(self, tma_map: dict[str, set[tuple[str,
+                                                           ...]]]) -> tuple[dict[str, set[str]], dict[str, set[str]]]:
         # tma_map already stores the canonical block_shape per desc,
         # representing (M,K) or (K,N) in memory-layout order.
         # Map each dot operand var back to its desc_name (through desc.load
@@ -422,29 +423,80 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
 
         return bs_m_map, bs_k_map
 
+    def _tl_load_expr_bfs_children(self, node: ast.AST) -> list[ast.AST]:
+        """Sub-expressions for width-first expansion (e.g. tl.load(A) after A = A + (...))."""
+        out = list[ast.AST]()
+        if isinstance(node, ast.Name):
+            if node.id in self.var_definitions:
+                out.append(self.var_definitions[node.id])
+        elif isinstance(node, ast.BinOp):
+            out.extend((node.left, node.right))
+        elif isinstance(node, ast.UnaryOp):
+            out.append(node.operand)
+        elif isinstance(node, ast.Call):
+            out.extend(node.args)
+            for kw in node.keywords:
+                out.append(kw.value)
+        elif isinstance(node, ast.Subscript):
+            out.append(node.value)
+            sl = node.slice
+            if isinstance(sl, ast.Slice):
+                for part in (sl.lower, sl.upper, sl.step):
+                    if part is not None:
+                        out.append(part)
+            elif isinstance(sl, ast.Tuple):
+                out.extend(sl.elts)
+            else:
+                out.append(sl)
+        elif isinstance(node, ast.Compare):
+            out.append(node.left)
+            out.extend(node.comparators)
+        elif isinstance(node, ast.BoolOp):
+            out.extend(node.values)
+        elif isinstance(node, ast.IfExp):
+            out.extend((node.test, node.body, node.orelse))
+        elif isinstance(node, ast.Attribute):
+            out.append(node.value)
+        return out
+
     # Analyzer 1: tl.load
     def analyze_tl_load_bs(self) -> dict[str, str]:
         load_map = dict[str, str]()  # [bs_name, ts_name]
         for addr_expr in self.load_addresses:
-            tl_load_used_var_names = VariableCollector.collect(addr_expr)
-            # Case (mm_kernel_general): a = tl.load(A + (ram[:, None] * stride_am + rk[None, :] * stride_ak))
-            #   tl_load_used_var_names = {'A', 'ram', 'stride_am', 'stride_ak', 'rk'}
-            for var_name in tl_load_used_var_names:
-                # self.var_all_definitions = {'pid':.., 'grid_m':.., 'grid_n':.., 'width':..,
-                #   'group_id':.., 'group_size':.., 'pid_m':.., 'pid_n':.., 'offset_am':..,
-                #   'offset_bn':.., 'offset_k':.., 'a_desc':.., 'b_desc':.., 'c_desc':..,
-                #   'acc':.., 'a':.., 'b':.., 'rm':.., 'rn':.., 'ram':.., 'rbn':..,
-                #   'prev_multiple':.., 'rk':.., 'mask_k':.., 'offsets':.., 'mask':..}
-                if var_name not in self.var_all_definitions:
+            queue = deque[ast.AST]((addr_expr, ))
+            seen = set[int]()
+
+            while queue:
+                expr = queue.popleft()
+                eid = id(expr)
+                if eid in seen:
                     continue
-                bs_names_set = self._extract_arange_bs_recursive(var_name)
-                ts_names_set, _ = self.get_dependencies(var_name)
-                # var_name = 'ram', bs_names_set = {'BLOCK_M'}, ts_names_set={'M'}
-                # var_name = 'rk',  bs_names_set = {'BLOCK_K'}, ts_names_set={'K'}
-                if len(bs_names_set) == 1 and len(ts_names_set) == 1:
-                    bs_name = bs_names_set.pop()
-                    ts_name = ts_names_set.pop()
-                    load_map[bs_name] = ts_name
+                seen.add(eid)
+
+                tl_load_used_var_names = VariableCollector.collect(expr)
+                # Case (mm_kernel_general): a = tl.load(A + (ram[:, None] * stride_am + rk[None, :] * stride_ak))
+                #   tl_load_used_var_names = {'A', 'ram', 'stride_am', 'stride_ak', 'rk'}
+                for var_name in tl_load_used_var_names:
+                    # self.var_all_definitions = {'pid':.., 'grid_m':.., 'grid_n':.., 'width':..,
+                    #   'group_id':.., 'group_size':.., 'pid_m':.., 'pid_n':.., 'offset_am':..,
+                    #   'offset_bn':.., 'offset_k':.., 'a_desc':.., 'b_desc':.., 'c_desc':..,
+                    #   'acc':.., 'a':.., 'b':.., 'rm':.., 'rn':.., 'ram':.., 'rbn':..,
+                    #   'prev_multiple':.., 'rk':.., 'mask_k':.., 'offsets':.., 'mask':..}
+                    if var_name not in self.var_all_definitions:
+                        continue
+                    bs_names_set = self._extract_arange_bs_recursive(var_name)
+                    ts_names_set, _ = self.get_dependencies(var_name)
+                    # var_name = 'ram', bs_names_set = {'BLOCK_M'}, ts_names_set={'M'}
+                    # var_name = 'rk',  bs_names_set = {'BLOCK_K'}, ts_names_set={'K'}
+                    if len(bs_names_set) == 1 and len(ts_names_set) == 1:
+                        bs_name = bs_names_set.pop()
+                        ts_name = ts_names_set.pop()
+                        load_map[bs_name] = ts_name
+
+                for child in self._tl_load_expr_bfs_children(expr):
+                    if id(child) not in seen:
+                        queue.append(child)
+
         return load_map
 
     # Parse nargs["a_desc"].block_shape = [BLOCK_M, BLOCK_K] in a pre_hook
@@ -488,8 +540,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         return ret  # dict[desc_name, list[desc_bshape]]
 
     # Analyzer 2: desc.load
-    def analyze_desc_load_bs(
-            self, pre_hook_fn: object | None = None) -> dict[str, set[tuple[str, ...]]]:
+    def analyze_desc_load_bs(self, pre_hook_fn: object | None = None) -> dict[str, set[tuple[str, ...]]]:
         # 2.0) desc_bshapes_map: dict[desc_name, list[desc_bshape]]
         desc_bshapes_map = dict[str, list[list[str]]]()
 
@@ -548,8 +599,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                 # var_name='a',   desc_name='a_desc', is_trans=False, matched_bshape=['BLOCK_M', 'BLOCK_K']
                 # var_name='a_t', desc_name='a_desc', is_trans=True,  matched_bshape=['BLOCK_K', 'BLOCK_M']
                 matched_bshape = self._match_bshape_by_addr(
-                    tma_load_assignment.get("addr_exprs") or [],
-                    candidate_bshapes, candidate_bs_names)
+                    tma_load_assignment.get("addr_exprs") or [], candidate_bshapes, candidate_bs_names)
             else:
                 matched_bshape = list[str]()
             if matched_bshape:
@@ -579,8 +629,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
         # {'a_desc', {('BLOCK_M', 'BLOCK_K')}, ...}
         return tma_map
 
-    def _match_bshape_by_addr(self, addr_exprs: list,
-                              candidate_bshapes: list[list[str]],
+    def _match_bshape_by_addr(self, addr_exprs: list, candidate_bshapes: list[list[str]],
                               candidate_bs_names: set[str]) -> list[str]:
         # candidate_bshapes: [['BLOCK_M', 'BLOCK_K'], ['BLOCK_K', 'BLOCK_M']]
         # candidate_bs_names: {'BLOCK_K', 'BLOCK_M'}
@@ -621,7 +670,7 @@ class KernelDependencyAnalyzer(ast.NodeVisitor):
                 if matched:
                     return list[str](candidate_bshape)
         if knobs.autotuning.print:
-            print(f"[AABS] Warning: _match_bshape_by_addr failed")
+            print("[AABS] Warning: _match_bshape_by_addr failed")
         return list[str](candidate_bshapes[0]) if candidate_bshapes else list[str]()
 
 
@@ -651,15 +700,11 @@ def analyze_kernel_dependencies(jit_fn, pre_hook_fn: object | None = None) -> tu
         if knobs.autotuning.print:
             jit_fn_name = getattr(jit_fn, '__name__', 'unknown')
             if load_map:
-                print(
-                    f"\n=== [Analyzer] tl.load (by tl.arange): {jit_fn_name} ==="
-                )
+                print(f"\n=== [Analyzer] tl.load (by tl.arange): {jit_fn_name} ===")
                 for bs_name, ts_name in load_map.items():
                     print(f"  load_map[bs_name, ts_name] = '{bs_name}' -> '{ts_name}'")
             if tma_map:
-                print(
-                    f"\n=== [Analyzer] desc.load (by block_shape): {jit_fn_name} ==="
-                )
+                print(f"\n=== [Analyzer] desc.load (by block_shape): {jit_fn_name} ===")
                 for desc_name, bs_names_set in tma_map.items():
                     print(f"  tma_map[desc_name, set[bshapes]] = '{desc_name}' -> {bs_names_set}")
             if bs_m_map or bs_k_map:
