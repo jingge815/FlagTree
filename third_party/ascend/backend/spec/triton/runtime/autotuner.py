@@ -45,6 +45,8 @@ class Autotuner(KernelInterface):
             ]
         else:
             self.configs = configs
+        if self.configs and (len(self.configs) > 0):
+            self.shared_config_pre_hook = self.configs[0].pre_hook  # flagtree: for aabs
         self.keys = key
         self.cache = {}
         self.arg_names = arg_names
@@ -156,6 +158,10 @@ class Autotuner(KernelInterface):
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure, MLIRCompilationError
 
+        verbose = os.getenv("TRITON_PRINT_AUTOTUNING", False)
+        if verbose:
+            print(f"Autotuning kernel {self.base_fn.__name__} with config {config}")
+
         # check for conflicts, i.e. meta-parameters both provided
         # as kwargs and by the autotuner
         conflicts = meta.keys() & config.kwargs.keys()
@@ -197,7 +203,9 @@ class Autotuner(KernelInterface):
             self.post_hook(full_nargs, exception=None)
 
         try:
-            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            rett = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            self.seen_tuned_metas[meta_key] = rett  # flagtree: deduplicate tuned meta
+            return rett
         except (OutOfResources, CompileTimeAssertionFailure, MLIRCompilationError):
             return [float("inf"), float("inf"), float("inf")]
 
@@ -216,6 +224,7 @@ class Autotuner(KernelInterface):
                 # prune configs
                 used_cached_result = False
                 pruned_configs = self.prune_configs(kwargs)
+                self.seen_tuned_metas = {}  # flagtree: deduplicate tuned meta
                 bench_start = time.time()
                 timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                 bench_end = time.time()
