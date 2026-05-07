@@ -10,7 +10,10 @@ from ..testing import do_bench_cudagraph
 from .jit import KernelInterface
 from .errors import OutOfResources
 from .driver import driver
+from .adjust_kernel_param import auto_adjust_block_sizes
 
+# flagtree aabs
+adjust_block_size: bool = os.getenv("FLAGTREE_AABS", True)
 
 class Autotuner(KernelInterface):
 
@@ -43,6 +46,8 @@ class Autotuner(KernelInterface):
             ]
         else:
             self.configs = configs
+        if self.configs and (len(self.configs) > 0):
+            self.shared_config_pre_hook = self.configs[0].pre_hook  # flagtree aabs
         self.keys = key
         self.cache = {}
         self.arg_names = arg_names
@@ -102,6 +107,7 @@ class Autotuner(KernelInterface):
         self.num_reps = rep
         import torch
         self.use_cuda_graph = use_cuda_graph and torch.cuda.is_available()
+        self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
 
         # If we got explicitly called via the old interface, raise a warning
         # and proceed with the old behavior.
@@ -136,6 +142,10 @@ class Autotuner(KernelInterface):
     def _bench(self, *args, config, **meta):
         from ..compiler.errors import CompileTimeAssertionFailure
 
+        verbose = os.getenv("TRITON_PRINT_AUTOTUNING", False)
+        if verbose:
+            print(f"Autotuning kernel {self.base_fn.__name__} with config {config}")
+
         # check for conflicts, i.e. meta-parameters both provided
         # as kwargs and by the autotuner
         conflicts = meta.keys() & config.kwargs.keys()
@@ -144,6 +154,17 @@ class Autotuner(KernelInterface):
                              " Make sure that you don't re-define auto-tuned symbols.")
         # augment meta-parameters with tunable ones
         current = dict(meta, **config.all_kwargs())
+        # flagtree aabs: auto_adjust_block_sizes
+        if adjust_block_size:
+            def _unwrap_to_jitfunction(fn):
+                from triton.runtime.jit import JITFunction
+                while not isinstance(fn, JITFunction):
+                    fn = fn.fn
+                return fn
+            auto_adjust_block_sizes(self.nargs, _unwrap_to_jitfunction(self.fn), self.configs, current, config)
+        meta_key = tuple(sorted(current.items()))
+        if meta_key in self.seen_tuned_metas:
+            return self.seen_tuned_metas[meta_key]  # flagtree aabs: deduplicate tuned 
         full_nargs = {**self.nargs, **current}
 
         def kernel_call():
@@ -165,7 +186,9 @@ class Autotuner(KernelInterface):
             self.post_hook(full_nargs, exception=None)
 
         try:
-            return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            rett = self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
+            self.seen_tuned_metas[meta_key] = rett  # flagtree aabs: deduplicate tuned meta
+            return rett
         except (OutOfResources, CompileTimeAssertionFailure):
             return [float("inf"), float("inf"), float("inf")]
 
@@ -184,6 +207,7 @@ class Autotuner(KernelInterface):
                 # prune configs
                 used_cached_result = False
                 pruned_configs = self.prune_configs(kwargs)
+                self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
                 bench_start = time.time()
                 timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                 bench_end = time.time()
@@ -211,7 +235,10 @@ class Autotuner(KernelInterface):
         return ret
 
     def prune_configs(self, kwargs):
-        pruned_configs = self.configs
+        # flagtree aabs: use deepcopy to prevent modification of the original configs
+        import copy
+        pruned_configs = copy.deepcopy(self.configs)
+        # pruned_configs = self.configs
         if self.early_config_prune:
             pruned_configs = self.early_config_prune(self.configs, self.nargs, **kwargs)
         if self.perf_model:
