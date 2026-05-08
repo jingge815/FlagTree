@@ -226,6 +226,7 @@ class Autotuner(KernelInterface):
         return False
 
     def run(self, *args, **kwargs):
+        self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
@@ -241,7 +242,6 @@ class Autotuner(KernelInterface):
                 pruned_configs = self.prune_configs(kwargs)
 
                 def benchmark():
-                    self.seen_tuned_metas = {}  # flagtree aabs: deduplicate tuned meta
                     bench_start = time.time()
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
