@@ -39,12 +39,24 @@ def atomic_and(in_ptr0, out_ptr0, out_ptr1, n_elements, BLOCK_SIZE: tl.constexpr
     tl.store(out_ptr1 + (x1), tmp1, xmask)
 
 
+<<<<<<< flagtree/third_party/ascend/unittest/pytest_ut/test_atomic_and.py
 @pytest.mark.parametrize('param_list', [
     ['int64', (32, 32), 2],
     ['int32', (32, 32), 2],
     ['int16', (32, 32), 2],
     ['int8', (16, 16), 4],
 ])
+=======
+@pytest.mark.parametrize('param_list',
+                         [
+                             ['int64', (32, 32), 2],
+                             ['int32', (32, 32), 2],
+                             ['int16', (32, 32), 2],
+                             ['int8', (16, 16), 4],
+                             ['uint8', (16, 16), 4],
+                         ]
+                         )
+>>>>>>> triton-ascend@HEAD/third_party/ascend/unittest/pytest_ut/test_atomic_and.py
 def test_atomic_and(param_list):
     dtype, shape, ncore = param_list
     block_size = shape[0] * shape[1] // ncore

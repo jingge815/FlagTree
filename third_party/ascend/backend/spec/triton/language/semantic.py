@@ -336,15 +336,16 @@ def mod(input: tl.tensor | numbers.Number, other: tl.tensor | numbers.Number, bu
     # float % float
     if scalar_ty.is_floating():
         # input - input.div(other, rounding_mode="floor") * other
-        floor = math.floor(fdiv(input, other, False, builder), _builder=builder)
-        ret = sub(input, mul(floor, other, True, builder), True, builder)
-        return ret
+        return tl.tensor(builder.create_frem(input.handle, other.handle), input.type)
     # % int
     elif scalar_ty.is_int():
         if scalar_ty.int_signedness != other_scalar_ty.int_signedness:
             raise TypeError("Cannot mod " + scalar_ty.__repr__() + " by " + other_scalar_ty.__repr__() + " "
                             "because they have different signedness;"
                             "this is unlikely to result in a useful answer. Cast them to the same signedness.")
+        if hasattr(input, 'was_bool_to_int8'):
+            false_val = builder.get_int1(False)
+            return tl.tensor(false_val, tl.int1)
         if scalar_ty.is_int_signed():
             return tl.tensor(builder.create_srem(input.handle, other.handle), input.type)
         else:
@@ -1114,6 +1115,9 @@ def _load_block_pointer(ptr, mask, other, boundary_check, padding, cache, evicti
     # Check `boundary_check` argument
     boundary_check = _canonicalize_boundary_check(boundary_check, dst_ty.get_block_shapes())
 
+    if boundary_check and padding is None:
+        padding = ir.PADDING_OPTION.PAD_ZERO
+
     # Build IR
     return tl.tensor(
         builder.create_tensor_pointer_load(ptr.handle, boundary_check, padding, cache, eviction, is_volatile), dst_ty)
@@ -1177,11 +1181,16 @@ def _load_legacy(ptr, mask, other, boundary_check, padding, cache, eviction, is_
 
     # Build IR
     if mask is None:
-        ret = tl.tensor(builder.create_load(ptr.handle, cache, eviction, is_volatile), dst_ty)
+        load_handle = builder.create_load(ptr.handle, cache, eviction, is_volatile)
     else:
-        ret = tl.tensor(
-            builder.create_masked_load(ptr.handle, mask.handle, other.handle if other else None, cache, eviction,
-                                       is_volatile), dst_ty)
+        load_handle = builder.create_masked_load(
+            ptr.handle, mask.handle, other.handle if other else None, cache, eviction, is_volatile
+        )
+
+    if is_bool:
+        load_handle.set_attr("was_bool_to_int8", builder.get_bool_attr(True))
+
+    ret = tl.tensor(load_handle, dst_ty)
     # Do not cast back to int1 when is_bool=true. We directly use the int8 tensor given by tl.load
     if is_bool:
         ret.was_bool_to_int8 = True
@@ -1608,7 +1617,8 @@ def dot(lhs: tl.tensor, rhs: tl.tensor, acc: tl.tensor, input_precision: Optiona
 
     if (input_precision == getattr(ir.INPUT_PRECISION, "HF32")):
         if (not lhs.dtype.is_fp32() or not rhs.dtype.is_fp32() or not ret_scalar_ty.is_fp32()):
-            raise ValueError("input_precision = 'hf32' must be used with f32 * f32 = f32 on Ascend")
+            # when input and result is not fp32, ignore input_precision (default is ieee)
+            input_precision = _str_to_dot_input_precision(builder.options.default_dot_input_precision, builder)
 
     if max_num_imprecise_acc is not None:
         print("max_num_imprecise_acc in tl.dot is not supported on Ascend yet. Thus it is ignored.")
@@ -1653,8 +1663,12 @@ def dot_scaled(lhs: tl.tensor, lhs_scale: tl.tensor, lhs_format: str, rhs: tl.te
                rhs_format: str, acc: Union[tl.tensor, None], out_dtype: tl.dtype, lhs_k_pack, rhs_k_pack,
                builder: ir.builder) -> tl.tensor:
     assert lhs.type.is_block() and rhs.type.is_block()
-    assert lhs.dtype == tl.bfloat16 or lhs.dtype == tl.float16, f"lhs matrix dtype must be bf16 or fp16"
-    assert rhs.dtype == tl.bfloat16 or rhs.dtype == tl.float16, f"rhs matrix dtype must be bf16 or fp16"
+    if is_compile_on_910_95:
+        assert lhs.dtype in [tl.float16, tl.bfloat16, tl.uint8, tl.float8e5, tl.float8e4nv], f"lhs matrix dtype must be in [bf16, fp16, uint8, e5m2, e4m3]"
+        assert rhs.dtype in [tl.float16, tl.bfloat16, tl.uint8, tl.float8e5, tl.float8e4nv], f"rhs matrix dtype must be in [bf16, fp16, uint8, e5m2, e4m3]"
+    else:
+        assert lhs.dtype == tl.bfloat16 or lhs.dtype == tl.float16, f"lhs matrix dtype must be bf16 or fp16"
+        assert rhs.dtype == tl.bfloat16 or lhs.dtype == tl.float16, f"rhs matrix dtype must be bf16 or fp16"
     assert lhs.dtype == rhs.dtype, f"lhs rhs matrix must get same dtype"
     lhs_rank = len(lhs.shape)
     rhs_rank = len(rhs.shape)
@@ -1663,26 +1677,37 @@ def dot_scaled(lhs: tl.tensor, lhs_scale: tl.tensor, lhs_format: str, rhs: tl.te
     rhs_format: str = rhs_format.value
     lhs_format_enum = _str_to_fp_type(lhs_format)
     rhs_format_enum = _str_to_fp_type(rhs_format)
+<<<<<<< flagtree/third_party/ascend/backend/spec/triton/language/semantic.py
     allowed_formats = {"bf16", "fp16"}  # unsupported fp8/4 dtype: "e2m1", "e4m3", "e5m2"
+=======
+    if is_compile_on_910_95:
+        allowed_formats = {"bf16", "fp16", "e4m3", "e5m2"}
+    else:
+        allowed_formats = {"bf16", "fp16"}  # unsupported fp8/4 dtype: "e2m1", "e4m3", "e5m2"
+>>>>>>> triton-ascend@HEAD/python/triton/language/semantic.py
     assert lhs_format in allowed_formats, f"NYI: lhs_format {lhs_format}"
     assert rhs_format in allowed_formats, f"NYI: rhs_format {rhs_format}"
     rhs_scale_is_none = rhs_scale is None or (isinstance(rhs_scale, tl.constexpr) and rhs_scale.value is None)
     lhs_scale_is_none = lhs_scale is None or (isinstance(lhs_scale, tl.constexpr) and lhs_scale.value is None)
-    assert isinstance(lhs_scale, tl.tensor) and lhs_scale.dtype == tl.int8, f"lhs_scale must be int8 tensor"
+    assert isinstance(lhs_scale, tl.tensor) and (lhs_scale.dtype == tl.int8 or lhs_scale.dtype == tl.uint8), f"lhs_scale must be int8 or uint8 tensor"
     if not rhs_scale_is_none:
-        assert isinstance(rhs_scale, tl.tensor) and rhs_scale.dtype == tl.int8, f"rhs_scale must be int8 tensor"
+        assert isinstance(rhs_scale, tl.tensor) and (rhs_scale.dtype == tl.int8 or rhs_scale.dtype == tl.uint8), f"rhs_scale must be int8 or uint8 tensor"
     lhs = _bitcast_to_fp_type(lhs, lhs_format, builder)
     rhs = _bitcast_to_fp_type(rhs, rhs_format, builder)
 
-    if lhs_k_pack == False:
+    assert lhs_k_pack or lhs_format == "e2m1", "only mxfp4 inputs can be packed along a dimension different than K"
+    assert rhs_k_pack or rhs_format == "e2m1", "only mxfp4 inputs can be packed along a dimension different than K"
+
+    lhs_k_pack_v = lhs_k_pack.value if isinstance(lhs_k_pack, tl.constexpr) else lhs_k_pack
+    rhs_k_pack_v = rhs_k_pack.value if isinstance(rhs_k_pack, tl.constexpr) else rhs_k_pack
+
+    if lhs_k_pack_v is False:
         dims = (1, 0)
-        dims = core._unwrap_iterable(dims)
         tmp_lhs = permute(lhs, dims, builder)
         lhs = reshape(tmp_lhs, (lhs.shape[0], lhs.shape[1]), True, builder)
 
-    if rhs_k_pack == False:
+    if rhs_k_pack_v is False:
         dims = (1, 0)
-        dims = core._unwrap_iterable(dims)
         tmp_rhs = permute(rhs, dims, builder)
         rhs = reshape(tmp_rhs, (rhs.shape[0], rhs.shape[1]), True, builder)
 

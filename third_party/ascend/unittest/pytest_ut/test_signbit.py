@@ -64,3 +64,23 @@ def test_all_blocks_parallel(param_list, monkeypatch):
     triton_signbit[ncore, 1, 1](x, y_cal, x.numel(), xblock, xblock_sub)
     test_common.validate_cmp('bool', y_cal, y_ref)
     monkeypatch.delenv("TRITON_ALL_BLOCKS_PARALLEL")
+<<<<<<< flagtree/third_party/ascend/unittest/pytest_ut/test_signbit.py
+=======
+
+
+@pytest.mark.parametrize('param_list',
+                         [
+                             ['float16', (2, 4096, 8), 2, 32768, 1024],
+                             ['float32', (2, 4096, 8), 2, 32768, 1024],
+                         ]
+                         )
+def test_auto_blockify(param_list, monkeypatch):
+    monkeypatch.setenv("TRITON_ALL_BLOCKS_PARALLEL", "1")
+    dtype, shape, ncore, xblock, xblock_sub = param_list
+    x = test_common.generate_tensor(shape, dtype).npu()
+    y_ref = torch.signbit(x).npu()
+    y_cal = torch.zeros(shape).bool().npu()
+    triton_signbit[ncore, 1, 1](x, y_cal, x.numel(), xblock, xblock_sub, auto_blockify_size=ncore)
+    test_common.validate_cmp('bool', y_cal, y_ref)
+    monkeypatch.delenv("TRITON_ALL_BLOCKS_PARALLEL")
+>>>>>>> triton-ascend@HEAD/third_party/ascend/unittest/pytest_ut/test_signbit.py

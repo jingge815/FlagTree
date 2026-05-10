@@ -18,17 +18,24 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 # THE SOFTWARE.
 
+from triton.language import math
+from triton.backends.ascend.utils import triton_enable_libdevice_simt
+
 from . import libdevice
 from . import extension
 
 extension.parallel = extension.aux_ops.parallel
-libdevice.atan2 = extension.math_ops.atan2
+if not triton_enable_libdevice_simt():
+    libdevice.atan2 = extension.math_ops.atan2
 libdevice.isfinited = extension.math_ops.isfinited
 libdevice.finitef = extension.math_ops.finitef
 libdevice.flip = extension.flip
 
+<<<<<<< flagtree/third_party/ascend/language/cann/__init__.py
 from triton.language import math
 
+=======
+>>>>>>> triton-ascend@HEAD/third_party/ascend/language/cann/__init__.py
 libdevice.umulhi = math.umulhi
 libdevice.exp = math.exp
 libdevice.exp2 = math.exp2

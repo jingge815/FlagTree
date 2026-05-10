@@ -23,16 +23,22 @@
 from __future__ import annotations
 
 import builtins
+import copy
+import functools
+import ast
 import os
 import time
-import copy
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List
+
 from torch import Tensor
 
+import triton
 from triton.runtime.autotuner import Autotuner, Config
 
+from .autoparser import (LowDimsAxesParser, PtrNumsParser, ReductionAxesParser,
+                         SplitAxesParser, TilingAxesParser)
 from .utils import get_byte_per_numel, is_valid_axis_name, valid_axis_names
-from .autoparser import SplitAxesParser, TilingAxesParser, ReductionAxesParser, LowDimsAxesParser, PtrNumsParser
 
 
 class AutoTilingTuner(Autotuner):
@@ -88,7 +94,13 @@ class AutoTilingTuner(Autotuner):
         tiling_params = self.hints.get("tiling_params", None)
         low_dim_axes = self.hints.get("low_dim_axes", None)
         reduction_axes = self.hints.get("reduction_axes", None)
-        self._init_axis_params(key, split_params, tiling_params, low_dim_axes, reduction_axes)
+        self._init_axis_params(
+            key,
+            split_params,
+            tiling_params,
+            low_dim_axes,
+            reduction_axes,
+        )
 
         self.auto_gen_config = not configs or self.hints.get("auto_gen_config", False)
         self.gen_configs = []  # generated configs from TileGenerator
@@ -98,8 +110,15 @@ class AutoTilingTuner(Autotuner):
         else:
             self.user_configs = configs
         self.is_simt_mode = False
+        self.simt_stack_limit = 8192
         self.user_specified_warps = None
         self.print_autotuning = os.getenv("TRITON_PRINT_AUTOTUNING", None) == "1"
+        # Compile kernels in parallel by default for triton.runtime.JITFunction,
+        # but not for others, e.g., LibEntry, since it's not compatible with AsyncCompileMode
+        self.compile_parallel = (
+            isinstance(self.fn, triton.runtime.JITFunction)
+            and os.getenv("TRITON_AUTOTUNE_PARALLEL_COMPILE", "1") == "1"
+        )
 
     def _init_axis_params(self, key, split_params, tiling_params, low_dim_axes, reduction_axes):
         if isinstance(key, list):
@@ -138,9 +157,18 @@ class AutoTilingTuner(Autotuner):
                                                                                           set(self.keys.keys())))
 
         self.split_params = split_params
+<<<<<<< flagtree/third_party/ascend/backend/runtime/autotuner.py
+=======
+        self.all_split_params = {}
+        self.fixed_split_params = {}
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/runtime/autotuner.py
         self.tiling_params = tiling_params
         self.low_dim_axes = low_dim_axes
         self.reduction_axes = reduction_axes
+        self.fixed_grid_dims = set()
+        self.fixed_grid_dim_values = {}
+        self.split_axis_pid_dims = {}
+        self.axis_pid_dims = {}
         self.dual_reduction = False
         self.persistent_reduction = False
         self.num_buffers = -1
@@ -167,8 +195,51 @@ class AutoTilingTuner(Autotuner):
             self.persistent_reduction = True
 
         if not self.split_params:
-            self.split_params = self._autoparse_split_params(miss_params)
-        miss_params = [arg for arg in miss_params if arg not in self.split_params.values()]
+            all_split_params = self._autoparse_split_params(
+                self._get_constexpr_candidates()
+            )
+            self.all_split_params = dict(all_split_params)
+            self.fixed_split_params = {}
+            self.fixed_grid_dim_values = self._get_fixed_grid_dim_values(
+                all_args.get("grid", None),
+                all_args,
+            )
+            self.fixed_grid_dims = set(self.fixed_grid_dim_values.keys())
+
+            fixed_grid_axes = {
+                axis for axis, pid_dim in self.axis_pid_dims.items()
+                if pid_dim in self.fixed_grid_dims
+            }
+
+            # Only missing constexpr params are tunable, and fixed-grid axes
+            # should not be tuned on split.
+            self.split_params = {
+                axis: param
+                for axis, param in all_split_params.items()
+                if param in miss_params and axis not in fixed_grid_axes
+            }
+
+            # Fixed split is inferred only from fixed grid dims.
+            for axis, pid_dim in self.axis_pid_dims.items():
+                if pid_dim not in self.fixed_grid_dims:
+                    continue
+                core_num = self.fixed_grid_dim_values.get(pid_dim, 0)
+                axis_len_name = self.keys.get(axis, None)
+                axis_len = all_args.get(axis_len_name, None)
+                if not isinstance(core_num, int) or core_num <= 0:
+                    continue
+                if not isinstance(axis_len, int) or axis_len <= 0:
+                    continue
+
+                self.fixed_split_params[axis] = (axis_len + core_num - 1) // core_num
+        elif not self.axis_pid_dims:
+            # When split axes are provided by hints, parse axis->program_id mapping
+            # independently for fixed-grid semantics and diagnostics.
+            self._autoparse_axis_pid_dims()
+        miss_params = [
+            arg for arg in miss_params
+            if arg not in self.split_params.values()
+        ]
         if not self.tiling_params:
             self.tiling_params = self._autoparse_tiling_params(miss_params)
         miss_params = [arg for arg in miss_params if arg not in self.tiling_params.values()]
@@ -191,6 +262,7 @@ class AutoTilingTuner(Autotuner):
         kernel_meta = KernelMeta(
             axis_sizes,
             self.split_params,
+            self.fixed_split_params,
             self.tiling_params,
             self.low_dim_axes,
             dtype,
@@ -272,6 +344,8 @@ class AutoTilingTuner(Autotuner):
 
     def run(self, *args, **kwargs):
         key = self.generate_key_and_configs(*args, **kwargs)
+        if self.is_simt_mode and kwargs.get('simt_stack_limit', None) is None:
+            kwargs['simt_stack_limit'] = self.simt_stack_limit
         used_cached_result = True
         if key not in self.cache:
             # prune configs
@@ -319,14 +393,40 @@ class AutoTilingTuner(Autotuner):
         exc = None
         exc_stack = ""
 
-        for config, fn in kernels_call.items():
+        if self.compile_parallel:
+            import psutil
+
+            max_workers = min(psutil.cpu_count(logical=False) // 2, len(kernels_call))
+            future_kernels = []
             try:
-                fn()
-                run_fns[config] = fn
-            except (CompileTimeAssertionFailure, MLIRCompilationError, OutOfResources) as e:
-                import traceback
-                exc_stack = traceback.format_exc()
-                exc = e
+                with (
+                    ThreadPoolExecutor(max_workers=max_workers) as executor,
+                    triton.AsyncCompileMode(executor),
+                ):
+                    for config, fn in kernels_call.items():
+                        future_kernels.append((config, fn(warmup=True)))
+
+                    for config, fut in future_kernels:
+                        try:
+                            if hasattr(fut, "result"):
+                                fut = fut.result()
+                            run_fns[config] = functools.partial(kernels_call[config], warmup=False)
+                        except (CompileTimeAssertionFailure, MLIRCompilationError) as e:
+                            import traceback
+                            exc_stack = traceback.format_exc()
+                            exc = e
+            except Exception as e:
+                # ignore exception from __exit__() of AsyncCompileMode
+                triton.runtime._async_compile.active_mode.set(None)
+        else:
+            for config, fn in kernels_call.items():
+                try:
+                    fn(warmup=False)
+                    run_fns[config] = functools.partial(fn, warmup=False)
+                except (CompileTimeAssertionFailure, MLIRCompilationError, OutOfResources) as e:
+                    import traceback
+                    exc_stack = traceback.format_exc()
+                    exc = e
 
         if len(run_fns) == 0:
             raise RuntimeError(f"No valid triton configs. {type(exc).__name__}: {exc} \nStack trace: {exc_stack}")
@@ -356,15 +456,18 @@ class AutoTilingTuner(Autotuner):
         current = dict(meta, **config.all_kwargs())
         full_nargs = {**self.nargs, **current}
 
-        def kernel_call():
+        def kernel_call(warmup):
             if config.pre_hook:
                 config.pre_hook(full_nargs)
             self.pre_hook(full_nargs)
             try:
-                self.fn.run(
+                current.update({"warmup": warmup})
+                res = self.fn.run(
                     *args,
                     **current,
                 )
+                if warmup:
+                    return res
             except Exception as e:
                 try:
                     self.post_hook(full_nargs, exception=e)
@@ -380,8 +483,32 @@ class AutoTilingTuner(Autotuner):
         _ = self.generate_key_and_configs(*args, **kwargs)
         pruned_configs = self.prune_configs(kwargs)
         ret = []
+<<<<<<< flagtree/third_party/ascend/backend/runtime/autotuner.py
         for config in pruned_configs:
             ret.append(self.fn.warmup(*args, **kwargs, **config.all_kwargs()))
+=======
+        if self.compile_parallel:
+            import psutil
+
+            max_workers = min(psutil.cpu_count(logical=False) // 2, len(pruned_configs))
+            with (
+                ThreadPoolExecutor(max_workers=max_workers) as executor,
+                triton.AsyncCompileMode(executor),
+            ):
+                for config in pruned_configs:
+                    ret.append(self.fn.warmup(
+                        *args,
+                        **kwargs,
+                        **config.all_kwargs()
+                    ))
+        else:
+            for config in pruned_configs:
+                ret.append(self.fn.warmup(
+                    *args,
+                    **kwargs,
+                    **config.all_kwargs()
+                ))
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/runtime/autotuner.py
         self.nargs = None
         return ret
 
@@ -389,7 +516,14 @@ class AutoTilingTuner(Autotuner):
         from ..testing import do_bench_npu
 
         kernel_call = self._make_kernel_call(*args, config=config, **meta)
+<<<<<<< flagtree/third_party/ascend/backend/runtime/autotuner.py
         do_bench_npu(kernel_call, prof_dir=self.auto_profile_dir, keep_res=True)
+=======
+        fn = functools.partial(kernel_call, warmup=False)
+        do_bench_npu(
+            fn, prof_dir=self.auto_profile_dir, keep_res=True
+        )
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/runtime/autotuner.py
 
     def _autoparse_split_params(self, candidates_params: List[str]) -> Dict[str, str]:
         """
@@ -398,9 +532,150 @@ class AutoTilingTuner(Autotuner):
         func_ast = self.fn.parse()
         parser = SplitAxesParser(func_ast, self.keys, candidates_params)
         split_axes = parser.parse()
+        self.split_axis_pid_dims = dict(getattr(parser, "split_axis_pid_dims", {}))
+        self.axis_pid_dims = dict(getattr(parser, "axis_pid_dims", {}))
         if self.print_autotuning:
+<<<<<<< flagtree/third_party/ascend/backend/runtime/autotuner.py
             print(f"Ascend autotuning parse split axes: {split_axes}")
+=======
+            print(
+                f"Ascend autotuning parse split axes: {split_axes}, "
+                f"split axis pid dims: {self.split_axis_pid_dims}, "
+                f"axis pid dims: {self.axis_pid_dims}"
+            )
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/runtime/autotuner.py
         return split_axes
+
+    def _autoparse_axis_pid_dims(self) -> Dict[str, int]:
+        """
+        Extract axis -> program_id dim mapping without relying on split-parameter
+        classification, so fixed-grid semantics can always consume it.
+        """
+        func_ast = self.fn.parse()
+        parser = SplitAxesParser(
+            func_ast,
+            self.keys,
+            self._get_constexpr_candidates(),
+        )
+        _ = parser.parse()
+        self.axis_pid_dims = dict(getattr(parser, "axis_pid_dims", {}))
+        self.split_axis_pid_dims = dict(getattr(parser, "split_axis_pid_dims", {}))
+        if self.print_autotuning:
+            print(
+                "Ascend autotuning parse axis pid dims (independent): "
+                f"{self.axis_pid_dims}"
+            )
+        return self.axis_pid_dims
+
+    def _get_constexpr_candidates(self) -> List[str]:
+        """
+        Returns all constexpr parameter names from the kernel function definition.
+        """
+        func_ast = self.fn.parse()
+        constexpr_names = []
+        for node in ast.walk(func_ast):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if not isinstance(node.args, ast.arguments):
+                continue
+            for arg in node.args.args:
+                if not isinstance(arg, ast.arg):
+                    continue
+                ann = arg.annotation
+                if (
+                    isinstance(ann, ast.Attribute)
+                    and isinstance(ann.value, ast.Name)
+                    and ann.value.id == "tl"
+                    and ann.attr == "constexpr"
+                ):
+                    constexpr_names.append(arg.arg)
+            break
+        return constexpr_names
+
+    def _get_fixed_grid_dim_values(self, grid, all_args: Dict[str, object] = None) -> Dict[int, int]:
+        """
+        Returns fixed grid dim -> value.
+        - Static tuple/list grid: direct extraction
+        - Callable grid: infer fixed dims by perturbing missing constexpr params
+        """
+        if grid is None:
+            return {}
+        if callable(grid):
+            return self._infer_fixed_dims_from_callable_grid(grid, all_args or {})
+        return self._extract_fixed_grid_dims(grid)
+
+    def _extract_fixed_grid_dims(self, grid) -> Dict[int, int]:
+        if isinstance(grid, int):
+            grid = (grid,)
+        if not isinstance(grid, (tuple, list)):
+            return {}
+        fixed_dims = {}
+        for idx, dim in enumerate(grid):
+            if isinstance(dim, int) and dim > 0:
+                fixed_dims[idx] = dim
+        return fixed_dims
+
+    def _normalize_grid_tuple(self, grid_out):
+        if isinstance(grid_out, int):
+            return (grid_out,)
+        if isinstance(grid_out, (tuple, list)):
+            return tuple(grid_out)
+        return None
+
+    def _infer_fixed_dims_from_callable_grid(self, grid_fn, all_args: Dict[str, object]) -> Dict[int, int]:
+        constexpr_candidates = self._get_constexpr_candidates()
+        base_meta = dict(all_args or {})
+
+        # Fill missing constexpr with stable probe defaults so grid(meta) can execute.
+        for name in constexpr_candidates:
+            if name not in base_meta:
+                base_meta[name] = 128
+
+        try:
+            base_grid_raw = grid_fn(dict(base_meta))
+        except Exception:
+            return {}
+
+        base_grid = self._normalize_grid_tuple(base_grid_raw)
+        if base_grid is None:
+            return {}
+
+        dynamic_dims = set()
+        # Missing constexpr are tunable candidates.
+        tunable_probe_names = [name for name in constexpr_candidates if name not in (all_args or {})]
+        probe_values = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+
+        for name in tunable_probe_names:
+            baseline = base_meta.get(name, 128)
+            for probe in probe_values:
+                if probe == baseline:
+                    continue
+                probe_meta = dict(base_meta)
+                probe_meta[name] = probe
+                try:
+                    probe_grid_raw = grid_fn(probe_meta)
+                except Exception:
+                    continue
+                probe_grid = self._normalize_grid_tuple(probe_grid_raw)
+                if probe_grid is None:
+                    continue
+                if len(probe_grid) != len(base_grid):
+                    dynamic_dims.update(range(min(len(probe_grid), len(base_grid))))
+                    continue
+                for idx, (base_dim, probe_dim) in enumerate(zip(base_grid, probe_grid)):
+                    if not (isinstance(base_dim, int) and isinstance(probe_dim, int)):
+                        dynamic_dims.add(idx)
+                        continue
+                    if base_dim != probe_dim:
+                        dynamic_dims.add(idx)
+
+        fixed_dims = {}
+        for idx, dim in enumerate(base_grid):
+            if idx in dynamic_dims:
+                continue
+            if isinstance(dim, int) and dim > 0:
+                fixed_dims[idx] = dim
+        return fixed_dims
 
     def _autoparse_tiling_params(self, candidates_params: List[str]) -> Dict[str, str]:
         """

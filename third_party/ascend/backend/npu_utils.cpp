@@ -38,7 +38,7 @@ static std::unordered_map<std::string, size_t> registered_names;
 static std::unordered_map<std::string, std::unique_ptr<size_t>> func_stubs;
 
 static std::tuple<void *, void *>
-registerKernel(const char *name, const void *data, size_t data_size, int shared,
+registerKernel(const char *name, const void *data, size_t data_size,
                int device, const char *kernel_mode_str) {
   rtError_t rtRet;
 
@@ -55,14 +55,14 @@ registerKernel(const char *name, const void *data, size_t data_size, int shared,
   rtRet = rtSetDevice(device);
   if (rtRet != RT_ERROR_NONE) {
     printf("rtSetDevice failed, 0x%x\n", rtRet);
-    return {NULL, NULL};
+    return {nullptr, nullptr};
   }
 
-  void *devbinHandle = NULL;
+  void *devbinHandle = nullptr;
   rtRet = rtDevBinaryRegister(&devbin, &devbinHandle);
   if (rtRet != RT_ERROR_NONE) {
     printf("rtDevBinaryRegister failed, 0x%x\n", rtRet);
-    return {NULL, NULL};
+    return {nullptr, nullptr};
   }
 
   std::string stubName = name;
@@ -75,7 +75,7 @@ registerKernel(const char *name, const void *data, size_t data_size, int shared,
   if (rtRet != RT_ERROR_NONE) {
     printf("rtFunctionRegister failed(stubName = %s), 0x%x\n", stubName.c_str(),
            rtRet);
-    return {NULL, NULL};
+    return {nullptr, nullptr};
   }
 
   return std::make_tuple(devbinHandle, func_stub_handle);
@@ -91,16 +91,16 @@ static PyObject *loadKernelBinary(PyObject *self, PyObject *args) {
 
   if (!PyArg_ParseTuple(args, "ss#iis", &name, &data, &data_size, &shared,
                         &device, &kernel_mode)) {
-    return NULL;
+    return nullptr;
   }
 
   auto [module_handle, func_handle] =
-      registerKernel(name, data, data_size, shared, device, kernel_mode);
+      registerKernel(name, data, data_size, device, kernel_mode);
 
   uint64_t mod = reinterpret_cast<uint64_t>(module_handle);
   uint64_t func = reinterpret_cast<uint64_t>(func_handle);
   if (PyErr_Occurred()) {
-    return NULL;
+    return nullptr;
   }
 
   return Py_BuildValue("(KKii)", mod, func, 0, 0);
@@ -113,10 +113,10 @@ static PyObject *getArch(PyObject *self, PyObject *args) {
 
   if (rtRet != RT_ERROR_NONE) {
     printf("rtGetSocVersion failed, 0x%x", rtRet);
-    return NULL;
+    return nullptr;
   }
   if (PyErr_Occurred()) {
-    return NULL;
+    return nullptr;
   }
   return Py_BuildValue("s", name);
 }
@@ -128,10 +128,10 @@ static PyObject *getAiCoreNum(PyObject *self, PyObject *args) {
 
   if (rtRet != RT_ERROR_NONE) {
     printf("rtGetAiCoreCount failed, 0x%x", rtRet);
-    return NULL;
+    return nullptr;
   }
   if (PyErr_Occurred()) {
-    return NULL;
+    return nullptr;
   }
   return Py_BuildValue("I", aiCoreCnt);
 }
@@ -141,6 +141,7 @@ static PyObject *createStream(PyObject *self, PyObject *args) {
 
   rtError_t rtRet = rtStreamCreate(&stream, 0);
 
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
   if (rtRet != RT_ERROR_NONE) {
     printf("rtStreamCreate failed, 0x%x", rtRet);
     return NULL;
@@ -154,6 +155,21 @@ static PyObject *createStream(PyObject *self, PyObject *args) {
   if (result == NULL) {
     rtStreamDestroy(stream);
   }
+=======
+	if (rtRet != RT_ERROR_NONE) {
+		printf("rtStreamCreate failed, 0x%x", rtRet);
+		return nullptr;
+	}
+	if (PyErr_Occurred()) {
+		return nullptr;
+	}
+	uint64_t stream_uint64 = reinterpret_cast<uint64_t>(stream);
+    PyObject* result = Py_BuildValue("K", stream_uint64);
+
+    if (result == nullptr) {
+        rtStreamDestroy(stream);
+    }
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 
   return result;
 }
@@ -193,6 +209,7 @@ std::vector<char> readDataFromBinaryFile(const std::string &filename) {
 }
 
 static PyObject *readDataFromBinaryFileWrapper(PyObject *self, PyObject *args) {
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
   const char *filename;
   uint64_t arr_ptr;
   if (!PyArg_ParseTuple(args, "sK", &filename, &arr_ptr)) {
@@ -208,6 +225,23 @@ static PyObject *readDataFromBinaryFileWrapper(PyObject *self, PyObject *args) {
     PyErr_SetString(PyExc_RuntimeError, e.what());
     return NULL;
   }
+=======
+	const char *filename;
+	uint64_t arr_ptr;
+	if (!PyArg_ParseTuple(args, "sK", &filename, &arr_ptr)) {
+		return nullptr;
+	}
+
+	try {
+		std::vector<char> data = readDataFromBinaryFile(filename);
+		char *arr = reinterpret_cast<char *>(arr_ptr);
+		std::copy(data.begin(), data.end(), arr);
+		return Py_None;
+	} catch (const std::exception& e) {
+		PyErr_SetString(PyExc_RuntimeError, e.what());
+		return nullptr;
+	}
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 }
 
 void writeDataToBinaryFile(const std::string &filename, const char *data,
@@ -225,6 +259,7 @@ void writeDataToBinaryFile(const std::string &filename, const char *data,
 }
 
 static PyObject *writeDataToBinaryFileWrapper(PyObject *self, PyObject *args) {
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
   const char *filename;
   uint64_t arr_ptr;
   size_t num_bytes;
@@ -256,16 +291,55 @@ static PyObject *allocateHostMemory(PyObject *self, PyObject *args) {
                  "rtMallocHost failed with error code: 0x%x", error);
     return NULL;
   }
+=======
+	const char *filename;
+	uint64_t arr_ptr;
+	size_t num_bytes;
+
+	if (!PyArg_ParseTuple(args, "sKn", &filename, &arr_ptr, &num_bytes)) {
+		return nullptr;
+	}
+
+	try {
+		const char* data = reinterpret_cast<const char*>(arr_ptr);
+		writeDataToBinaryFile(filename, data, num_bytes);
+		return Py_None;
+	} catch (const std::exception& e) {
+		PyErr_SetString(PyExc_RuntimeError, e.what());
+		return nullptr;
+	}
+}
+
+static PyObject* allocateHostMemory(PyObject* self, PyObject* args) {
+	uint64_t num_bytes;
+	if (!PyArg_ParseTuple(args, "K", &num_bytes)) {
+		return nullptr;
+	}
+
+	void* host_ptr = nullptr;
+	rtError_t error = rtMallocHost(&host_ptr, num_bytes, RT_MEMORY_HOST);
+	if (error != RT_ERROR_NONE) {
+		PyErr_Format(PyExc_RuntimeError, "rtMallocHost failed with error code: 0x%x", error);
+		return nullptr;
+	}
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 
   PyObject *result = Py_BuildValue("K", (uint64_t)host_ptr);
 
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
   if (result == NULL) {
     rtFreeHost(host_ptr);
   }
+=======
+    if (result == nullptr) {
+        rtFreeHost(host_ptr);
+    }
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 
   return result;
 }
 
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
 static PyObject *allocateDeviceMemory(PyObject *self, PyObject *args) {
   uint64_t num_bytes;
   if (!PyArg_ParseTuple(args, "K", &num_bytes)) {
@@ -279,16 +353,37 @@ static PyObject *allocateDeviceMemory(PyObject *self, PyObject *args) {
                  error);
     return NULL;
   }
+=======
+static PyObject* allocateDeviceMemory(PyObject* self, PyObject* args) {
+	uint64_t num_bytes;
+	if (!PyArg_ParseTuple(args, "K", &num_bytes)) {
+		return nullptr;
+	}
+
+	void* device_ptr = nullptr;
+	rtError_t error = rtMalloc(&device_ptr, num_bytes, RT_MEMORY_HBM, 0);
+	if (error != RT_ERROR_NONE) {
+		PyErr_Format(PyExc_RuntimeError, "rtMalloc failed with error code: 0x%x", error);
+		return nullptr;
+	}
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 
   PyObject *result = Py_BuildValue("K", (uint64_t)device_ptr);
 
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
   if (result == NULL) {
     rtFree(device_ptr);
   }
+=======
+    if (result == nullptr) {
+        rtFree(device_ptr);
+    }
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 
   return result;
 }
 
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
 static PyObject *copyMemory(PyObject *self, PyObject *args) {
   uint64_t dst_ptr;
   uint64_t src_ptr;
@@ -357,12 +452,48 @@ static PyObject *setDeviceLimit(PyObject *self, PyObject *args) {
   return Py_None;
 }
 
+=======
+static PyObject* copyMemory(PyObject* self, PyObject* args) {
+	uint64_t dst_ptr;
+	uint64_t src_ptr;
+	size_t count;
+	const char* direction_str;
+	rtMemcpyKind_t copy_direction;
+
+	if (!PyArg_ParseTuple(args, "KKns", &dst_ptr, &src_ptr, &count, &direction_str)) {
+		return nullptr;
+	}
+
+	if (strcmp(direction_str, "H2D") == 0) {
+		copy_direction = RT_MEMCPY_HOST_TO_DEVICE;
+	} else if (strcmp(direction_str, "D2H") == 0) {
+		copy_direction = RT_MEMCPY_DEVICE_TO_HOST;
+	} else {
+		PyErr_SetString(PyExc_ValueError, "Invalid copy direction. Must be 'H2D' or 'D2H'.");
+		return nullptr;
+	}
+
+	void *dst = (void*)dst_ptr;
+	void *src = (void*)src_ptr;
+
+	rtError_t error = rtMemcpy(dst, count, src, count, copy_direction);
+	if (error != RT_ERROR_NONE) {
+		PyErr_Format(PyExc_RuntimeError, "rtMemcpy failed with error code: 0x%x", error);
+		return nullptr;
+	}
+
+	Py_INCREF(Py_None);
+	return Py_None;
+}
+
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 static PyMethodDef NpuUtilsMethods[] = {
     {"load_kernel_binary", loadKernelBinary, METH_VARARGS,
      "Load NPU kernel binary into NPU driver"},
     {"get_arch", getArch, METH_VARARGS, "Get soc version of NPU"},
     // sentinel
     {"get_aicore_num", getAiCoreNum, METH_VARARGS, "Get the number of AI core"},
+<<<<<<< flagtree/third_party/ascend/backend/npu_utils.cpp
     {"create_stream", createStream, METH_VARARGS, "Create a stream"},
     {"read_data_from_file", readDataFromBinaryFileWrapper, METH_VARARGS,
      "Read binary file into the array already allocated"},
@@ -376,6 +507,15 @@ static PyMethodDef NpuUtilsMethods[] = {
      "Copy data between host and device"},
     {"set_device_limit", setDeviceLimit, METH_VARARGS, "Set the limit of NPU"},
     {NULL, NULL, 0, NULL}};
+=======
+	{"create_stream", createStream, METH_VARARGS, "Create a stream"},
+	{"read_data_from_file", readDataFromBinaryFileWrapper, METH_VARARGS, "Read binary file into the array already allocated"},
+	{"write_data_to_file", writeDataToBinaryFileWrapper, METH_VARARGS, "Write an array to a binary file"},
+	{"allocate_device_memory", allocateDeviceMemory, METH_VARARGS, "Allocate device memory"},
+	{"allocate_host_memory", allocateHostMemory, METH_VARARGS, "Allocate host memory"},
+	{"copy_memory", copyMemory, METH_VARARGS, "Copy data between host and device"},
+    {nullptr, nullptr, 0, nullptr}};
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/npu_utils.cpp
 
 static PyModuleDef ModuleDef = {
     PyModuleDef_HEAD_INIT, "npu_utils",
@@ -384,8 +524,8 @@ static PyModuleDef ModuleDef = {
 
 PyMODINIT_FUNC PyInit_npu_utils(void) {
   PyObject *m = PyModule_Create(&ModuleDef);
-  if (m == NULL) {
-    return NULL;
+  if (m == nullptr) {
+    return nullptr;
   }
 
   PyModule_AddFunctions(m, NpuUtilsMethods);

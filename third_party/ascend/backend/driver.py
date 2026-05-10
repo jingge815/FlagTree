@@ -28,7 +28,7 @@ import sysconfig
 from typing import Optional
 import functools
 import hashlib
-from triton.runtime.cache import get_cache_manager, get_dump_manager
+from triton.runtime.cache import get_cache_manager, get_dump_manager, default_cache_dir
 from triton.backends.driver import DriverBase
 from triton.backends.compiler import GPUTarget
 from triton.backends.ascend.utils import (_precompile_npu_hash, _precompile_npu_ext, _build_npu_ext, _check_cxx11_abi,
@@ -69,7 +69,7 @@ class NPUUtils(object):
         env_arch = get_ascend_arch_from_env()
 
     def load_binary(self, name, kernel, shared, device):
-        fnname, mix_mode = name.split()
+        fnname, mix_mode = name.rsplit("_", 1)
         return self.npu_utils_mod.load_kernel_binary(fnname, kernel, shared, device, mix_mode)
 
     @functools.lru_cache()
@@ -93,19 +93,6 @@ class NPUUtils(object):
     @functools.lru_cache()
     def get_aivector_core_num(self):
         return self.get_device_properties("npu")["num_vectorcore"]
-
-    @functools.lru_cache()
-    def set_device_limit(self, device, ty, val):
-        """
-        Set npu device limit
-
-        Args:
-            device: Device id
-            ty: The type of the limit, valid types include:
-                "LOW_POWER_TIMEOUT", "WARP_STACK_SIZE", "DVG_WARP_STACK_SIZE", "STACK_SIZE"
-            val: The specific meaning of the value depends on the type of limit.
-        """
-        self.npu_utils_mod.set_device_limit(device, ty, val)
 
 
 class NPULauncher(object):
@@ -225,32 +212,56 @@ class NPUDriver(DriverBase):
         return get_backend_func("get_empty_tensor", cache_size // 4)
 
 
+<<<<<<< flagtree/third_party/ascend/backend/driver.py
 # fixed the issue of corrupted gch header files in multi-threaded scenarios.
 def _precompile_npu_ext_with_lock(header_path):
+=======
+def _precompile_npu_ext_with_lock(header_src, enable_precompile):
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/driver.py
     import fcntl
-    src_path = os.path.dirname(header_path)
-    lock_path = os.path.join(src_path, "precompiled.lock")
+    precompile_hash = _precompile_npu_hash(header_src)
+    cache = get_cache_manager(precompile_hash)
+    gch_path = cache.get_file("precompiled.h.gch")
+    header_path = cache.get_file("precompiled.h")
+    if enable_precompile: 
+        if header_path is not None and gch_path is not None:
+            return header_path
+    else:
+        if header_path is not None:
+            return header_path
+    cache_dir = os.getenv("TRITON_CACHE_DIR", "").strip() or default_cache_dir()
+    lock_path = os.path.join(cache_dir, f"{precompile_hash}.lock")
     with open(lock_path, "a+") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX)
-            _precompile_npu_ext(header_path)
+            header_path = cache.get_file("precompiled.h")
+            if enable_precompile:
+                gch_path = cache.get_file("precompiled.h.gch")
+                if header_path is not None and gch_path is not None:
+                    return header_path
+            else:
+                if header_path is not None:
+                    return header_path
+            header_path = cache.put(header_src, "precompiled.h", binary=False)
+            if not enable_precompile:
+                return header_path
+            src_dir = os.path.dirname(header_path)
+            gch_path = os.path.join(src_dir, "precompiled.h.gch")
+            _precompile_npu_ext(header_path, gch_path)
+            return header_path
         finally:
             fcntl.flock(f, fcntl.LOCK_UN)
-
+    
 
 def make_npu_launcher_stub(header_src, wrapper_src, debug=False):
     """
     Generate the launcher stub to launch the kernel
     """
-    precompile_hash = _precompile_npu_hash(header_src)
-    cache = get_cache_manager(precompile_hash)
-    header_path = cache.get_file("precompiled.h")
-    gch_path = cache.get_file("precompiled.h.gch")
+    enable_precompile = not os.getenv("TRITON_DISABLE_PRECOMPILE", 'false').lower() in ('true', '1')
     # if precompile header file and its gch file not exist, do precompile
-    if header_path is None and gch_path is None:
-        header_path = cache.put(header_src, "precompiled.h", binary=False)
-        _precompile_npu_ext_with_lock(header_path)
-
+    header_path = _precompile_npu_ext_with_lock(header_src, enable_precompile)
+    assert header_path is not None, "the precompiled.h path is empty."
+    
     # try to get cached file
     so_cache_key = hashlib.sha256(wrapper_src.encode("utf-8")).hexdigest()
     so_cache_manager = get_cache_manager(so_cache_key)
@@ -274,15 +285,13 @@ def make_npu_launcher_stub(header_src, wrapper_src, debug=False):
         return cache_path
 
     kernel_launcher_type = "torch"
-    enable_taskqueue = os.getenv("TRITON_ENABLE_TASKQUEUE", 'true').lower() in ('true', '1')
-    if not enable_taskqueue:
-        kernel_launcher_type = None
+
 
     with tempfile.TemporaryDirectory() as tmpdir:
         src_path = os.path.join(tmpdir, f"{name}.cxx")
         with open(src_path, "w") as f:
             f.write(wrapper_src)
-        so_path = _build_npu_ext(name, header_path, src_path, kernel_launcher=kernel_launcher_type, precompile=True)
+        so_path = _build_npu_ext(name, header_path, src_path, kernel_launcher=kernel_launcher_type, precompile=enable_precompile)
         if debug:
             with open(so_path, "rb") as f:
                 dump_manager.put(f.read(), so_name, binary=True)
@@ -555,10 +564,32 @@ static inline DevicePtrInfo getPointer(PyObject *obj, int idx) {
     ptr_info.dev_ptr = reinterpret_cast<void *>(PyLong_AsUnsignedLongLong(ret));
     if(!ptr_info.dev_ptr)
       return ptr_info;
-    Py_DECREF(ret);  // Thanks ChatGPT!
+    aclrtPtrAttributes attributes;
+    aclError status = aclrtPointerGetAttributes(ptr_info.dev_ptr, &attributes);
+
+    if (status == ACL_SUCCESS) {
+      if (attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE && attributes.location.type != 4) {
+        Py_DECREF(ret);
+        PyErr_Format(PyExc_ValueError,
+                     "Pointer argument (at %d) cannot be accessed from Triton (cpu tensor?)", idx);
+        ptr_info.valid = false;
+        return ptr_info;
+      }
+    } else {
+      Py_DECREF(ret);
+      PyErr_Format(PyExc_RuntimeError,
+                   "Failed to query pointer attributes at argument %d. "
+                   "Error code: %d. This may indicate invalid memory address "
+                   "or NPU device error.",
+                   idx, status);
+      ptr_info.valid = false;
+      return ptr_info;
+      }
+    Py_DECREF(ret);
     return ptr_info;
   }
   PyErr_SetString(PyExc_TypeError, "Pointer argument must be either uint64 or have data_ptr method");
+  ptr_info.valid = false;
   return ptr_info;
 }
 """
@@ -746,12 +777,13 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
   name.append(kernelName);
   void *workspace_addr_ptr = NULL;
   uint32_t blockNum4Workspace = gridX * gridY * gridZ;
+  {get_backend_func("pre_launch", True)}
   {f'''
   uint64_t totalWorkSpaceSize = {workspace_size} * blockNum4Workspace;
-  auto optionsWorkspace = at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte);
-  workspace_addr_ptr = {get_backend_func("allocate_memory", "totalWorkSpaceSize", "optionsWorkspace")}
+  {get_backend_func("allocate_memory", "totalWorkSpaceSize", "stream")}
   ''' if workspace_size > 0 else ''}
   {'auto launch_call = [=]() -> rtError_t' if enable_taskqueue else ''} {{
+    {get_backend_func("pre_launch", False)}
     uint32_t blockNum = gridX * gridY * gridZ;
 
     #ifdef ENABLE_GRID_WARN_PRINT
@@ -761,14 +793,17 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
         warned = true;
     }}
     #endif
+<<<<<<< flagtree/third_party/ascend/backend/driver.py
     {get_backend_func("pre_launch")}
+=======
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/driver.py
     {'blockNum = std::min(blockNum, (uint32_t)' + str(num_physical_blocks) + ');' if enable_auto_map_parallel_blocks else ''}
     // set mixBlockNumRation for nodeBasicBlockDim for msprof report
     uint32_t mixBlockNumRation = {mix_block_dim_ratio};
     uint32_t nodeBasicBlockDim = (mixBlockNumRation << 16) + blockNum;
 
     {'cce::internal::DebugTunnelData *DTData = cce::internal::DebugTunnel::Open(blockNum);' if enable_device_print else ''}
-    rtError_t ret;
+    rtError_t ret = RT_ERROR_NONE;
     {'void *ffts_addr = NULL; uint32_t ffts_len; ret = rtGetC2cCtrlAddr((uint64_t*)&ffts_addr, &ffts_len);' if target_support_ffts else ''}
     {'if (ret != RT_ERROR_NONE) return ret;' if (target_support_ffts and enable_taskqueue) else 'if (ret != RT_ERROR_NONE) return;' if (target_support_ffts and (not enable_taskqueue)) else ''}
     // stub argument for workspace
@@ -776,7 +811,7 @@ static void _launch(const char* kernelName, const void* func, rtStream_t stream,
     uint16_t ModuleId = 0;
     {f'''
     uint64_t syncBlockLockSize = {lock_num} * sizeof(int64_t);
-    syncBlockLock_ptr = {get_backend_func("allocate_sync_block_lock", "syncBlockLockSize", "stream")}
+    {get_backend_func("allocate_sync_block_lock", "syncBlockLockSize", "stream")}
     if (!syncBlockLock_ptr) {{
       {alloc_success_code if enable_taskqueue else sync_lock_fail_code}
     }}
@@ -880,8 +915,12 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
     }
   }}
 
-  if (launch_enter_hook != Py_None && !PyObject_CallObject(launch_enter_hook, args)) {{
-    return NULL;
+  if (launch_enter_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_enter_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
   }}
 
   // get kernel_name
@@ -904,8 +943,12 @@ static PyObject* launch(PyObject* self, PyObject* args) {{
   if (PyErr_Occurred()) {{
     return NULL;
   }}
-  if (launch_exit_hook != Py_None && !PyObject_CallObject(launch_exit_hook, args)) {{
-    return NULL;
+  if(launch_exit_hook != Py_None){{
+    PyObject* args = Py_BuildValue("(O)", launch_metadata);
+    PyObject* ret = PyObject_CallObject(launch_exit_hook, args);
+    Py_DECREF(args);
+    if (!ret)
+      return NULL;
   }}
   Py_RETURN_NONE;
 }}

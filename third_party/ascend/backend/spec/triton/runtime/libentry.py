@@ -1,4 +1,3 @@
-# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 # Copyright 2018-2020 Philippe Tillet
 # Copyright 2020-2022 OpenAI
 # Copyright © 2024 BAAI. All rights reserved.
@@ -285,6 +284,9 @@ def libentry():
     """
 
     def decorator(fn):
+        from triton.runtime.interpreter import InterpretedFunction
+        if isinstance(fn, InterpretedFunction):
+            return fn
         return LibEntry(fn)
 
     return decorator

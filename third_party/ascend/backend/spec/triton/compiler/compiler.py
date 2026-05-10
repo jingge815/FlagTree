@@ -169,6 +169,11 @@ def triton_key():
     return f'{__version__}' + '-'.join(contents)
 
 
+def get_cache_key(src, backend, backend_options, env_vars):
+    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{backend_options.hash()}-{str(sorted(env_vars.items()))}"
+    return key
+
+
 def parse(full_name, ext, context):
     if ext == "ttir" or ext == "ttgir":
         module = ir.parse_mlir_module(full_name, context)
@@ -217,7 +222,7 @@ def filter_traceback(e: BaseException):
         e.__traceback__ = frames[0]
 
 
-def compile(src, target=None, options=None):
+def compile(src, target=None, options=None, _env_vars=None):
     if target is None:
         target = driver.active.get_current_target()
     assert isinstance(target, GPUTarget), "target must be of GPUTarget type"
@@ -230,8 +235,8 @@ def compile(src, target=None, options=None):
     extra_options = src.parse_options()
     options = backend.parse_options(dict(options or dict(), **extra_options))
     # create cache manager
-    env_vars = get_cache_invalidating_env_vars()
-    key = f"{triton_key()}-{src.hash()}-{backend.hash()}-{options.hash()}-{str(sorted(env_vars.items()))}"
+    env_vars = get_cache_invalidating_env_vars() if _env_vars is None else _env_vars
+    key = get_cache_key(src, backend, options, env_vars=env_vars)
     hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
     fn_cache_manager = get_cache_manager(hash)
     # For dumping/overriding only hash the source as we want it to be independent of triton
@@ -291,7 +296,11 @@ def compile(src, target=None, options=None):
             else:
                 stage_name = "MLIRCompile"
             error_detail = e.stderr.decode('utf-8') if hasattr(e, 'stderr') and e.stderr else str(e)
-            error_detail += f"\n\n[INFO]: The compiled kernel cache is in {fn_cache_manager.cache_dir}\n\n"
+            from ..runtime.cache import FileCacheManager
+            if isinstance(fn_cache_manager, FileCacheManager):
+                error_detail += f"\n\n[INFO]: The compiled kernel cache is in {fn_cache_manager.cache_dir}\n\n"
+            else:
+                error_detail += f"\n\n[INFO]: The compiled kernel cache is {file_name}.{ext}\n\n"
             raise MLIRCompilationError(stage_name, error_detail) from e
         ir_filename = f"{file_name}.{ext}"
         if (fn_override_manager is not None and (full_name := fn_override_manager.get_file(ir_filename)) is not None):

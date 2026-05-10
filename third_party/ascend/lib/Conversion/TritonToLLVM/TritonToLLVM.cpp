@@ -36,6 +36,7 @@ static Type getElementType(Value value) {
   return type;
 }
 
+<<<<<<< flagtree/third_party/ascend/lib/Conversion/TritonToLLVM/TritonToLLVM.cpp
 static int64_t get1DTensorLength(Value tensor) {
   auto type = mlir::cast<TensorType>(tensor.getType());
   auto shape = type.getShape();
@@ -44,6 +45,12 @@ static int64_t get1DTensorLength(Value tensor) {
          "ElementwiseInlineAsm now can operate only with 1D tensors");
 
   return shape[0];
+=======
+static int64_t getTensorNumElements(Value tensor)
+{
+    auto type = mlir::cast<RankedTensorType>(tensor.getType());
+    return type.getNumElements();
+>>>>>>> triton-ascend@HEAD/third_party/ascend/lib/TritonToLLVM/TritonToLLVM.cpp
 }
 
 static Value getInt32Value(RewriterBase &rewriter, Location loc, int val) {
@@ -81,6 +88,7 @@ SmallVector<Value> packOperands(mlir::triton::ElementwiseInlineAsmOp op,
   return packedOperands;
 }
 
+<<<<<<< flagtree/third_party/ascend/lib/Conversion/TritonToLLVM/TritonToLLVM.cpp
 static SmallVector<Value> unpackElements(Location loc, Value packedValues,
                                          RewriterBase &rewriter) {
   auto type = mlir::cast<TensorType>(packedValues.getType());
@@ -96,6 +104,27 @@ static SmallVector<Value> unpackElements(Location loc, Value packedValues,
                                                          packedValues, indexes);
     result.push_back(extracted);
   }
+=======
+static SmallVector<Value> unpackElements(Location loc, Value packedValues, RewriterBase &rewriter)
+{
+    auto type = mlir::cast<RankedTensorType>(packedValues.getType());
+    auto elementType = type.getElementType();
+    auto shape = type.getShape();
+
+    int64_t numElements = type.getNumElements();
+
+    SmallVector<Value> result;
+    for (int64_t linearIdx = 0; linearIdx < numElements; linearIdx++) {
+        SmallVector<Value> indexes(shape.size());
+        int64_t remaining = linearIdx;
+        for (int64_t dim = shape.size() - 1; dim >= 0; dim--) {
+            indexes[dim] = rewriter.create<arith::ConstantIndexOp>(loc, remaining % shape[dim]);
+            remaining /= shape[dim];
+        }
+        Value extracted = rewriter.create<tensor::ExtractOp>(loc, elementType, packedValues, indexes);
+        result.push_back(extracted);
+    }
+>>>>>>> triton-ascend@HEAD/third_party/ascend/lib/TritonToLLVM/TritonToLLVM.cpp
 
   return result;
 }
@@ -175,8 +204,12 @@ createDestOps(triton::ElementwiseInlineAsmOp op, RewriterBase &rewriter,
   return ret;
 }
 
-} // namespace
+static LogicalResult processScalarInlineAsm(triton::ElementwiseInlineAsmOp op,
+                                            PatternRewriter &rewriter)
+{
+  Location loc = op.getLoc();
 
+<<<<<<< flagtree/third_party/ascend/lib/Conversion/TritonToLLVM/TritonToLLVM.cpp
 struct ElementwiseInlineAsmOpConversion
     : OpRewritePattern<triton::ElementwiseInlineAsmOp> {
   using OpRewritePattern<triton::ElementwiseInlineAsmOp>::OpRewritePattern;
@@ -214,6 +247,75 @@ struct ElementwiseInlineAsmOpConversion
         unpackedResults[j].insert(unpackedResults[j].end(), cur[j].begin(),
                                   cur[j].end());
       }
+=======
+  auto outsWrapped = createDestOps(op, rewriter, {}, loc);
+
+  SmallVector<Value> outs;
+  for (const auto &resWrapped : outsWrapped) {
+    outs.push_back(resWrapped[0]);
+  }
+  rewriter.replaceOp(op, outs);
+
+  return success();
+}
+
+static LogicalResult processVectorInlineAsm(triton::ElementwiseInlineAsmOp op,
+                                            PatternRewriter &rewriter)
+{
+  Location loc = op.getLoc();
+
+  SmallVector<SmallVector<Value>> unpackedOperands;
+  for (auto operand : op.getOperands()) {
+    auto unpackedOperand = unpackElements(loc, operand, rewriter);
+    unpackedOperands.push_back(unpackedOperand);
+  }
+
+  int64_t resultLength = getTensorNumElements(op->getResult(0));
+  if (resultLength % op.getPackedElement()) {
+    op.emitError("Result tensor should be diveded to pack");
+    return failure();
+  }
+
+  SmallVector<SmallVector<Value>> unpackedResults(op->getNumResults());
+  for (int64_t i = 0; i < resultLength; i += op.getPackedElement()) {
+    // Block of elements to process with one call to the inline asm.  This is
+    // ordered opposite `unpackedResults`: The outer dim is
+    // op.getPackedElement(), and the inner dim is the operand.
+    SmallVector<SmallVector<Value>> block(op.getPackedElement());
+    for (auto &os : unpackedOperands) {
+      for (int j = 0; j < op.getPackedElement(); j++) {
+        block[j].push_back(os[i + j]);
+      }
+    }
+    auto cur = createDestOps(op, rewriter, block, loc);
+    assert(cur.size() == unpackedResults.size());
+    for (unsigned j = 0; j < cur.size(); j++) {
+      unpackedResults[j].insert(unpackedResults[j].end(), cur[j].begin(),
+                                cur[j].end());
+    }
+  }
+  // Reorder and pack the results.
+  SmallVector<Value> outs;
+  for (int i = 0; i < unpackedResults.size(); i++) {
+    outs.push_back(rewriter.create<tensor::FromElementsOp>(
+        loc, op->getResult(i).getType(), unpackedResults[i]));
+  }
+  rewriter.replaceOp(op, outs);
+
+  return success();
+}
+
+} // namespace
+
+struct ElementwiseInlineAsmOpConversion : OpRewritePattern<triton::ElementwiseInlineAsmOp> {
+    using OpRewritePattern<triton::ElementwiseInlineAsmOp>::OpRewritePattern;
+
+    LogicalResult matchAndRewrite(triton::ElementwiseInlineAsmOp op,
+                                  PatternRewriter &rewriter) const final
+    {
+      return op.getOperands().empty() ? processScalarInlineAsm(op, rewriter)
+                                      : processVectorInlineAsm(op, rewriter);
+>>>>>>> triton-ascend@HEAD/third_party/ascend/lib/TritonToLLVM/TritonToLLVM.cpp
     }
     // Reorder and pack the results.
     SmallVector<Value> outs;

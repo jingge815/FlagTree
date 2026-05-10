@@ -51,6 +51,7 @@ def atomic_add_supply(in_ptr0, out_ptr0, n_elements, BLOCK_SIZE: tl.constexpr):
     tmp1 = tl.atomic_add(out_ptr0 + (x1), tmp0, xmask)
 
 
+<<<<<<< flagtree/third_party/ascend/unittest/pytest_ut/test_atomic_add.py
 @pytest.mark.parametrize('param_list', [
     ['int16', (32, 32), 2],
     ['int8', (32, 32), 2],
@@ -60,13 +61,50 @@ def atomic_add_supply(in_ptr0, out_ptr0, n_elements, BLOCK_SIZE: tl.constexpr):
     ['float16', (128, 128), 16],
     ['float32', (32768, 16), 32],
 ])
+=======
+@triton.jit
+def atomic_add_for_load_offset(
+    index_ptr, in_ptr0, out_ptr0
+):
+    index = tl.atomic_add(index_ptr, 1)
+    val = tl.load(in_ptr0 + index)
+    tl.store(out_ptr0, val)
+
+
+@triton.jit
+def atomic_add_for_store_offset(
+    index_ptr, out_ptr0
+):
+    index = tl.atomic_add(index_ptr, 1)
+    tl.store(out_ptr0 + index, 1)
+
+
+@pytest.mark.parametrize('param_list',
+                         [
+                             ['int64', (256, 32), 2],
+                             ['int32', (32, 32), 2],
+                             ['int16', (32, 32), 2],
+                             ['int8', (32, 32), 2],
+                             ['uint8', (32, 32), 2],
+                             ['float32', (32, 32), 2],
+                             ['float16', (64, 64), 4],
+                             ['bfloat16', (64, 64), 4],
+                             ['float32', (128, 128), 8],
+                             ['float16', (128, 128), 16],
+                             ['float32', (32768, 16), 32],
+                         ]
+                         )
+>>>>>>> triton-ascend@HEAD/third_party/ascend/unittest/pytest_ut/test_atomic_add.py
 def test_atomic_add(param_list):
     dtype, shape, ncore = param_list
     block_size = shape[0] * shape[1] / ncore
     split_size = shape[0] // ncore
     x0_value = 3
     x0 = torch.full(shape, x0_value, dtype=eval(f'torch.{dtype}')).npu()
-    x1 = torch.full((split_size, shape[1]), 2, dtype=eval(f'torch.{dtype}')).npu()
+    if dtype == 'int64':
+        x1 = torch.randint(-10**15, 10**15, (split_size, shape[1]), dtype=eval(f'torch.{dtype}')).npu()
+    else:
+        x1 = torch.full((split_size, shape[1]), 2, dtype=eval(f'torch.{dtype}')).npu()
     y = torch.full((split_size, shape[1]), -10, dtype=eval(f'torch.{dtype}')).npu()
 
     y_ref = x1 + 0
@@ -155,6 +193,36 @@ def test_atomic_add_2d_supply(dtype, shape):
     test_common.validate_cmp(dtype, x1, x1_ref)
 
 
+<<<<<<< flagtree/third_party/ascend/unittest/pytest_ut/test_atomic_add.py
+=======
+def test_atomic_add_for_load_offset():
+    index = torch.tensor([1]).npu()
+    input_tensor = torch.zeros(5).npu()
+    output = torch.tensor([1]).npu()
+    index_ref = index.clone()
+    index_ref += 1
+    output_ref = output.clone()
+    output_ref = input_tensor[index]
+    
+    atomic_add_for_load_offset[(1, )](index, input_tensor, output)
+    torch.equal(index, index_ref)
+    torch.equal(output, output_ref)
+
+
+def test_atomic_add_for_store_offset():
+    index = torch.tensor([1]).npu()
+    output = torch.zeros(5).npu()
+    index_ref = index.clone()
+    index_ref += 1
+    output_ref = output.clone()
+    output_ref[index] = 1
+    
+    atomic_add_for_store_offset[(1, )](index, output)
+    torch.equal(index, index_ref)
+    torch.equal(output, output_ref)
+
+
+>>>>>>> triton-ascend@HEAD/third_party/ascend/unittest/pytest_ut/test_atomic_add.py
 if __name__ == "__main__":
     param_list = ['float32', (32, 32), 2]
     test_atomic_add_2d(param_list)

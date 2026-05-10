@@ -27,14 +27,10 @@ import test_common
 
 
 @triton.jit
-def fn_npu_f32(output_ptr, x_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+def fn_npu_f32(output_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
     xidx = tl.arange(0, XB)
     yidx = tl.arange(0, YB)
     zidx = tl.arange(0, ZB)
-
-    idx = xidx[:, None, None] * YB * ZB + yidx[None, :, None] * ZB + zidx[None, None, :]
-
-    X = tl.load(x_ptr + idx)
 
     ret = tl.zeros((XB, YB, ZB), dtype=tl.float32)
 
@@ -44,14 +40,10 @@ def fn_npu_f32(output_ptr, x_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.con
 
 
 @triton.jit
-def fn_npu_f16(output_ptr, x_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+def fn_npu_f16(output_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
     xidx = tl.arange(0, XB)
     yidx = tl.arange(0, YB)
     zidx = tl.arange(0, ZB)
-
-    idx = xidx[:, None, None] * YB * ZB + yidx[None, :, None] * ZB + zidx[None, None, :]
-
-    X = tl.load(x_ptr + idx)
 
     ret = tl.zeros((XB, YB, ZB), dtype=tl.float16)
 
@@ -61,14 +53,10 @@ def fn_npu_f16(output_ptr, x_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.con
 
 
 @triton.jit
-def fn_npu_i8(output_ptr, x_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
+def fn_npu_i8(output_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.constexpr):
     xidx = tl.arange(0, XB)
     yidx = tl.arange(0, YB)
     zidx = tl.arange(0, ZB)
-
-    idx = xidx[:, None, None] * YB * ZB + yidx[None, :, None] * ZB + zidx[None, None, :]
-
-    X = tl.load(x_ptr + idx)
 
     ret = tl.zeros((XB, YB, ZB), dtype=tl.int8)
 
@@ -87,17 +75,14 @@ def fn_npu_i8(output_ptr, x_ptr, XB: tl.constexpr, YB: tl.constexpr, ZB: tl.cons
 ])
 def test_case(param_list):
     dtype, shape, ncore, XB, YB, ZB = param_list
-    x0 = test_common.generate_tensor(shape, dtype)
 
     y_ref = torch.full((XB, YB, ZB), 0, dtype=eval('torch.' + dtype)).npu()
-    print(f"y_ref = {y_ref[0, 0, 0:4]}")
 
     y_cal = torch.randint(1, (XB, YB, ZB), dtype=eval('torch.' + dtype)).npu()
     if dtype == "float32":
-        fn_npu_f32[ncore, 1, 1](y_cal, x0, XB, YB, ZB)
+        fn_npu_f32[ncore, 1, 1](y_cal, XB, YB, ZB)
     elif dtype == "float16":
-        fn_npu_f16[ncore, 1, 1](y_cal, x0, XB, YB, ZB)
+        fn_npu_f16[ncore, 1, 1](y_cal, XB, YB, ZB)
     else:
-        fn_npu_i8[ncore, 1, 1](y_cal, x0, XB, YB, ZB)
-    print(f"y_cal = {y_cal[0, 0, 0:4]}")
+        fn_npu_i8[ncore, 1, 1](y_cal, XB, YB, ZB)
     test_common.validate_cmp(dtype, y_cal, y_ref)

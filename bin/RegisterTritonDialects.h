@@ -1,4 +1,5 @@
 #pragma once
+<<<<<<< flagtree/bin/RegisterTritonDialects.h
 
 #ifdef __AMD__
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
@@ -7,6 +8,20 @@
 #ifdef __NVIDIA__
 #include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
 #endif
+=======
+#include "ascend/include/TritonToLinalg/Passes.h"
+#include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
+#include "ascend/include/TritonToStructured/Passes.h"
+#include "ascend/include/TritonToAnnotation/Passes.h"
+#include "ascend/include/TritonToUnstructure/Passes.h"
+#include "ascend/include/TritonToHIVM/Passes.h"
+#include "ascend/include/TritonToHFusion/Passes.h"
+#include "ascend/include/TritonToLLVM/Passes.h"
+#include "ascend/include/AutoBlockify/Passes.h"
+// #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
+// #include "amd/include/TritonAMDGPUTransforms/Passes.h"
+// #include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
+>>>>>>> triton-ascend@HEAD/bin/RegisterTritonDialects.h
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #ifdef __NVIDIA__
@@ -66,11 +81,26 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
 #endif
   mlir::triton::registerConvertTritonToTritonGPUPass();
   mlir::triton::registerAllocateSharedMemoryPass();
+<<<<<<< flagtree/bin/RegisterTritonDialects.h
 #ifdef __NVIDIA__
   mlir::triton::registerConvertTritonGPUToLLVMPass();
   mlir::triton::registerConvertNVGPUToLLVMPass();
   mlir::triton::registerDecomposeUnsupportedNVIDIAConversions();
 #endif
+=======
+  // mlir::triton::registerConvertTritonGPUToLLVMPass();
+  // mlir::triton::registerConvertNVGPUToLLVMPass();
+  // mlir::triton::registerDecomposeUnsupportedNVIDIAConversions();
+  mlir::triton::registerTritonToLinalgPasses();
+  mlir::triton::registerDiscreteMaskAccessConversion();
+  mlir::triton::registerTritonToStructuredPasses();
+  mlir::triton::registerTritonToAnnotationPasses();
+  mlir::triton::registerTritonToUnstructurePasses();
+  mlir::triton::registerTritonToHIVMPasses();
+  mlir::triton::registerTritonToHFusionPasses();
+  mlir::triton::registerTritonToLLVMPasses();
+  mlir::triton::registerAutoBlockifyPasses();
+>>>>>>> triton-ascend@HEAD/bin/RegisterTritonDialects.h
   mlir::registerLLVMDIScope();
 
 #ifdef __AMD__

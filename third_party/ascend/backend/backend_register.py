@@ -33,7 +33,7 @@ class BackendStrategyRegistry:
             if category not in self.strategies:
                 self.strategies[category] = {}
             if method in self.strategies[category]:
-                raise ValueError(f"Strategy {name} already registered")
+                raise ValueError(f"Strategy {method} already registered")
             self.strategies[category][method] = func
             return func
 
@@ -164,7 +164,7 @@ def get_empty_tensor(size):
 
 
 @backend_strategy_registry.register("mindspore", "get_tensor_params_shape")
-def get_tensor_params_shape(args):
+def get_tensor_params_shape(*args):
     import mindspore
     tensor_params = [arg for arg in args if isinstance(arg, mindspore.Tensor)]
     tensor_params_shape = []
@@ -174,7 +174,7 @@ def get_tensor_params_shape(args):
 
 
 @backend_strategy_registry.register("torch_npu", "get_tensor_params_shape")
-def get_tensor_params_shape(args):
+def get_tensor_params_shape(*args):
     import torch
     tensor_params = [arg for arg in args if isinstance(arg, torch.Tensor)]
     tensor_params_shape = []
@@ -188,10 +188,13 @@ def get_cc_cmd(build_pch):
     import mindspore
     mindspore_path = os.path.dirname(os.path.realpath(mindspore.__file__))
     cc_cmd = [
+        f"-I{mindspore_path}",
+        f"-I{os.path.join(mindspore_path, 'include/')}",
         f"-I{os.path.join(mindspore_path, 'include/third_party')}",
         f"-I{os.path.join(mindspore_path, 'include/third_party/robin_hood_hashing')}",
         f"-I{os.path.join(mindspore_path, 'include/mindspore/core')}",
         f"-I{os.path.join(mindspore_path, 'include/mindspore/core/include')}",
+        f"-I{os.path.join(mindspore_path, 'include/mindspore/core/mindrt/include')}",
         f"-I{os.path.join(mindspore_path, 'include/mindspore/ccsrc')}",
         f"-I{os.path.join(mindspore_path, 'include/mindspore/ccsrc/include')}",
         f"-I{os.path.join(mindspore_path, 'include/mindspore/ops')}",
@@ -255,23 +258,31 @@ def set_current_device(device_id):
 @backend_strategy_registry.register("mindspore", "get_current_stream")
 def get_current_stream(device):
     import mindspore
-    return mindspore.current_stream().id
+    try:
+        return mindspore.current_stream().stream_ptr()
+    except Exception:
+        return mindspore.current_stream().id
 
 
 @backend_strategy_registry.register("torch_npu", "get_current_stream")
 def get_current_stream(device):
     import torch
     import torch_npu
-    from torch_npu._C import _npu_getCurrentRawStream
     if device is None:
         device = torch.npu.current_device()
-    return _npu_getCurrentRawStream(device)
+    if hasattr(torch_npu._C, "_npu_getCurrentRawStreamNoWait"):
+        from torch_npu._C import _npu_getCurrentRawStreamNoWait
+        return _npu_getCurrentRawStreamNoWait(device)
+    else:
+        from torch_npu._C import _npu_getCurrentRawStream
+        return _npu_getCurrentRawStream(device)
 
 
 @backend_strategy_registry.register("mindspore", "header_file")
 def header_file(enable_taskqueue):
     return f'''#include "include/utils/device_manager_conf.h"
 #include "include/runtime/hardware_abstract/device_context/device_context_manager.h"
+#include "include/mindspore/ops/kernel/ascend/aclnn/pyboost_impl/aclnn_utils.h"
 {'#include "include/pynative/utils/runtime/op_executor.h"' if {enable_taskqueue} else ''}
 {'#include "include/runtime/pipeline/pipeline.h"' if {enable_taskqueue} else ''}'''
 
@@ -285,34 +296,43 @@ def header_file(enable_taskqueue):
 
 @backend_strategy_registry.register("mindspore", "allocate_memory")
 def allocate_memory(size, stream):
-    return f"device_context->device_res_manager_->AllocateMemory({size}, reinterpret_cast<uint64_t>({stream}));"
+    return f'''auto work_ptr = std::make_shared<mindspore::kernel::pyboost::MemBlock>(device_context, {size}, reinterpret_cast<uint64_t>({stream}));
+    workspace_addr_ptr = work_ptr->ptr_;'''
 
 
 @backend_strategy_registry.register("torch_npu", "allocate_memory")
-def allocate_memory(size, option):
-    return f"const_cast<void *>(at::empty({size}, {option}).storage().data());"
+def allocate_memory(size, stream):
+    return f"workspace_addr_ptr = const_cast<void *>(at::empty({size}, at::TensorOptions().device(at::kPrivateUse1).dtype(at::kByte)).storage().data());"
+
+
+@backend_strategy_registry.register("mindspore", "allocate_sync_block_lock")
+def allocate_sync_block_lock(size, stream):
+    return f'''auto sync_ptr = std::make_shared<mindspore::kernel::pyboost::MemBlock>(device_context, {size}, reinterpret_cast<uint64_t>({stream}));
+    syncBlockLock_ptr = work_ptr->ptr_;'''
 
 
 @backend_strategy_registry.register("torch_npu", "allocate_sync_block_lock")
 def allocate_sync_block_lock(size, stream):
-    return f"const_cast<void *>(at_npu::native::allocate_workspace({size}, {stream}).storage().data());"
+    return f"syncBlockLock_ptr = const_cast<void *>(at_npu::native::allocate_workspace({size}, {stream}).storage().data());"
 
 
 @backend_strategy_registry.register("mindspore", "pre_launch")
-def pre_launch():
-    return '''static auto device_context = mindspore::device::DeviceContextManager::GetInstance().GetOrCreateDeviceContext({mindspore::device::DeviceType::kAscend, mindspore::DeviceManagerConf::GetInstance()->device_id()});
-    device_context->device_res_manager_->BindDeviceToCurrentThread(false);'''
+def pre_launch(first_call):
+    if first_call:
+        return '''static auto device_context = mindspore::device::DeviceContextManager::GetInstance().GetOrCreateDeviceContext({mindspore::device::DeviceType::kAscend, mindspore::DeviceManagerConf::GetInstance()->device_id()});
+        device_context->device_res_manager_->BindDeviceToCurrentThread(false);'''
+    else:
+        return '''device_context->device_res_manager_->BindDeviceToCurrentThread(false);'''
 
 
 @backend_strategy_registry.register("torch_npu", "pre_launch")
-def pre_launch():
+def pre_launch(first_call):
     return ""
 
 
 @backend_strategy_registry.register("mindspore", "async_launch")
 def async_launch(func):
-    return f'''mindspore::runtime::OpExecutor::DispatchLaunchTask({func});
-    mindspore::runtime::Pipeline::Get().launch_stage()->Wait();'''
+    return f'''mindspore::runtime::OpExecutor::DispatchLaunchTask({func});'''
 
 
 @backend_strategy_registry.register("torch_npu", "async_launch")

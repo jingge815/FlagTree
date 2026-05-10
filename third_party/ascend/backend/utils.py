@@ -28,6 +28,7 @@ import sysconfig
 from pathlib import Path
 import logging
 from platform import python_version
+from triton.tools.get_ascend_devices import is_compile_on_910_95
 from triton.backends.ascend.backend_register import backend_strategy_registry
 
 import pybind11
@@ -152,7 +153,10 @@ def _get_llvm_path(path: str, *paths) -> str:
 def _get_npucompiler_path() -> str:
     ascend_dir = os.path.dirname(os.path.abspath(__file__))
     env = os.environ.copy()
-    npu_compiler_path = os.path.join(ascend_dir, "bishengir", "bin", "bishengir-compile")
+    if is_compile_on_910_95:
+        npu_compiler_path = os.path.join(ascend_dir, "bishengir-a5", "bin", "bishengir-compile")
+    else:
+        npu_compiler_path = os.path.join(ascend_dir, "bishengir", "bin", "bishengir-compile")
     if os.path.exists(npu_compiler_path):
         npuir_env_path = os.path.dirname(npu_compiler_path)
         env["PATH"] = npuir_env_path + ":" + env["PATH"]
@@ -263,6 +267,13 @@ def _enable_print_ub_bits() -> bool:
     return os.getenv("ENABLE_PRINT_UB_BITS", "false").lower() in ("true", "1")
 
 
+<<<<<<< flagtree/third_party/ascend/backend/utils.py
+=======
+def _enable_dump_memory_info() -> bool:
+    return os.getenv("TRITON_MEMORY_DISPLAY", "false").lower() in ("true", "1")
+
+
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/utils.py
 def _get_cxx():
     cxx = os.environ.get("CC")
     if cxx is None:
@@ -301,12 +312,17 @@ def _precompile_npu_hash(header_src):
     hash_txt = hashlib.sha256("_".join(version_txt).encode("utf-8")).hexdigest()
     return hash_txt
 
+<<<<<<< flagtree/third_party/ascend/backend/utils.py
 
 def _precompile_npu_ext(header_path):
     src_dir = os.path.dirname(header_path)
     gch_path = os.path.join(src_dir, "precompiled.h.gch")
     cxx = _get_cxx()
+=======
+>>>>>>> triton-ascend@HEAD/third_party/ascend/backend/utils.py
 
+def _precompile_npu_ext(header_path, gch_path):
+    cxx = _get_cxx()
     cc_cmd = [cxx, "-x", "c++-header", header_path]
     # disable all warnings
     cc_cmd += [f"-w"]
@@ -344,12 +360,13 @@ def _precompile_npu_ext(header_path):
 
     cc_cmd += ["-std=c++17", "-shared", "-fPIC", "-o", gch_path]
 
-    ret = subprocess.check_call(cc_cmd)
+    result = subprocess.run(cc_cmd, capture_output=True, text=True)
 
-    if ret != 0:
-        print(f"Unable to precompile header file, ret is: {ret}")
+    if result.returncode == 0:
+        return header_path
+    else:
+        raise RuntimeError(f"Failed to compile {gch_path}, error: {result.stderr},cmd={cc_cmd}")
 
-    return header_path
 
 
 def _build_npu_ext(obj_name: str, header_path, src_path, *, kernel_launcher="torch", precompile=False) -> str:
@@ -399,8 +416,8 @@ def _build_npu_ext(obj_name: str, header_path, src_path, *, kernel_launcher="tor
         "-lascendcl",
     ]
     # FIXME: check why this condition works wrong in parall scene
-    # if kernel_launcher == "torch":
-    cc_cmd += get_backend_func("get_cc_cmd", build_pch=False)
+    if kernel_launcher == "torch":
+        cc_cmd += get_backend_func("get_cc_cmd", build_pch=False)
 
     cc_cmd += ["-std=c++17", "-shared", "-fPIC", "-Winvalid-pch", "-o", so_path]
 
@@ -413,7 +430,7 @@ def _build_npu_ext(obj_name: str, header_path, src_path, *, kernel_launcher="tor
             # only for clang++, when precompile invalid, fallback to normal compile
             return _build_npu_ext(obj_name, header_path, src_path, precompile=False)
         else:
-            raise RuntimeError(f"Failed to compile {src_path}, error: {result.stderr}")
+            raise RuntimeError(f"Failed to compile {src_path}, error: {result.stderr},cmd={cc_cmd}")
 
 
 def _get_kernel_target(metadata: dict):
@@ -531,8 +548,11 @@ def is_ffts_supported(arch: str):
     Cases:
     - empty str: User does not specify arch, thus it runs on 910B/910D both of which support ffts. Return True.
     - Ascend310B4: 310B4 does not support ffts. Return False.
+    - Ascend910_95*: 910_95 does not support ffts. Return False.
     - Other arch: 910B/910D supports ffts. Return True.
     '''
+    if is_compile_on_910_95:
+        return False
     if arch in ["Ascend910A", "Ascend310B4"]:
         return False
     return True
@@ -541,5 +561,17 @@ def is_ffts_supported(arch: str):
 def force_disable_ffts():
     '''
     '''
+    if is_compile_on_910_95:
+        return True
     disable_ffts = os.getenv("TRITON_DISABLE_FFTS", "false").lower() in ("true", "1")
     return disable_ffts
+
+
+def triton_support_ffts():
+    arch = get_ascend_arch_from_env()
+    return is_ffts_supported(arch) and (not force_disable_ffts())
+
+
+def triton_enable_libdevice_simt():
+    enable_libdevice_simt = os.getenv("TRITON_ENABLE_LIBDEVICE_SIMT", False)
+    return enable_libdevice_simt

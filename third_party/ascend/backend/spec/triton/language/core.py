@@ -1542,15 +1542,24 @@ def dot(input, other, acc=None, input_precision=None, allow_tf32=None, max_num_i
       specified (i.e. at least one must be :code:`None`).
     """
     assert input_precision is None or allow_tf32 is None, "Only one of input_precision and allow_tf32 can be specified"
-    assert not allow_tf32, "allow_tf32 is deprecated, please use input_precision='hf32' on Ascend instead."
+    assert not allow_tf32, "allow_tf32 is not supported as 'True', please use fp32 on Ascend instead."
     if input_precision is None:
         supports_tf32 = _builder and "tf32" in _builder.options.allowed_dot_input_precisions
         default_precision = "tf32" if (supports_tf32 and (allow_tf32 or allow_tf32 is None)) else "ieee"
+        # when setting allow_tf32, use input_precision='hf32' on Ascend instead.
+        if allow_tf32:
+            default_precision = "hf32"
         input_precision = os.getenv("TRITON_F32_DEFAULT", default_precision)
     else:
+<<<<<<< flagtree/third_party/ascend/backend/spec/triton/language/core.py
         assert input_precision not in [
             "tf32", "tf32x3"
         ], "input_precision == tf32 or tf32x3 is invalid, please use input_precision='hf32' on Ascend instead."
+=======
+        if input_precision == "tf32":
+            input_precision = "hf32"
+
+>>>>>>> triton-ascend@HEAD/python/triton/language/core.py
     input_precision = _constexpr_to_value(input_precision)
     out_dtype = _constexpr_to_value(out_dtype)
     max_num_imprecise_acc = _constexpr_to_value(max_num_imprecise_acc)
@@ -2091,9 +2100,9 @@ def reduce(input, axis, combine_fn, keep_dims=False, _builder=None, _generator=N
     ret = semantic.reduction(input, axis, make_combine_region, _builder)
     if keep_dims:
         if axis is not None:
-            ret = tuple(expand_dims(t, axis, _builder=_builder) for t in ret)
+            ret = builtins.tuple(expand_dims(t, axis, _builder=_builder) for t in ret)
         else:
-            ret = tuple(expand_ndims(t, len(input[0].shape)) for t in ret)
+            ret = builtins.tuple(expand_ndims(t, len(input[0].shape)) for t in ret)
     return ret
 
 
@@ -2523,7 +2532,7 @@ def inline_asm_elementwise(asm: str, constraints: str, args: Sequence, dtype: Un
 
     if not has_multiple_outputs:
         return tensor(call.get_result(0), res_tys[0])
-    return tuple(tensor(call.get_result(i), ty) for i, ty in enumerate(res_tys))
+    return builtins.tuple(tensor(call.get_result(i), ty) for i, ty in enumerate(res_tys))
 
 
 # -----------------------

@@ -47,11 +47,19 @@ def triton_nextafter(in_ptr0, in_ptr1, out_ptr0, XBLOCK: tl.constexpr, XBLOCK_SU
         tl.store(out_ptr0 + (x0), tmp2, None)
 
 
+<<<<<<< flagtree/third_party/ascend/unittest/pytest_ut/test_nextafter.py
 @pytest.mark.parametrize('param_list', [
     ['float32', (2, 4096, 8), 2, 32768, 1024],
     ['float16', (2, 4096, 8), 2, 32768, 1024],
     ['bfloat16', (2, 4096, 8), 2, 32768, 1024],
 ])
+=======
+@pytest.mark.parametrize('param_list',
+                            [
+                                ['float32', (2, 4096, 8), 2, 32768, 1024],
+                                ['float16', (2, 4096, 8), 2, 32768, 1024],
+                            ])
+>>>>>>> triton-ascend@HEAD/third_party/ascend/unittest/pytest_ut/test_nextafter.py
 def test_nextafter(param_list):
     dtype, shape, ncore, xblock, xblock_sub = param_list
     x0_ref = test_common.generate_tensor(shape, dtype)
