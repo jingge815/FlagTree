@@ -248,16 +248,6 @@ struct ElementwiseInlineAsmOpConversion : OpRewritePattern<triton::ElementwiseIn
       return op.getOperands().empty() ? processScalarInlineAsm(op, rewriter)
                                       : processVectorInlineAsm(op, rewriter);
     }
-    // Reorder and pack the results.
-    SmallVector<Value> outs;
-    for (int i = 0; i < unpackedResults.size(); i++) {
-      outs.push_back(rewriter.create<tensor::FromElementsOp>(
-          loc, op->getResult(i).getType(), unpackedResults[i]));
-    }
-    rewriter.replaceOp(op, outs);
-
-    return success();
-  }
 };
 
 void TritonToLLVMPass::runOnOperation() {

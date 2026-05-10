@@ -522,9 +522,11 @@ void init_ascend_ir(py::module &&m) {
            })
       .def("get_iterator_types_attr",
           [](AscendNPUIROpBuilder &self, const std::vector<hivm::IteratorType>& array) {
-          auto attrs = llvm::to_vector(llvm::map_range(array, [&self](hivm::IteratorType type) {
-                return cast<Attribute>(self.getBuilder().getAttr<hivm::IteratorTypeAttr>(type));
-          }));
+          llvm::SmallVector<Attribute> attrs;
+          attrs.reserve(array.size());
+          for (auto type : array) {
+            attrs.push_back(self.getBuilder().getI32IntegerAttr(static_cast<int32_t>(type)));
+          }
           return self.getBuilder().getArrayAttr(attrs);
           })
       .def("get_t_core_type_attr_name",

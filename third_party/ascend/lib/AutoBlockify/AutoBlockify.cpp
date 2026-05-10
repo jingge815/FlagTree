@@ -22,8 +22,7 @@
 
 #include "AutoBlockify/AutoBlockify.h"
 #include "AutoBlockify/Utils.h"
-#include "Dialect/TritonAscend/IR/TritonAscendDialect.h"
-#include "Utils/Utils.h"
+#include "npu/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Pass/PassManager.h"

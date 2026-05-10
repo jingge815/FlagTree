@@ -26,7 +26,6 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/Support/Casting.h"
 
-#include "Utils/Utils.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"

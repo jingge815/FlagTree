@@ -1,13 +1,8 @@
 #pragma once
-#include "ascend/include/TritonToLinalg/Passes.h"
-#include "ascend/include/DiscreteMaskAccessConversion/Passes.h"
-#include "ascend/include/TritonToStructured/Passes.h"
-#include "ascend/include/TritonToAnnotation/Passes.h"
-#include "ascend/include/TritonToUnstructure/Passes.h"
-#include "ascend/include/TritonToHIVM/Passes.h"
-#include "ascend/include/TritonToHFusion/Passes.h"
-#include "ascend/include/TritonToLLVM/Passes.h"
-#include "ascend/include/AutoBlockify/Passes.h"
+#include "TritonToHIVM/Passes.h"
+#include "TritonToHFusion/Passes.h"
+#include "TritonToLLVM/Passes.h"
+#include "AutoBlockify/Passes.h"
 // #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 // #include "amd/include/TritonAMDGPUTransforms/Passes.h"
 // #include "third_party/nvidia/include/Dialect/NVGPU/IR/Dialect.h"
@@ -73,11 +68,6 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   // mlir::triton::registerConvertTritonGPUToLLVMPass();
   // mlir::triton::registerConvertNVGPUToLLVMPass();
   // mlir::triton::registerDecomposeUnsupportedNVIDIAConversions();
-  mlir::triton::registerTritonToLinalgPasses();
-  mlir::triton::registerDiscreteMaskAccessConversion();
-  mlir::triton::registerTritonToStructuredPasses();
-  mlir::triton::registerTritonToAnnotationPasses();
-  mlir::triton::registerTritonToUnstructurePasses();
   mlir::triton::registerTritonToHIVMPasses();
   mlir::triton::registerTritonToHFusionPasses();
   mlir::triton::registerTritonToLLVMPasses();
