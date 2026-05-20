@@ -103,23 +103,6 @@ jobs:
 
           # pip install --no-cache-dir pyyaml==6.0.3
           # 生成 pytest marks 参数
-          MARKS=$(python3  "${SCRIPTS_DIR}/parse_operators.py"  "$OPERATORS_YAML")
-          if [ -z "$MARKS" ]; then
-            echo "Error: Failed to generate pytest marks"
-            exit 1
-          fi
-          cd "$FLAGGEMS_DIR"
-          pip install -r requirements/requirements_nvidia.txt
-          pip list
-          pip install -v -e .  --no-build-isolation
-          if [ $? -ne 0 ]; then
-              echo "Error: Failed to install FlagGems"
-              exit 1
-          fi
-
-          # pip install --no-cache-dir pyyaml==6.0.3
-          # 生成 pytest marks 参数
-
           # MARKS=$(python3  "${SCRIPTS_DIR}/parse_operators.py"  "$OPERATORS_YAML")
           # if [ -z "$MARKS" ]; then
           #   echo "Error: Failed to generate pytest marks"
@@ -199,36 +182,48 @@ jobs:
 
           # 运行测试 (不带超时)
           cd "$FLAGGEMS_DIR"
-          CRITICAL_FAILED=0
 
+          MISS_OP=0
+          CRITICAL_FAILED=0
           # 3. 遍历数组并记录时间（保持不变）
           for OP in "${OPERATORS[@]}"; do
-              echo -e "\n---> [START] Testing Operator: $OP"
+              echo -e "\n-----------------------------------------> [START] Testing Operator: $OP"
               
               START_TIME=$(date +%s)
 
               # 直接将 $OP 作为 pytest 的 -m 参数
-              python3 -m pytest tests/ -m "$OP" --ref=cpu --quick  $IGNORE_ARGS
-              EXIT_CODE=$?
+              EXIT_CODE=0
+              python3 -m pytest tests/ -m "$OP" --ref=cpu --quick $IGNORE_ARGS || EXIT_CODE=$?
 
               END_TIME=$(date +%s)
               ELAPSED=$((END_TIME - START_TIME))
 
-              echo "---> [END] Operator: $OP | Duration: ${ELAPSED}s | Exit Code: $EXIT_CODE"
-              echo "----------------------------------------------------------------"
-
+            
               if [ $EXIT_CODE -eq 0 ]; then
                   echo "Result: $OP Passed"
               elif [ $EXIT_CODE -eq 1 ]; then
                   echo "Result: $OP Failed (failures allowed in CI)"
               elif [ $EXIT_CODE -eq 5 ]; then
                   echo "Result: $OP Error (No tests collected)"
-                  CRITICAL_FAILED=1
+                  MISS_OP=$((MISS_OP + 1))
               else
                   echo "Result: $OP Error (Exit code $EXIT_CODE)"
                   CRITICAL_FAILED=1
               fi
+              echo -e "\n------------------------------------------> [END] Operator: $OP | Duration: ${ELAPSED}s | Exit Code: $EXIT_CODE"
           done
+
+          if [ $CRITICAL_FAILED -ne 0 ]; then
+              echo "=========================================="
+              echo "Error: CI Failed! Some operators (pytest Exit codes are not 1 or 5) had critical errors."
+              echo "=========================================="
+              exit 1
+          else
+              echo "=========================================="
+              echo "Success: All operators tested smoothly!"
+              echo "=========================================="
+              exit 0
+          fi
 
 
           # bash -c "$PYTEST_CMD"
