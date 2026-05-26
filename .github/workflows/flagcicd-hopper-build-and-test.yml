@@ -13,8 +13,10 @@ concurrency:
 jobs:
   flagcicd-hopper-build-and-test:
     runs-on: [flagcicd-flagtree-nvidia3.6]
+    env:
+      TRITON_CACHE_DIR: /mnt/airs-business/cicd/flagtree/flagcicd-flagGems-test/nvidia/triton_cache
     container:
-      image: harbor.baai.ac.cn/flagtree/flagtree-3.6.x-py312-torch2.8.0a0_5228986c39.nv25.05-ubuntu24.04:202603
+      image: harbor.baai.ac.cn/flagtree/flagtree-py312-torch2.8.0a0_5228986c39.nv25.05-ubuntu24.04:202605-3.6-base
       options: 
         --uts=host
         --ipc=host
@@ -93,7 +95,7 @@ jobs:
 
           # 安装 FlagGems 依赖
           cd "$FLAGGEMS_DIR"
-          pip install -r requirements/requirements_nvidia.txt
+          # pip install -r requirements/requirements_nvidia.txt
           pip list
           pip install -v -e .  --no-build-isolation
           if [ $? -ne 0 ]; then
