@@ -100,7 +100,7 @@ class BackendInstaller:
             language_dir = None
 
         tools_dir = os.path.join(backend_src_dir, "tools")
-        if not os.path.exists(tools_dir):
+        if not os.path.exists(tools_dir) or backend_name in ("flir"):
             tools_dir = None
 
         for file in ["compiler.py", "driver.py"]:
@@ -627,7 +627,7 @@ def download_and_copy_dependencies():
 
 
 if helper.flagtree_backend:
-    if helper.flagtree_backend in ("aipu", "tsingmicro", "enflame"):
+    if helper.flagtree_backend in ("aipu", "tsingmicro", "enflame", "ascend"):
         backends = [
             *BackendInstaller.copy(helper.configs.default_backends + tuple(helper.configs.extend_backends)),
             *BackendInstaller.copy_externals(),
