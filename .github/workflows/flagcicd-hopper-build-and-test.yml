@@ -13,6 +13,8 @@ concurrency:
 jobs:
   flagcicd-hopper-build-and-test:
     runs-on: [flagcicd-flagtree-nvidia3.6]
+    env:
+      TRITON_HOME: /mnt/airs-business/cicd/flagtree/flagcicd-flagGems-test/nvidia/
     container:
       image: harbor.baai.ac.cn/flagtree/flagtree-py312-torch2.8.0a0_5228986c39.nv25.05-ubuntu24.04:202605-3.6-base
       options: 
@@ -28,19 +30,6 @@ jobs:
 
     if: ${{ github.repository == 'FlagTree/flagtree' || github.repository == 'flagos-ai/flagtree' }}
     steps:
-      - name: Initialize Shared NFS Cache
-        run: |
-          # 这是 NFS 上的共享目录
-          SHARED_CACHE_DIR="/mnt/airs-business/cicd/flagtree/flagcicd-flagGems-test/nvidia/.triton"
-          cp  -a  /root/.triton/. "$SHARED_CACHE_DIR/"
-          exit 1
-
-      - name: Initialize Shared NFS Cache
-        shell: bash
-        run: |
-          ls /root/.triton || true
-          echo "$TRITON_CACHE_DIR"
-  
       - name: Smart Checkout
         uses: flagos-ai/FlagTree/.github/actions/smart-checkout@main
         with:
