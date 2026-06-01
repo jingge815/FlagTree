@@ -97,7 +97,7 @@ jobs:
           # Install FlagGems dependencies
           cd "$FLAGGEMS_DIR"
           # pip install -r requirements/requirements_nvidia.txt
-          pip list
+          # pip list
           pip install -v -e .  --no-build-isolation --no-deps
           if [ $? -ne 0 ]; then
               echo "Error: Failed to install FlagGems"
@@ -115,19 +115,15 @@ jobs:
           echo "Generated pytest marks: ${MARKS:0:200}..."
 
           cd tests/
-          # =========================================================
-          # 核心修改：通过环境变量动态加载忽略规则（零侵入、无长度限制）
-          # =========================================================
-          # 1. 传递忽略列表的文件路径给 Python 插件
+          # 传递忽略列表的文件路径给 Python 插件
           export FLAGGEMS_IGNORE_LIST_PATH="$IGNORE_LIST"
           
-          # 2. 将 scripts 目录加入 Python 寻址路径
+          # 将 scripts 目录加入 Python 寻址路径
           export PYTHONPATH="${SCRIPTS_DIR}:$PYTHONPATH"
 
-          # 3. 构建清爽的 Pytest 命令，使用 -p 参数加载 dynamic_ignore 插件
+          # 构建 Pytest 命令，使用 -p 参数加载 dynamic_ignore 插件
           PYTEST_CMD="python3 -m pytest -m \"$MARKS\" --ref=cpu --quick -p dynamic_ignore"
           # =========================================================
-
           # exit 1
 
           echo "=========================================="
@@ -136,9 +132,12 @@ jobs:
           echo "Reference device: cpu"
           echo "=========================================="
 
+
+          set +e
           bash -c "$PYTEST_CMD"
           EXIT_CODE=$?
-
+          set -e
+          
           if [ $EXIT_CODE -eq 0 ]; then
               echo "All tests passed"
               echo "FlagGems accuracy tests completed successfully"
