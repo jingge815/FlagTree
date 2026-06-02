@@ -1,3 +1,7 @@
+# flagtree backend path specialization
+from triton.flagtree_spec import spec_path
+spec_path(__path__)
+
 from ._layouts import AMDMFMALayout, AMDWMMALayout
 from . import cdna3, cdna4
 from . import rdna3, rdna4

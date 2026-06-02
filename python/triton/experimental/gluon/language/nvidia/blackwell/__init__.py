@@ -1,6 +1,10 @@
 from __future__ import annotations
 from typing import Optional, Tuple, List, TYPE_CHECKING
 
+# flagtree backend path specialization
+from triton.flagtree_spec import spec_path
+spec_path(__path__)
+
 from dataclasses import dataclass
 from triton.runtime.jit import constexpr_function
 from triton.experimental.gluon.language import _core as ttgl

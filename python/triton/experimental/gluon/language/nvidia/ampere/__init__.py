@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+# flagtree backend path specialization
+from triton.flagtree_spec import spec_path
+spec_path(__path__)
+
 from triton import knobs
 from triton.experimental.gluon.language import _core as ttgl
 from triton.experimental.gluon.language._layouts import DotOperandLayout, NVMMADistributedLayout

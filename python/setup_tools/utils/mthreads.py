@@ -1,6 +1,4 @@
-import sys
 import shutil
-import inspect
 from pathlib import Path
 
 from setuptools import find_packages
@@ -28,7 +26,8 @@ def _is_language_extra_package(package):
     return package == "triton.language.extra" or package.startswith("triton.language.extra.")
 
 
-def _merge_mthreads_packages(existing_packages):
+def merge_mthreads_packages(existing_packages):
+    """Merge mthreads-specific packages with existing packages for non-editable installs."""
     packages = []
     seen = set()
 
@@ -51,7 +50,8 @@ def _merge_mthreads_packages(existing_packages):
     return packages
 
 
-def _merge_mthreads_package_dir(existing_package_dir):
+def merge_mthreads_package_dir(existing_package_dir):
+    """Merge mthreads-specific package dirs with existing for non-editable installs."""
     package_dir = dict(existing_package_dir or {})
     package_dir[""] = MTHREADS_PYTHON_ROOT
 
@@ -66,7 +66,8 @@ def _merge_mthreads_package_dir(existing_package_dir):
     return package_dir
 
 
-def _patch_mthreads_cmdclass(existing_cmdclass):
+def patch_mthreads_cmdclass(existing_cmdclass):
+    """Patch build_py to force rebuild for mthreads non-editable installs."""
     cmdclass = dict(existing_cmdclass or {})
     original_build_py = cmdclass.get("build_py")
     if original_build_py is None:
@@ -85,39 +86,10 @@ def _patch_mthreads_cmdclass(existing_cmdclass):
     return cmdclass
 
 
-def _wrap_setup(original_setup):
-    if getattr(original_setup, "_mthreads_python_root_patched", False):
-        return original_setup
-
-    def setup_with_mthreads_python_root(*args, **kwargs):
-        kwargs["packages"] = _merge_mthreads_packages(kwargs.get("packages", []))
-        kwargs["package_dir"] = _merge_mthreads_package_dir(kwargs.get("package_dir", {}))
-        kwargs["cmdclass"] = _patch_mthreads_cmdclass(kwargs.get("cmdclass", {}))
-        return original_setup(*args, **kwargs)
-
-    setup_with_mthreads_python_root._mthreads_python_root_patched = True
-    setup_with_mthreads_python_root._mthreads_original_setup = original_setup
-    return setup_with_mthreads_python_root
-
-
-def _patch_setup_for_mthreads_python_root():
-    patched = False
-
-    frame = inspect.currentframe()
-    while frame is not None:
-        setup_func = frame.f_globals.get("setup")
-        if callable(setup_func):
-            frame.f_globals["setup"] = _wrap_setup(setup_func)
-            patched = True
-        frame = frame.f_back
-
-    main_module = sys.modules.get("__main__")
-    if main_module is not None and hasattr(main_module, "setup"):
-        main_module.setup = _wrap_setup(main_module.setup)
-        patched = True
-
-    if not patched:
-        raise RuntimeError("mthreads setup hook could not find setup() to patch")
-
-
-_patch_setup_for_mthreads_python_root()
+def apply_mthreads_setup_args(kwargs):
+    """Apply mthreads package overrides to setup() kwargs.
+    Called from setup.py when FLAGTREE_BACKEND=mthreads and not editable install."""
+    kwargs["packages"] = merge_mthreads_packages(kwargs.get("packages", []))
+    kwargs["package_dir"] = merge_mthreads_package_dir(kwargs.get("package_dir", {}))
+    kwargs["cmdclass"] = patch_mthreads_cmdclass(kwargs.get("cmdclass", {}))
+    return kwargs

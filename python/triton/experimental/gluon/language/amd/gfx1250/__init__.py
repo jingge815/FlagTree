@@ -1,3 +1,7 @@
+# flagtree backend path specialization
+from triton.flagtree_spec import spec_path
+spec_path(__path__)
+
 from triton.runtime.jit import constexpr_function
 from triton._C.libtriton.gluon_ir import get_amd_wmma_scale_layout as _get_wmma_scale_layout
 
