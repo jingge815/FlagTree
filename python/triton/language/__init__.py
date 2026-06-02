@@ -1,7 +1,10 @@
-# flagtree backend path specialization
-from triton.flagtree_spec import spec_path
+from triton.flagtree_spec import spec_path, spec
 
+# flagtree backend path specialization
 spec_path(__path__)
+
+# flagtree backend specialization
+spec("language_extend_globals", globals())
 
 """isort:skip_file"""
 # Import order is significant here.
@@ -280,6 +283,10 @@ __all__ = [
     "zeros",
     "zeros_like",
 ]
+
+
+# flagtree backend specialization
+spec("language_extend_globals_and_all", globals(), __all__)
 
 
 def str_to_ty(name, c):

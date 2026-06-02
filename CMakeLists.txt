@@ -331,6 +331,11 @@ if(TRITON_BUILD_PYTHON_MODULE)
   add_subdirectory(third_party/tle)
   #add_subdirectory(third_party/tle/dsa)
 
+  if(FLAGTREE_BACKEND STREQUAL "ascend")
+    list(APPEND TRITON_PLUGIN_NAMES "flir")
+    add_subdirectory(third_party/flir)
+  endif()
+
   if (DEFINED TRITON_PLUGIN_DIRS)
     foreach(PLUGIN_DIR ${TRITON_PLUGIN_DIRS})
       # Read the plugin name under dir/backend/name.conf
@@ -558,6 +563,9 @@ endif()
 
 if(NOT TRITON_BUILD_PYTHON_MODULE)
   add_subdirectory(third_party/tle)
+  if(FLAGTREE_BACKEND STREQUAL "ascend")
+    add_subdirectory(third_party/flir)
+  endif()
   foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
     add_subdirectory(third_party/${CODEGEN_BACKEND})
   endforeach()
