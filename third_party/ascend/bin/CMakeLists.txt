@@ -202,3 +202,17 @@ target_link_libraries(triton-mlir-opt PRIVATE
 )
 
 mlir_check_all_link_libraries(triton-mlir-opt)
+
+if(DEFINED CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+  set(_ascend_tool_targets
+    # triton-opt
+    triton-mlir-opt
+  )
+  foreach(_tool IN LISTS _ascend_tool_targets)
+    if(TARGET ${_tool})
+      set_target_properties(${_tool} PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
+      )
+    endif()
+  endforeach()
+endif()
