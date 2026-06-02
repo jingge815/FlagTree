@@ -580,6 +580,9 @@ if(NOT FLAGTREE_BACKEND OR FLAGTREE_BACKEND MATCHES "^(aipu|tsingmicro|enflame)$
   add_subdirectory(bin)
   add_subdirectory(test)
 endif()
+if(FLAGTREE_BACKEND MATCHES "^(ascend)$")
+  add_subdirectory(test)
+endif()
 
 if(TRITON_BUILD_UT)
   add_subdirectory(unittest)

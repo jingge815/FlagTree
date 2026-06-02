@@ -3,14 +3,14 @@
 #include "incubated/Conversion/AutoBlockify/Passes.h"
 #include "incubated/Conversion/DynamicCVPipeline/AddControlFlowCondition.h"
 #include "incubated/Conversion/TritonToAnnotation/Passes.h"
-#include "incubated/Conversion/TritonToHFusion/Passes.h"
-#include "incubated/Conversion/TritonToHIVM/Passes.h"
-#include "incubated/Conversion/TritonToLinalg/Passes.h"
-#include "incubated/Conversion/TritonToLLVM/Passes.h"
+#include "ascend/include/TritonToHFusion/Passes.h"
+#include "ascend/include/TritonToHIVM/Passes.h"
+#include "incubated/Conversion/TritonToLinalgIncubated/Passes.h"
+#include "ascend/include/TritonToLLVM/Passes.h"
 
 #include "incubated/Conversion/TritonToGraph/Passes.h"
-#include "incubated/Conversion/TritonToStructured/Passes.h"
-#include "incubated/Conversion/TritonToUnstructure/Passes.h"
+#include "incubated/Conversion/TritonToStructuredIncubated/Passes.h"
+#include "incubated/Conversion/TritonToUnstructureIncubated/Passes.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
 #include "bishengir/Dialect/HACC/IR/HACC.h"
@@ -18,7 +18,7 @@
 #include "bishengir/Dialect/HIVM/IR/HIVM.h"
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 
-#include "incubated/Dialect/TritonAscend/IR/TritonAscendDialect.h"
+#include "npu/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "amd/include/Dialect/TritonAMDGPU/IR/Dialect.h"
 #include "amd/include/TritonAMDGPUTransforms/Passes.h"
 #include "nvidia/include/Dialect/NVGPU/IR/Dialect.h"
@@ -98,12 +98,12 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerConvertTritonGPUToLLVMPass();
   mlir::triton::registerConvertNVGPUToLLVMPass();
   mlir::triton::registerAllocateSharedMemoryNvPass();
-  mlir::triton::registerTritonToLinalgPasses();
+  mlir::triton::Incubated::registerTritonToLinalgIncubatedPasses();
 
   mlir::triton::registerDiscreteMaskAccessConversion();
-  mlir::triton::registerTritonToStructuredPasses();
+  mlir::triton::registerTritonToStructuredIncubatedPasses();
   mlir::triton::registerTritonToAnnotationPasses();
-  mlir::triton::registerTritonToUnstructurePasses();
+  mlir::triton::registerTritonToUnstructureIncubatedPasses();
   mlir::triton::registerTritonToHIVMPasses();
   mlir::triton::registerTritonToHFusionPasses();
   mlir::triton::registerTritonToLLVMPasses();
@@ -134,7 +134,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::triton::registerTritonAMDGPUInsertInstructionSchedHints();
   mlir::triton::registerTritonAMDGPULowerInstructionSchedHints();
   mlir::registerTritonAMDFoldTrueCmpI();
-  mlir::triton::amdgpu::registerTritonAMDGPUOptimizeDotOperands();
+  // mlir::triton::amdgpu::registerTritonAMDGPUOptimizeDotOperands();
 
   // NVWS passes
   mlir::triton::registerNVWSTransformsPasses();

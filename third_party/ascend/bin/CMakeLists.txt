@@ -16,10 +16,10 @@ target_link_libraries(triton-opt PRIVATE
   TritonToAnnotation
   TritonToHFusion
   TritonToHIVM
-  TritonToLinalg
+  TritonToLinalgIncubated
   TritonToLLVM
-  TritonToStructured
-  TritonToUnstructure
+  TritonToStructuredIncubated
+  TritonToUnstructureIncubated
   # BiShengIR dialects
   BiShengIRAnnotationDialect
   BiShengIRHACCDialect
@@ -56,10 +56,10 @@ target_link_libraries(triton-reduce PRIVATE
   TritonToAnnotation
   TritonToHFusion
   TritonToHIVM
-  TritonToLinalg
+  TritonToLinalgIncubated
   TritonToLLVM
-  TritonToStructured
-  TritonToUnstructure
+  TritonToStructuredIncubated
+  TritonToUnstructureIncubated
   # BiShengIR dialects
   BiShengIRAnnotationDialect
   BiShengIRHACCDialect
@@ -95,10 +95,10 @@ target_link_libraries(triton-lsp PRIVATE
   TritonToAnnotation
   TritonToHFusion
   TritonToHIVM
-  TritonToLinalg
+  TritonToLinalgIncubated
   TritonToLLVM
-  TritonToStructured
-  TritonToUnstructure
+  TritonToStructuredIncubated
+  TritonToUnstructureIncubated
   # BiShengIR dialects
   BiShengIRAnnotationDialect
   BiShengIRHACCDialect
@@ -153,10 +153,10 @@ target_link_libraries(triton-tensor-layout PRIVATE
   TritonToAnnotation
   TritonToHFusion
   TritonToHIVM
-  TritonToLinalg
+  TritonToLinalgIncubated
   TritonToLLVM
-  TritonToStructured
-  TritonToUnstructure
+  TritonToStructuredIncubated
+  TritonToUnstructureIncubated
   # BiShengIR dialects
   BiShengIRAnnotationDialect
   BiShengIRHACCDialect
