@@ -1,4 +1,37 @@
+import importlib
 import os
+
+_spec_module = None
+
+
+def _triton_root() -> str | None:
+    current_path = os.path.abspath(__file__).replace(os.sep, "/")
+    marker = "/triton/"
+    idx = current_path.find(marker)
+    if idx == -1:
+        return None
+    return current_path[:idx + len("/triton")]
+
+
+def _get_spec_module():
+    global _spec_module
+    from ._flagtree_backend import FLAGTREE_BACKEND
+    if not FLAGTREE_BACKEND:
+        return None
+    triton_root = _triton_root()
+    if triton_root is None:
+        return None
+    spec_dir = os.path.join(triton_root, "backends", FLAGTREE_BACKEND, "spec")
+    if not os.path.isdir(spec_dir):
+        return None
+    if _spec_module is not None:
+        return _spec_module
+    try:
+        _spec_module = importlib.import_module(f"triton.backends.{FLAGTREE_BACKEND}.spec")
+    except ImportError:
+        return None
+    return _spec_module
+
 
 # flagtree backend path specialization
 def spec_path(path_list: list):
@@ -19,21 +52,15 @@ def spec_path(path_list: list):
 
 # flagtree backend specialization
 def spec(function_name: str, *args, **kwargs):
-    from .runtime.driver import driver
-    if hasattr(driver.active, "spec"):
-        spec = driver.active.spec
-        if hasattr(spec, function_name):
-            func = getattr(spec, function_name)
-            return func(*args, **kwargs)
+    mod = _get_spec_module()
+    if mod is not None and hasattr(mod, function_name):
+        return getattr(mod, function_name)(*args, **kwargs)
     return None
 
 
 # flagtree backend func specialization
 def spec_func(function_name: str):
-    from .runtime.driver import driver
-    if hasattr(driver.active, "spec"):
-        spec = driver.active.spec
-        if hasattr(spec, function_name):
-            func = getattr(spec, function_name)
-            return func
+    mod = _get_spec_module()
+    if mod is not None and hasattr(mod, function_name):
+        return getattr(mod, function_name)
     return None
