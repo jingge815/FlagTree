@@ -36,7 +36,8 @@ static SmallVector<int64_t> getStrides(InsertTileOp op) {
     return s;
   }
   auto tileTy = cast<RankedTensorType>(op.getTile().getType());
-  return SmallVector<int64_t>(tileTy.getShape().begin(), tileTy.getShape().end());
+  return SmallVector<int64_t>(tileTy.getShape().begin(),
+                              tileTy.getShape().end());
 }
 
 // Check if the tile to be inserted is CTA-aligned (for register shuffle path).
@@ -264,12 +265,13 @@ lowerInsertTileViaSMEMDynamic(InsertTileOp op, InsertTileOp::Adaptor adaptor,
     Value gv = rewriter.create<LLVM::ConstantOp>(
         loc, i32Ty, rewriter.getI32IntegerAttr((int32_t)logicalGrid[d]));
     Value svStride = rewriter.create<LLVM::ConstantOp>(
-      loc, i32Ty, rewriter.getI32IntegerAttr((int32_t)strides[d]));
+        loc, i32Ty, rewriter.getI32IntegerAttr((int32_t)strides[d]));
     Value tv = rewriter.create<LLVM::ConstantOp>(
         loc, i32Ty, rewriter.getI32IntegerAttr((int32_t)tileShape[d]));
     Value coord = rewriter.create<LLVM::UDivOp>(loc, i32Ty, dynIndex, sv);
     coord = rewriter.create<LLVM::URemOp>(loc, i32Ty, coord, gv);
-    tileStartVals[d] = rewriter.create<LLVM::MulOp>(loc, i32Ty, coord, svStride);
+    tileStartVals[d] =
+        rewriter.create<LLVM::MulOp>(loc, i32Ty, coord, svStride);
     tileEndVals[d] =
         rewriter.create<LLVM::AddOp>(loc, i32Ty, tileStartVals[d], tv);
   }
@@ -360,7 +362,8 @@ lowerInsertTileViaSMEMDynamic(InsertTileOp op, InsertTileOp::Adaptor adaptor,
     Value lp = rewriter.create<LLVM::GEPOp>(loc, smemPtrTy, i8Ty, smemBase,
                                             ValueRange{smemByteOffsetV},
                                             LLVM::GEPNoWrapFlags::inbounds);
-    Value tileLoaded = rewriter.create<LLVM::LoadOp>(loc, llvmElemTy, lp, elemBytes);
+    Value tileLoaded =
+        rewriter.create<LLVM::LoadOp>(loc, llvmElemTy, lp, elemBytes);
     rewriter.create<LLVM::BrOp>(loc, ValueRange{tileLoaded}, mergeBlock);
 
     rewriter.setInsertionPointToStart(elseBlock);

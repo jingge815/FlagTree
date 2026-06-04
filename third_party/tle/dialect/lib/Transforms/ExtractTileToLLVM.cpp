@@ -9,7 +9,6 @@
 #include "tle/dialect/include/Transforms/PatternTleToLLVM.h"
 #include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
-#include "triton/Conversion/TritonGPUToLLVM/TargetInfoBase.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "llvm/Support/raw_ostream.h"
@@ -34,7 +33,8 @@ static SmallVector<int64_t> getStrides(ExtractTileOp op) {
   if (auto a = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
           op->getAttr("strides"))) {
     SmallVector<int64_t> s;
-    for (auto v : a.asArrayRef()) s.push_back(v);
+    for (auto v : a.asArrayRef())
+      s.push_back(v);
     return s;
   }
   // 向后兼容：没有 strides 属性时退化为 tile_shape
@@ -51,7 +51,7 @@ static bool isCTATileAligned(ExtractTileOp op, int64_t linearIndex) {
   auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
   auto srcShape = srcTy.getShape();
   auto tileShape = getTileShape(op);
-  auto strides   = getStrides(op);
+  auto strides = getStrides(op);
   auto ctaTile = getShapePerCTATile(srcTy);
   int rank = srcShape.size();
   SmallVector<int64_t> logicalGrid(rank), tileCoords(rank);
@@ -63,7 +63,7 @@ static bool isCTATileAligned(ExtractTileOp op, int64_t linearIndex) {
     remain /= logicalGrid[i];
   }
   for (int i = 0; i < rank; ++i) {
-   
+
     int64_t off = tileCoords[i] * strides[i];
     if (tileShape[i] % (int64_t)ctaTile[i] != 0)
       return false;
@@ -87,7 +87,7 @@ lowerExtractTileStatic(ExtractTileOp op, ExtractTileOp::Adaptor adaptor,
   auto srcShape = srcTy.getShape(), dstShape = dstTy.getShape();
   auto tileShape = getTileShape(op);
   int rank = srcShape.size();
-  auto strides   = getStrides(op);
+  auto strides = getStrides(op);
   auto vals = unpackLLElements(loc, adaptor.getSrc(), rewriter);
   auto shapePerCTATile = getShapePerCTATile(srcTy);
   auto srcCTAShape = multiDimElementwise<int64_t, unsigned>(
@@ -104,11 +104,11 @@ lowerExtractTileStatic(ExtractTileOp op, ExtractTileOp::Adaptor adaptor,
     remain /= logicalGrid[i];
   }
   for (int i = 0; i < rank; ++i)
-    elementCoords[i] = logicalCoords[i] * strides[i]; 
+    elementCoords[i] = logicalCoords[i] * strides[i];
   auto firstTileCoord = multiDimElementwise<int64_t, unsigned>(
       elementCoords, shapePerCTATile, std::divides<unsigned>());
   auto srcCTAOrder = getCTATileOrder(srcTy),
-      dstCTAOrder = getCTATileOrder(dstTy);
+       dstCTAOrder = getCTATileOrder(dstTy);
   unsigned totalSrcCTAs = std::accumulate(
       srcCTAShape.begin(), srcCTAShape.end(), 1, std::multiplies<>());
   unsigned elemsPerCTA = ttg::getTotalElemsPerThread(srcTy) / totalSrcCTAs;
@@ -147,7 +147,7 @@ lowerExtractTileViaSMEM(ExtractTileOp op, ExtractTileOp::Adaptor adaptor,
   auto srcShape = srcTy.getShape(), dstShape = dstTy.getShape();
   auto tileShape = getTileShape(op);
   int rank = srcShape.size();
-  auto strides   = getStrides(op);
+  auto strides = getStrides(op);
   MLIRContext *ctx = rewriter.getContext();
   auto i1Ty = rewriter.getIntegerType(1);
   auto i8Ty = rewriter.getIntegerType(8);
@@ -223,10 +223,11 @@ lowerExtractTileViaSMEM(ExtractTileOp op, ExtractTileOp::Adaptor adaptor,
         loc, i32Ty, rewriter.getI32IntegerAttr((int32_t)strides[d]));
     Value tv = rewriter.create<LLVM::ConstantOp>(
         loc, i32Ty, rewriter.getI32IntegerAttr((int32_t)tileShape[d]));
-    
+
     Value coord = rewriter.create<LLVM::UDivOp>(loc, i32Ty, dynIndex, sv);
     coord = rewriter.create<LLVM::URemOp>(loc, i32Ty, coord, gv);
-    tileStartVals[d] = rewriter.create<LLVM::MulOp>(loc, i32Ty, coord, sv_stride);
+    tileStartVals[d] =
+        rewriter.create<LLVM::MulOp>(loc, i32Ty, coord, sv_stride);
     tileEndVals[d] =
         rewriter.create<LLVM::AddOp>(loc, i32Ty, tileStartVals[d], tv);
   }

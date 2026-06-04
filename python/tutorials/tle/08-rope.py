@@ -37,9 +37,7 @@ RoPE variants are included.
 # -----
 
 import argparse
-import math
 import random
-import sys
 
 import torch
 import triton
@@ -48,15 +46,15 @@ import triton.experimental.tle.language as tle
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
-
 # %%
 # Helper: build cos/sin cache
 # ---------------------------
 
+
 def build_rope_cache(max_seq_len, head_dim, device, dtype=torch.float32, base=10000.0):
     """Precompute cos/sin tables for all positions up to ``max_seq_len``."""
     half_dim = head_dim // 2
-    theta = 1.0 / (base ** (torch.arange(0, half_dim, device=device, dtype=dtype) / half_dim))
+    theta = 1.0 / (base**(torch.arange(0, half_dim, device=device, dtype=dtype) / half_dim))
     positions = torch.arange(max_seq_len, device=device, dtype=dtype)
     angles = torch.outer(positions, theta)
     return angles.cos().contiguous(), angles.sin().contiguous()
@@ -70,19 +68,29 @@ def build_rope_cache(max_seq_len, head_dim, device, dtype=torch.float32, base=10
 # (plus ``N`` loads for the rotated element), even though the data for all
 # heads is contiguous in memory.
 
+
 @triton.jit
 def _rope_outplace_kernel_v1(
-    oq_ptr,         # (n_tokens, q_heads, head_dim)
-    ok_ptr,         # (n_tokens, k_heads, head_dim)
-    q_ptr,          # (n_tokens, q_heads, head_dim)
-    k_ptr,          # (n_tokens, k_heads, head_dim)
-    cos_ptr,        # (max_seq_len, head_dim // 2)
-    sin_ptr,        # (max_seq_len, head_dim // 2)
-    q_stride_s, q_stride_h, q_stride_d,
-    k_stride_s, k_stride_h, k_stride_d,
-    oq_stride_s, oq_stride_h, oq_stride_d,
-    ok_stride_s, ok_stride_h, ok_stride_d,
-    cos_stride_s, sin_stride_s,
+    oq_ptr,  # (n_tokens, q_heads, head_dim)
+    ok_ptr,  # (n_tokens, k_heads, head_dim)
+    q_ptr,  # (n_tokens, q_heads, head_dim)
+    k_ptr,  # (n_tokens, k_heads, head_dim)
+    cos_ptr,  # (max_seq_len, head_dim // 2)
+    sin_ptr,  # (max_seq_len, head_dim // 2)
+    q_stride_s,
+    q_stride_h,
+    q_stride_d,
+    k_stride_s,
+    k_stride_h,
+    k_stride_d,
+    oq_stride_s,
+    oq_stride_h,
+    oq_stride_d,
+    ok_stride_s,
+    ok_stride_h,
+    ok_stride_d,
+    cos_stride_s,
+    sin_stride_s,
     seq_len,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
@@ -125,7 +133,7 @@ def _rope_outplace_kernel_v1(
         rotated_cols = off_h * q_stride_h + (rotated_block * q_stride_d)
         output_offs = off_h * oq_stride_h + (ordered_block * oq_stride_d)
 
-        q = tl.load(q_ptr + ordered_cols, mask=mask, other=0.0)          # ← load from GMEM
+        q = tl.load(q_ptr + ordered_cols, mask=mask, other=0.0)  # ← load from GMEM
         rotated_q = tl.load(q_ptr + rotated_cols, mask=mask, other=0.0)  # ← load from GMEM
         y = q * cos + rotated_q * sin
         tl.store(oq_ptr + output_offs, y, mask=mask)
@@ -138,7 +146,7 @@ def _rope_outplace_kernel_v1(
         rotated_cols = off_h * k_stride_h + (rotated_block * k_stride_d)
         output_offs = off_h * ok_stride_h + (ordered_block * ok_stride_d)
 
-        k = tl.load(k_ptr + ordered_cols, mask=mask, other=0.0)          # ← load from GMEM
+        k = tl.load(k_ptr + ordered_cols, mask=mask, other=0.0)  # ← load from GMEM
         rotated_k = tl.load(k_ptr + rotated_cols, mask=mask, other=0.0)  # ← load from GMEM
         y = k * cos + rotated_k * sin
         tl.store(ok_ptr + output_offs, y, mask=mask)
@@ -146,13 +154,18 @@ def _rope_outplace_kernel_v1(
 
 @triton.jit
 def _rope_inplace_kernel_v1(
-    q_ptr,          # (n_tokens, q_heads, head_dim)
-    k_ptr,          # (n_tokens, k_heads, head_dim)
-    cos_ptr,        # (max_seq_len, head_dim // 2)
-    sin_ptr,        # (max_seq_len, head_dim // 2)
-    q_stride_s, q_stride_h, q_stride_d,
-    k_stride_s, k_stride_h, k_stride_d,
-    cos_stride_s, sin_stride_s,
+    q_ptr,  # (n_tokens, q_heads, head_dim)
+    k_ptr,  # (n_tokens, k_heads, head_dim)
+    cos_ptr,  # (max_seq_len, head_dim // 2)
+    sin_ptr,  # (max_seq_len, head_dim // 2)
+    q_stride_s,
+    q_stride_h,
+    q_stride_d,
+    k_stride_s,
+    k_stride_h,
+    k_stride_d,
+    cos_stride_s,
+    sin_stride_s,
     seq_len,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
@@ -219,19 +232,29 @@ def _rope_inplace_kernel_v1(
 # ``tl.load`` (it lives at a different offset), but the dominant load path is
 # coalesced into one bulk access.
 
+
 @triton.jit
 def _rope_outplace_kernel_v2(
-    oq_ptr,         # (n_tokens, q_heads, head_dim)
-    ok_ptr,         # (n_tokens, k_heads, head_dim)
-    q_ptr,          # (n_tokens, q_heads, head_dim)
-    k_ptr,          # (n_tokens, k_heads, head_dim)
-    cos_ptr,        # (max_seq_len, head_dim // 2)
-    sin_ptr,        # (max_seq_len, head_dim // 2)
-    q_stride_s, q_stride_h, q_stride_d,
-    k_stride_s, k_stride_h, k_stride_d,
-    oq_stride_s, oq_stride_h, oq_stride_d,
-    ok_stride_s, ok_stride_h, ok_stride_d,
-    cos_stride_s, sin_stride_s,
+    oq_ptr,  # (n_tokens, q_heads, head_dim)
+    ok_ptr,  # (n_tokens, k_heads, head_dim)
+    q_ptr,  # (n_tokens, q_heads, head_dim)
+    k_ptr,  # (n_tokens, k_heads, head_dim)
+    cos_ptr,  # (max_seq_len, head_dim // 2)
+    sin_ptr,  # (max_seq_len, head_dim // 2)
+    q_stride_s,
+    q_stride_h,
+    q_stride_d,
+    k_stride_s,
+    k_stride_h,
+    k_stride_d,
+    oq_stride_s,
+    oq_stride_h,
+    oq_stride_d,
+    ok_stride_s,
+    ok_stride_h,
+    ok_stride_d,
+    cos_stride_s,
+    sin_stride_s,
     seq_len,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
@@ -279,9 +302,7 @@ def _rope_outplace_kernel_v2(
 
     for off_h in range(0, NUM_Q_HEADS):
         # ── KEY CHANGE: slice from register tile instead of GMEM load ──
-        q = tle.extract_tile(
-            q_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]
-        ).reshape((PADDED_HEAD_DIM,))
+        q = tle.extract_tile(q_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]).reshape((PADDED_HEAD_DIM, ))
 
         rotated_cols = off_h * q_stride_h + (rotated_block * q_stride_d)
         rotated_q = tl.load(q_ptr + rotated_cols, mask=mask, other=0.0)
@@ -299,9 +320,7 @@ def _rope_outplace_kernel_v2(
     )  # shape: [NUM_K_HEADS, PADDED_HEAD_DIM]
 
     for off_h in range(0, NUM_K_HEADS):
-        k = tle.extract_tile(
-            k_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]
-        ).reshape((PADDED_HEAD_DIM,))
+        k = tle.extract_tile(k_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]).reshape((PADDED_HEAD_DIM, ))
 
         rotated_cols = off_h * k_stride_h + (rotated_block * k_stride_d)
         rotated_k = tl.load(k_ptr + rotated_cols, mask=mask, other=0.0)
@@ -311,13 +330,18 @@ def _rope_outplace_kernel_v2(
 
 @triton.jit
 def _rope_inplace_kernel_v2(
-    q_ptr,          # (n_tokens, q_heads, head_dim)
-    k_ptr,          # (n_tokens, k_heads, head_dim)
-    cos_ptr,        # (max_seq_len, head_dim // 2)
-    sin_ptr,        # (max_seq_len, head_dim // 2)
-    q_stride_s, q_stride_h, q_stride_d,
-    k_stride_s, k_stride_h, k_stride_d,
-    cos_stride_s, sin_stride_s,
+    q_ptr,  # (n_tokens, q_heads, head_dim)
+    k_ptr,  # (n_tokens, k_heads, head_dim)
+    cos_ptr,  # (max_seq_len, head_dim // 2)
+    sin_ptr,  # (max_seq_len, head_dim // 2)
+    q_stride_s,
+    q_stride_h,
+    q_stride_d,
+    k_stride_s,
+    k_stride_h,
+    k_stride_d,
+    cos_stride_s,
+    sin_stride_s,
     seq_len,
     NUM_Q_HEADS: tl.constexpr,
     NUM_K_HEADS: tl.constexpr,
@@ -362,9 +386,7 @@ def _rope_inplace_kernel_v2(
     )
 
     for off_h in range(0, NUM_Q_HEADS):
-        q = tle.extract_tile(
-            q_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]
-        ).reshape((PADDED_HEAD_DIM,))
+        q = tle.extract_tile(q_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]).reshape((PADDED_HEAD_DIM, ))
 
         rotated_cols = off_h * q_stride_h + (rotated_block * q_stride_d)
         rotated_q = tl.load(q_ptr + rotated_cols, mask=mask, other=0.0)
@@ -381,9 +403,7 @@ def _rope_inplace_kernel_v2(
     )
 
     for off_h in range(0, NUM_K_HEADS):
-        k = tle.extract_tile(
-            k_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]
-        ).reshape((PADDED_HEAD_DIM,))
+        k = tle.extract_tile(k_block, index=[off_h, 0], tile_shape=[1, PADDED_HEAD_DIM]).reshape((PADDED_HEAD_DIM, ))
 
         rotated_cols = off_h * k_stride_h + (rotated_block * k_stride_d)
         rotated_k = tl.load(k_ptr + rotated_cols, mask=mask, other=0.0)
@@ -411,17 +431,33 @@ def _launch_rope_outplace(kernel, q, k, cos, sin, rotary_interleaved):
     q_embed = torch.empty_like(q)
     k_embed = torch.empty_like(k)
 
-    grid = (n_tokens,)
+    grid = (n_tokens, )
     kernel[grid](
-        q_embed, k_embed,
-        q, k, cos, sin,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        q_embed.stride(0), q_embed.stride(1), q_embed.stride(2),
-        k_embed.stride(0), k_embed.stride(1), k_embed.stride(2),
-        cos.stride(0), sin.stride(0),
+        q_embed,
+        k_embed,
+        q,
+        k,
+        cos,
+        sin,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        q_embed.stride(0),
+        q_embed.stride(1),
+        q_embed.stride(2),
+        k_embed.stride(0),
+        k_embed.stride(1),
+        k_embed.stride(2),
+        cos.stride(0),
+        sin.stride(0),
         seq_len,
-        q_heads, k.shape[-2], head_dim, padded_head_dim,
+        q_heads,
+        k.shape[-2],
+        head_dim,
+        padded_head_dim,
         rotary_interleaved,
         MAX_POSITION_EMBEDDINGS=cos.shape[0],
     )
@@ -440,14 +476,25 @@ def _launch_rope_inplace(kernel, q, k, cos, sin, rotary_interleaved):
     n_tokens, q_heads, head_dim = q.shape
     padded_head_dim = max(triton.next_power_of_2(head_dim), 16)
 
-    grid = (n_tokens,)
+    grid = (n_tokens, )
     kernel[grid](
-        q, k, cos, sin,
-        q.stride(0), q.stride(1), q.stride(2),
-        k.stride(0), k.stride(1), k.stride(2),
-        cos.stride(0), sin.stride(0),
+        q,
+        k,
+        cos,
+        sin,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k.stride(0),
+        k.stride(1),
+        k.stride(2),
+        cos.stride(0),
+        sin.stride(0),
         seq_len,
-        q_heads, k.shape[-2], head_dim, padded_head_dim,
+        q_heads,
+        k.shape[-2],
+        head_dim,
+        padded_head_dim,
         rotary_interleaved,
         MAX_POSITION_EMBEDDINGS=cos.shape[0],
     )
@@ -458,13 +505,16 @@ def rope_outplace_v1(q, k, cos, sin, rotary_interleaved=False):
     """Baseline RoPE (outplace)."""
     return _launch_rope_outplace(_rope_outplace_kernel_v1, q, k, cos, sin, rotary_interleaved)
 
+
 def rope_outplace_v2(q, k, cos, sin, rotary_interleaved=False):
     """TLE RoPE (outplace)."""
     return _launch_rope_outplace(_rope_outplace_kernel_v2, q, k, cos, sin, rotary_interleaved)
 
+
 def rope_inplace_v1(q, k, cos, sin, rotary_interleaved=False):
     """Baseline RoPE (inplace)."""
     return _launch_rope_inplace(_rope_inplace_kernel_v1, q, k, cos, sin, rotary_interleaved)
+
 
 def rope_inplace_v2(q, k, cos, sin, rotary_interleaved=False):
     """TLE RoPE (inplace)."""
@@ -504,14 +554,12 @@ def _assert_close_robust(name, a, b, rtol=5e-2, atol=2e-1):
     if abs_p999 < 0.25 and rel_p999 < 0.25:
         return  # robust check passed
 
-    raise AssertionError(
-        f"{name} mismatch: allclose failed and robust check failed; "
-        f"abs_p999={abs_p999:.6f}, rel_p999={rel_p999:.6f}"
-    )
+    raise AssertionError(f"{name} mismatch: allclose failed and robust check failed; "
+                         f"abs_p999={abs_p999:.6f}, rel_p999={rel_p999:.6f}")
 
 
-def check_correctness(batch=4, seq_len=256, q_heads=32, k_heads=8, head_dim=128,
-                      dtype=torch.bfloat16, rotary_interleaved=False):
+def check_correctness(batch=4, seq_len=256, q_heads=32, k_heads=8, head_dim=128, dtype=torch.bfloat16,
+                      rotary_interleaved=False):
     """Verify v1 and v2 produce identical results (both inplace and outplace)."""
     torch.manual_seed(0)
 
@@ -598,8 +646,7 @@ def _robust_bench(fn, reset_fn):
     return float(torch.quantile(t[keep], 0.5).item())
 
 
-def _run_benchmark_table(title, configs, dtype, rotary_interleaved,
-                         rope_v1_fn, rope_v2_fn, inplace):
+def _run_benchmark_table(title, configs, dtype, rotary_interleaved, rope_v1_fn, rope_v2_fn, inplace):
     """Print a benchmark table for a set of (batch, seq_len, q_heads, k_heads, head_dim)."""
     mode = "inplace" if inplace else "outplace"
     print(f"\n--- {title} [{mode}] (dtype={dtype}) ---")
@@ -625,10 +672,12 @@ def _run_benchmark_table(title, configs, dtype, rotary_interleaved,
             rope_v2_fn(q2, k2, cos, sin, rotary_interleaved)
 
         def reset_v1():
-            q1.copy_(q_src); k1.copy_(k_src)
+            q1.copy_(q_src)
+            k1.copy_(k_src)
 
         def reset_v2():
-            q2.copy_(q_src); k2.copy_(k_src)
+            q2.copy_(q_src)
+            k2.copy_(k_src)
 
         # Randomize measurement order
         runners = [("v1", run_v1, reset_v1), ("v2", run_v2, reset_v2)]
@@ -650,13 +699,10 @@ def _run_benchmark_table(title, configs, dtype, rotary_interleaved,
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(
-        description="RoPE with TLE extract_tile — baseline vs optimized benchmark"
-    )
+    parser = argparse.ArgumentParser(description="RoPE with TLE extract_tile — baseline vs optimized benchmark")
     parser.add_argument("--benchmark", action="store_true",
                         help="Run benchmark tables in addition to correctness check")
-    parser.add_argument("--dtype", type=str, default="bfloat16",
-                        choices=["float16", "bfloat16", "fp16", "bf16"],
+    parser.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "fp16", "bf16"],
                         help="Data type for benchmark")
     args = parser.parse_args(argv)
 
@@ -678,29 +724,27 @@ def main(argv=None):
     CONFIGS = [
         # (batch, seq_len, q_heads, k_heads, head_dim)
         # head_dim=128 — TLE shines
-        (1,   128,  32, 8,  128),
-        (1,  1024,  32, 8,  128),
-        (8,   128,  32, 8,  128),
-        (8,  1024,  32, 8,  128),
-        (32,  128,  32, 8,  128),
-        (32, 1024,  32, 8,  128),
-        (8,  1024,  16, 16, 128),
-        (32, 1024,  16, 16, 128),
+        (1, 128, 32, 8, 128),
+        (1, 1024, 32, 8, 128),
+        (8, 128, 32, 8, 128),
+        (8, 1024, 32, 8, 128),
+        (32, 128, 32, 8, 128),
+        (32, 1024, 32, 8, 128),
+        (8, 1024, 16, 16, 128),
+        (32, 1024, 16, 16, 128),
         # head_dim=256 — smaller gain
-        (1,   128,  32, 8,  256),
-        (8,   128,  32, 8,  256),
-        (32,  128,  32, 8,  256),
-        (32, 1024,  16, 16, 256),
+        (1, 128, 32, 8, 256),
+        (8, 128, 32, 8, 256),
+        (32, 128, 32, 8, 256),
+        (32, 1024, 16, 16, 256),
     ]
 
     for interleaved in [False, True]:
         ilabel = "interleaved (GPT-NeoX style)" if interleaved else "non-interleaved (LLaMA style)"
         # outplace
-        _run_benchmark_table(ilabel, CONFIGS, dtype, interleaved,
-                             rope_outplace_v1, rope_outplace_v2, inplace=False)
+        _run_benchmark_table(ilabel, CONFIGS, dtype, interleaved, rope_outplace_v1, rope_outplace_v2, inplace=False)
         # inplace
-        _run_benchmark_table(ilabel, CONFIGS, dtype, interleaved,
-                             rope_inplace_v1, rope_inplace_v2, inplace=True)
+        _run_benchmark_table(ilabel, CONFIGS, dtype, interleaved, rope_inplace_v1, rope_inplace_v2, inplace=True)
 
 
 if __name__ == "__main__":

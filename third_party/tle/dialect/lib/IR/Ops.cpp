@@ -25,7 +25,8 @@ constexpr int kClusterSharedMemoryAddressSpace = 7;
 // ExtractTileOp Builder
 // ============================================================================
 void ExtractTileOp::build(OpBuilder &builder, OperationState &state, Value src,
-                          Value index, ArrayRef<int64_t> tileShape, ArrayRef<int64_t> strides) {
+                          Value index, ArrayRef<int64_t> tileShape,
+                          ArrayRef<int64_t> strides) {
   auto srcType = cast<RankedTensorType>(src.getType());
   auto resultType = RankedTensorType::get(tileShape, srcType.getElementType(),
                                           srcType.getEncoding());
@@ -64,9 +65,10 @@ LogicalResult ExtractTileOp::verify() {
   SmallVector<int64_t> strides;
   if (auto a = mlir::dyn_cast_or_null<mlir::DenseI64ArrayAttr>(
           getOperation()->getAttr("strides")))
-    for (auto v : a.asArrayRef()) strides.push_back(v);
-  if (strides.empty()) strides = tileShape;  
-
+    for (auto v : a.asArrayRef())
+      strides.push_back(v);
+  if (strides.empty())
+    strides = tileShape;
 
   // ---- Basic checks required for both static and dynamic index ----
 
@@ -92,7 +94,8 @@ LogicalResult ExtractTileOp::verify() {
     if ((srcShape[i] - tileShape[i]) < 0 ||
         (srcShape[i] - tileShape[i]) % strides[i] != 0)
       return emitOpError("(srcShape - tileShape) must be divisible by strides "
-                         "at dimension ") << i;
+                         "at dimension ")
+             << i;
     if (dstShape[i] != tileShape[i])
       return emitOpError("result shape must equal tile_shape at dimension ")
              << i;
@@ -119,7 +122,7 @@ LogicalResult ExtractTileOp::verify() {
   for (size_t i = 0; i < srcShape.size(); ++i) {
     logicalGridShape[i] = (srcShape[i] - tileShape[i]) / strides[i] + 1;
     totalTiles *= logicalGridShape[i];
- }
+  }
 
   // Out-of-bounds check
   if (index < 0 || index >= totalTiles)
