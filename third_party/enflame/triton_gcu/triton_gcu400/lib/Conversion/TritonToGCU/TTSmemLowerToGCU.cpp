@@ -1096,8 +1096,8 @@ static SmallVector<Value> computeElemOffsets(OpBuilder &b, Location loc,
                                              ArrayRef<int64_t> srcShape,
                                              ArrayRef<int64_t> tileShape,
                                              ArrayRef<int64_t> strides) {
-  auto coords = delinearizeTileIndex(b, loc, linearIdx, srcShape, tileShape,
-                                     strides);
+  auto coords =
+      delinearizeTileIndex(b, loc, linearIdx, srcShape, tileShape, strides);
   unsigned rank = srcShape.size();
   SmallVector<Value> offsets(rank);
   for (unsigned d = 0; d < rank; ++d) {
@@ -1160,9 +1160,8 @@ emitSliceFromSmem(OpBuilder &rewriter, Location loc, Value smemBuf,
                   triton::gcu::FirstLastUserAnalysis &userAnalysis,
                   std::map<Operation *, Operation *> &replaced2Origin,
                   triton::gcu::PrivateTagPool &pTagPool, Operation *op) {
-  auto elemOffsets =
-      computeElemOffsets(rewriter, loc, convertedIndex, srcShape, tileShape,
-                         strides);
+  auto elemOffsets = computeElemOffsets(rewriter, loc, convertedIndex, srcShape,
+                                        tileShape, strides);
   auto lastUser = userAnalysis.getLastUser(op->getResults()[0]);
   auto output = syncAllocOp(rewriter, loc, lastUser, userAnalysis,
                             replaced2Origin, outputType);
@@ -1193,9 +1192,8 @@ emitDesliceToSmem(OpBuilder &rewriter, Location loc, Value smemBuf,
                   triton::gcu::FirstLastUserAnalysis &userAnalysis,
                   std::map<Operation *, Operation *> &replaced2Origin,
                   triton::gcu::PrivateTagPool &pTagPool, Operation *op) {
-  auto elemOffsets =
-      computeElemOffsets(rewriter, loc, convertedIndex, srcShape, tileShape,
-                         strides);
+  auto elemOffsets = computeElemOffsets(rewriter, loc, convertedIndex, srcShape,
+                                        tileShape, strides);
   auto firstUser = userAnalysis.getFirstUser(op->getResults()[0]);
   auto lastUser = userAnalysis.getLastUser(op->getResults()[0]);
 
@@ -1269,7 +1267,7 @@ struct TleExtractTileLowering : SharedGenericConversionPattern {
     SmallVector<int64_t> stridesVec;
     if (stridesAttr) {
       stridesVec.assign(stridesAttr.asArrayRef().begin(),
-                         stridesAttr.asArrayRef().end());
+                        stridesAttr.asArrayRef().end());
     } else {
       stridesVec.assign(tileShape.begin(), tileShape.end());
     }
@@ -1383,7 +1381,7 @@ struct TleInsertTileLowering : SharedGenericConversionPattern {
     SmallVector<int64_t> stridesVec;
     if (stridesAttr) {
       stridesVec.assign(stridesAttr.asArrayRef().begin(),
-                         stridesAttr.asArrayRef().end());
+                        stridesAttr.asArrayRef().end());
     } else {
       stridesVec.assign(tileShapeVec.begin(), tileShapeVec.end());
     }
@@ -1446,11 +1444,10 @@ struct TleInsertTileLowering : SharedGenericConversionPattern {
                                  replaced2Origin);
     }
 
-    auto output =
-        emitDesliceToSmem(rewriter, loc, smemBuf, convertedTile, convertedIndex,
-                          srcShape, tileShape, strides, tileTensorTy,
-                          resultTensorTy, userAnalysis, replaced2Origin,
-                          pTagPool, op);
+    auto output = emitDesliceToSmem(
+        rewriter, loc, smemBuf, convertedTile, convertedIndex, srcShape,
+        tileShape, strides, tileTensorTy, resultTensorTy, userAnalysis,
+        replaced2Origin, pTagPool, op);
 
     leaveTritionOp(rewriter, op);
     rewriter.replaceOp(op, output);
