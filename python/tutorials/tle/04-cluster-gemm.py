@@ -494,6 +494,11 @@ def _autotune_config(
             any_success = True
         except RuntimeError as e:
             print(f"[autotune] {name}: skip cfg={cfg} ({e})")
+            # Clear the sticky CUDA error so subsequent kernels are not affected.
+            # cudaGetLastError is the only way to clear a sticky async error.
+            import ctypes
+            cuda = ctypes.CDLL("libcudart.so")
+            cuda.cudaGetLastError()
             continue
         if ms < best_ms:
             best_ms = ms

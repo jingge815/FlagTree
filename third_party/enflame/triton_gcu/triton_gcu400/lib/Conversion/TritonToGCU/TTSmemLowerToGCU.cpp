@@ -1453,10 +1453,10 @@ struct SliceFromLocalOpLowering
         dyn_cast<MemRefType>(getTypeConverter()->convertType(resultTensorTy));
 
     auto tileShapeArr = op.getTileShape();
-    auto stridesAttr = op.getTileStrides();
+    auto stridesOpt = op.getTileStrides();
     SmallVector<int64_t> stridesVec(
-        stridesAttr ? stridesAttr.asArrayRef().begin() : tileShapeArr.begin(),
-        stridesAttr ? stridesAttr.asArrayRef().end() : tileShapeArr.end());
+        stridesOpt.has_value() ? stridesOpt->begin() : tileShapeArr.begin(),
+        stridesOpt.has_value() ? stridesOpt->end() : tileShapeArr.end());
 
     auto output =
         emitSliceFromSmem(rewriter, op.getLoc(), adaptor.getSrc(),
@@ -1491,10 +1491,10 @@ struct DesliceToLocalOpLowering
     auto resultTensorTy = cast<RankedTensorType>(op.getResult().getType());
 
     auto tileShapeArr = op.getTileShape();
-    auto stridesAttr = op.getTileStrides();
+    auto stridesOpt = op.getTileStrides();
     SmallVector<int64_t> stridesVec(
-        stridesAttr ? stridesAttr.asArrayRef().begin() : tileShapeArr.begin(),
-        stridesAttr ? stridesAttr.asArrayRef().end() : tileShapeArr.end());
+        stridesOpt.has_value() ? stridesOpt->begin() : tileShapeArr.begin(),
+        stridesOpt.has_value() ? stridesOpt->end() : tileShapeArr.end());
 
     auto output = emitDesliceToSmem(
         rewriter, op.getLoc(), adaptor.getSrc(), adaptor.getTile(),
