@@ -485,13 +485,22 @@ def _autotune_config(
 ) -> KernelConfig:
     best_cfg = candidates[0]
     best_ms = float("inf")
+    any_success = False
     for cfg in candidates:
-        run_fn(cfg)
-        torch.cuda.synchronize()
-        ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup, rep=rep)
+        try:
+            run_fn(cfg)
+            torch.cuda.synchronize()
+            ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup, rep=rep)
+            any_success = True
+        except RuntimeError as e:
+            print(f"[autotune] {name}: skip cfg={cfg} ({e})")
+            continue
         if ms < best_ms:
             best_ms = ms
             best_cfg = cfg
+    if not any_success:
+        print(f"[autotune] {name}: all configs failed, giving up")
+        return None
     print(f"[autotune] {name}: best cfg={best_cfg} ms={best_ms:.3f} tflops={_tflops(M, N, K, best_ms):.2f}")
     return best_cfg
 
@@ -584,6 +593,9 @@ def main(argv: list[str] | None = None) -> None:
             args.tune_warmup,
             args.tune_rep,
         )
+        if remote_cfg is None:
+            print("SKIP: all cluster remote configs failed with misaligned address.")
+            return
 
     print(f"selected triton cfg: {triton_cfg}")
     print(f"selected remote cfg: {remote_cfg}")
