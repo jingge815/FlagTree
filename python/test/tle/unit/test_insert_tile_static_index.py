@@ -32,7 +32,6 @@ def insert_tile_stride_kernel(
     tl.store(out_ptr + offs_m[:, None] * N + offs_n[None, :], z)
 
 
-
 @triton.jit
 def insert_tile_kernel(
     x_ptr,
@@ -103,14 +102,16 @@ def test_insert_tile_with_stride():
     y = (10000 + torch.arange(TM * TN, device="cuda", dtype=torch.float32)).reshape(TM, TN)
     out = torch.empty_like(x)
 
-    print(f"Running insert_tile kernel with stride: x={M}x{N}, tile={TM}x{TN}, stride={SM}x{SN}, index=[{idx_m},{idx_n}]...")
+    print(
+        f"Running insert_tile kernel with stride: x={M}x{N}, tile={TM}x{TN}, stride={SM}x{SN}, index=[{idx_m},{idx_n}]..."
+    )
     insert_tile_stride_kernel[(1, )](x, y, out, M, N, TM, TN, SM, SN, idx_m, idx_n)
     print("Kernel executed.\n")
 
     expected = x.clone()
     start_m = idx_m * SM
     start_n = idx_n * SN
-    expected[start_m:start_m+TM, start_n:start_n+TN] = y
+    expected[start_m:start_m + TM, start_n:start_n + TN] = y
 
     max_abs_diff = (out - expected).abs().max().item()
     print(f"max_abs_diff = {max_abs_diff}")

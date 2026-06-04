@@ -15,14 +15,18 @@ DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
 
 def _next_pow2(x: int) -> int:
-    return 1 if x <= 1 else 2 ** math.ceil(math.log2(x))
-
+    return 1 if x <= 1 else 2**math.ceil(math.log2(x))
 
 
 @triton.jit
 def glu_baseline(
-    a_ptr, b_ptr, out_ptr, D,
-    stride_an, stride_bn, stride_outn,
+    a_ptr,
+    b_ptr,
+    out_ptr,
+    D,
+    stride_an,
+    stride_bn,
+    stride_outn,
     BLOCK_D: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
@@ -31,15 +35,12 @@ def glu_baseline(
     offs_d = pid_d * BLOCK_D + tl.arange(0, BLOCK_D)
     mask_d = offs_d < D
 
-    a = tl.load(a_ptr + pid_n * stride_an + offs_d,
-                mask=mask_d, other=0.0).to(tl.float32)
-    b = tl.load(b_ptr + pid_n * stride_bn + offs_d,
-                mask=mask_d, other=0.0).to(tl.float32)
+    a = tl.load(a_ptr + pid_n * stride_an + offs_d, mask=mask_d, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + pid_n * stride_bn + offs_d, mask=mask_d, other=0.0).to(tl.float32)
 
     result = a * (1.0 / (1.0 + tl.exp(-b)))
 
-    tl.store(out_ptr + pid_n * stride_outn + offs_d,
-             result.to(out_ptr.dtype.element_ty), mask=mask_d)
+    tl.store(out_ptr + pid_n * stride_outn + offs_d, result.to(out_ptr.dtype.element_ty), mask=mask_d)
 
 
 # %%
@@ -49,32 +50,31 @@ def glu_baseline(
 
 @triton.jit
 def glu_extract_static(
-    x_ptr, out_ptr, D,
-    stride_xn, stride_outn,
-    D_P2:  tl.constexpr,
+    x_ptr,
+    out_ptr,
+    D,
+    stride_xn,
+    stride_outn,
+    D_P2: tl.constexpr,
     D2_P2: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
 
     offs = tl.arange(0, D2_P2)
     mask = offs < (D * 2)
-    halo = tl.load(x_ptr + pid_n * stride_xn + offs,
-                   mask=mask, other=0.0)
+    halo = tl.load(x_ptr + pid_n * stride_xn + offs, mask=mask, other=0.0)
 
-    a_tile = tle.extract_tile(halo, index=[0],
-                              tile_shape=[D_P2])
-    b_tile = tle.extract_tile(halo, index=[1],
-                              tile_shape=[D_P2])
+    a_tile = tle.extract_tile(halo, index=[0], tile_shape=[D_P2])
+    b_tile = tle.extract_tile(halo, index=[1], tile_shape=[D_P2])
 
-    a_f32     = a_tile.to(tl.float32)
-    b_f32     = b_tile.to(tl.float32)
+    a_f32 = a_tile.to(tl.float32)
+    b_f32 = b_tile.to(tl.float32)
     sigmoid_b = 1.0 / (1.0 + tl.exp(-b_f32))
-    result    = a_f32 * sigmoid_b
+    result = a_f32 * sigmoid_b
 
     offs_d = tl.arange(0, D_P2)
     mask_d = offs_d < D
-    tl.store(out_ptr + pid_n * stride_outn + offs_d,
-             result.to(out_ptr.dtype.element_ty), mask=mask_d)
+    tl.store(out_ptr + pid_n * stride_outn + offs_d, result.to(out_ptr.dtype.element_ty), mask=mask_d)
 
 
 # %%
@@ -84,13 +84,18 @@ def glu_extract_static(
 
 def triton_glu(x, BLOCK_D):
     N, D2 = x.shape
-    D     = D2 // 2
-    out   = torch.empty((N, D), device=x.device, dtype=x.dtype)
-    a, b  = torch.chunk(x, 2, dim=-1)
-    grid  = (N, triton.cdiv(D, BLOCK_D))
+    D = D2 // 2
+    out = torch.empty((N, D), device=x.device, dtype=x.dtype)
+    a, b = torch.chunk(x, 2, dim=-1)
+    grid = (N, triton.cdiv(D, BLOCK_D))
     glu_baseline[grid](
-        a, b, out, D,
-        a.stride(0), b.stride(0), out.stride(0),
+        a,
+        b,
+        out,
+        D,
+        a.stride(0),
+        b.stride(0),
+        out.stride(0),
         BLOCK_D=BLOCK_D,
     )
     return out
@@ -98,13 +103,16 @@ def triton_glu(x, BLOCK_D):
 
 def tle_glu(x):
     N, D2 = x.shape
-    D     = D2 // 2
-    out   = torch.empty((N, D), device=x.device, dtype=x.dtype)
-    d_p2  = _next_pow2(D)
+    D = D2 // 2
+    out = torch.empty((N, D), device=x.device, dtype=x.dtype)
+    d_p2 = _next_pow2(D)
     d2_p2 = _next_pow2(D2)
-    glu_extract_static[(N,)](
-        x, out, D,
-        x.stride(0), out.stride(0),
+    glu_extract_static[(N, )](
+        x,
+        out,
+        D,
+        x.stride(0),
+        out.stride(0),
         D_P2=d_p2,
         D2_P2=d2_p2,
     )
@@ -122,13 +130,11 @@ def torch_glu(x):
 # Without phase 1, the first-compile time of BLOCK_D=1024 gets folded into
 # do_bench and the autotuner mis-elects BLOCK_D=256 as "fastest".
 
-
 _BLOCK_D_CANDIDATES = [64, 128, 256, 512, 1024]
 _block_d_cache: dict = {}
 
 
-def best_block_d(N: int, D: int, dtype: torch.dtype,
-                 verbose: bool = False) -> int:
+def best_block_d(N: int, D: int, dtype: torch.dtype, verbose: bool = False) -> int:
     """Pick the fastest BLOCK_D for the baseline on (N, D, dtype). Cached."""
     key = (N, D, dtype)
     if key in _block_d_cache:
@@ -161,9 +167,7 @@ def best_block_d(N: int, D: int, dtype: torch.dtype,
     # We use the no-quantiles form and let it return a single float.
     best_bd, best_ms = valid_bds[0], float("inf")
     for bd in valid_bds:
-        ms = triton.testing.do_bench(
-            lambda b=bd: triton_glu(x, b),
-            warmup=25, rep=100)
+        ms = triton.testing.do_bench(lambda b=bd: triton_glu(x, b), warmup=25, rep=100)
         if verbose:
             print(f"  [autotune] N={N} D={D} {dtype} BLOCK_D={bd:>4}  "
                   f"{ms*1000:.3f} us")
@@ -200,13 +204,11 @@ def _make_input(N, D, dtype):
 def _check_static_feasibility(D: int) -> None:
     d_p2 = _next_pow2(D)
     if d_p2 != D:
-        raise ValueError(
-            f"D={D} is not pow2 (next_pow2={d_p2}); static extract_tile "
-            f"requires D == next_pow2(D)")
+        raise ValueError(f"D={D} is not pow2 (next_pow2={d_p2}); static extract_tile "
+                         f"requires D == next_pow2(D)")
     if d_p2 < 256:
-        raise ValueError(
-            f"D_P2={d_p2} < 256; cannot guarantee divisibility by "
-            f"ctaTile(<=128)")
+        raise ValueError(f"D_P2={d_p2} < 256; cannot guarantee divisibility by "
+                         f"ctaTile(<=128)")
 
 
 def run_correctness(N, D, dtype, BLOCK_D=None):
@@ -215,16 +217,14 @@ def run_correctness(N, D, dtype, BLOCK_D=None):
     if BLOCK_D is None:
         BLOCK_D = best_block_d(N, D, dtype)
 
-    ref      = torch_glu(x.float()).to(dtype)
+    ref = torch_glu(x.float()).to(dtype)
     y_triton = triton_glu(x, BLOCK_D)
-    y_tle    = tle_glu(x)
+    y_tle = tle_glu(x)
 
     atol = 1e-2 if dtype == torch.float16 else 1e-4
     rtol = 1e-3 if dtype == torch.float16 else 1e-4
-    torch.testing.assert_close(y_triton.float(), ref.float(),
-                               rtol=rtol, atol=atol)
-    torch.testing.assert_close(y_tle.float(), ref.float(),
-                               rtol=rtol, atol=atol)
+    torch.testing.assert_close(y_triton.float(), ref.float(), rtol=rtol, atol=atol)
+    torch.testing.assert_close(y_tle.float(), ref.float(), rtol=rtol, atol=atol)
     dt = "fp16" if dtype == torch.float16 else "fp32"
     print(f"  [OK]  N={N} D={D} {dt}  BLOCK_D={BLOCK_D}")
 
@@ -235,12 +235,9 @@ if "--only_unit_test" in sys.argv:
             run_correctness(_N, _D, _dtype)
     sys.exit(0)
 
-
 _BENCH_PROVIDERS = ["triton", "tle", "torch"]
-_BENCH_NAMES     = ["Triton (baseline, autotuned)",
-                    "TLE (extract_tile static)",
-                    "Torch (F.glu)"]
-_BENCH_STYLES    = [("blue", "-"), ("orange", "-"), ("green", "-")]
+_BENCH_NAMES = ["Triton (baseline, autotuned)", "TLE (extract_tile static)", "Torch (F.glu)"]
+_BENCH_STYLES = [("blue", "-"), ("orange", "-"), ("green", "-")]
 
 
 @triton.testing.perf_report(
@@ -264,15 +261,12 @@ def benchmark(N, D, provider, dtype_str):
     quantiles = [0.5, 0.2, 0.8]
 
     if provider == "torch":
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: torch_glu(x), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: torch_glu(x), quantiles=quantiles)
     elif provider == "tle":
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: tle_glu(x), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: tle_glu(x), quantiles=quantiles)
     else:  # triton baseline with autotuned BLOCK_D
         BLOCK_D = best_block_d(N, D, dtype)
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: triton_glu(x, BLOCK_D), quantiles=quantiles)
+        ms, min_ms, max_ms = triton.testing.do_bench(lambda: triton_glu(x, BLOCK_D), quantiles=quantiles)
 
     return ms, max_ms, min_ms
 
@@ -284,17 +278,12 @@ def benchmark(N, D, provider, dtype_str):
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--N", type=int, default=4096,
-                        help="rows for correctness")
-    parser.add_argument("--D", type=int, default=1024,
-                        help="last-dim half-size for correctness "
-                             "(pow2, >=256)")
-    parser.add_argument("--dtype", type=str, default="float32",
-                        choices=["float16", "float32", "fp16", "fp32"])
-    parser.add_argument("--show_plots", action="store_true",
-                        help="show plots in benchmark")
-    parser.add_argument("--verbose_autotune", action="store_true",
-                        help="print autotune timing for each BLOCK_D")
+    parser.add_argument("--N", type=int, default=4096, help="rows for correctness")
+    parser.add_argument("--D", type=int, default=1024, help="last-dim half-size for correctness "
+                        "(pow2, >=256)")
+    parser.add_argument("--dtype", type=str, default="float32", choices=["float16", "float32", "fp16", "fp32"])
+    parser.add_argument("--show_plots", action="store_true", help="show plots in benchmark")
+    parser.add_argument("--verbose_autotune", action="store_true", help="print autotune timing for each BLOCK_D")
     args = parser.parse_args(argv)
 
     dtype = _get_dtype(args.dtype)
@@ -311,8 +300,7 @@ def main(argv=None):
     run_correctness(args.N, args.D, dtype)
     print()
 
-    benchmark.run(print_data=True, show_plots=args.show_plots,
-                  dtype_str=args.dtype.replace("float", "fp"))
+    benchmark.run(print_data=True, show_plots=args.show_plots, dtype_str=args.dtype.replace("float", "fp"))
 
 
 if __name__ == "__main__":

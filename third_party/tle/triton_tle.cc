@@ -79,9 +79,11 @@ void init_triton_tle_ir(py::module &&m) {
       // TLE-Lite
       .def(
           "create_extract_tile",
-          [](TritonOpBuilder &self, Value &input,
-            Value &index, std::vector<int64_t> &tileShape,std::vector<int64_t> strides) -> Value {
-            auto op = self.create<tle::ExtractTileOp>(input, index, tileShape, strides);
+          [](TritonOpBuilder &self, Value &input, Value &index,
+             std::vector<int64_t> &tileShape,
+             std::vector<int64_t> strides) -> Value {
+            auto op = self.create<tle::ExtractTileOp>(input, index, tileShape,
+                                                      strides);
             return op.getResult();
           },
           py::arg("input"), py::arg("index"), py::arg("tileShape"),
@@ -89,9 +91,10 @@ void init_triton_tle_ir(py::module &&m) {
           "Create extract_tile operation")
       .def(
           "create_insert_tile",
-          [](TritonOpBuilder &self, Value &input, Value &tile,
-             Value &index, std::vector<int64_t> strides) -> Value {
-            auto op = self.create<tle::InsertTileOp>(input, tile, index, strides);
+          [](TritonOpBuilder &self, Value &input, Value &tile, Value &index,
+             std::vector<int64_t> strides) -> Value {
+            auto op =
+                self.create<tle::InsertTileOp>(input, tile, index, strides);
             return op.getResult();
           },
           py::arg("input"), py::arg("tile"), py::arg("index"),
@@ -477,7 +480,7 @@ void init_triton_tle_passes(py::module &&m) {
                      tle::createTritonTleLowerExtractTile);
 
   ADD_PASS_WRAPPER_0("add_lower_insert_tile",
-                    tle::createTritonTleLowerInsertTile);
+                     tle::createTritonTleLowerInsertTile);
 }
 
 void init_tle_raw_ir(py::module &&m) {

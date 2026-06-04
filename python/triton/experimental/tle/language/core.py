@@ -113,8 +113,9 @@ def cumsum(input, axis=0, reverse=False, dtype: tl.constexpr = None, _semantic=N
 
 
 # ============================================================================
-# extract_tile helper functions 
+# extract_tile helper functions
 # ============================================================================
+
 
 def _try_unwrap_int(val):
     """
@@ -222,7 +223,7 @@ def _linearize_dynamic_multidim_index(index_tuple, src_shape, tile_shape_ints, _
     strides_eff = strides_ints if strides_ints else tile_shape_ints
     grid = []
     for i, (s, t) in builtins.enumerate(builtins.zip(src_shape, tile_shape_ints)):
-        grid.append((s - t) // strides_eff[i] + 1)    
+        grid.append((s - t) // strides_eff[i] + 1)
     # compute strides
     strides = [1] * len(grid)
     acc = 1
@@ -368,15 +369,13 @@ def extract_tile(
     if not is_dynamic:
         strides_eff = strides_ints if strides_ints else tile_shape_ints
         if all(isinstance(s, int) for s in src_shape):
-            for i, (s, t, st) in builtins.enumerate(
-                    builtins.zip(src_shape, tile_shape_ints, strides_eff)):
+            for i, (s, t, st) in builtins.enumerate(builtins.zip(src_shape, tile_shape_ints, strides_eff)):
                 if (s - t) < 0 or (s - t) % st != 0:
-                    raise ValueError(
-                        f"(src-tile) not divisible by stride at dim {i}: "
-                        f"src={s}, tile={t}, stride={st}")
+                    raise ValueError(f"(src-tile) not divisible by stride at dim {i}: "
+                                     f"src={s}, tile={t}, stride={st}")
             total_tiles = 1
             for s, t, st in builtins.zip(src_shape, tile_shape_ints, strides_eff):
-                total_tiles *= (s - t) // st + 1 
+                total_tiles *= (s - t) // st + 1
             if index_value < 0 or index_value >= total_tiles:
                 raise ValueError(f"index {index_value} out of range [0, {total_tiles})")
 
@@ -397,7 +396,8 @@ def extract_tile(
             # Static index: encode compile-time constant as IR constant
             index_ir = _semantic._convert_to_ir_values([index_value], require_i64=False)[0]
 
-        output = _semantic.builder.create_extract_tile(x.handle, index_ir, tile_shape_ints, strides_ints or tile_shape_ints)
+        output = _semantic.builder.create_extract_tile(x.handle, index_ir, tile_shape_ints, strides_ints
+                                                       or tile_shape_ints)
         block_type = tl.block_type(x.type.element_ty, tile_shape_ints)
         return tl.tensor(output, block_type)
     except Exception as e:
@@ -459,9 +459,8 @@ def insert_tile(
             raise ValueError(f"Stride dimension {i} must be positive, got {stride_dim}")
         remainder = src_dim - tile_dim
         if remainder < 0 or remainder % stride_dim != 0:
-            raise ValueError(
-                f"(src-tile) not divisible by stride at dim {i}: "
-                f"src={src_dim}, tile={tile_dim}, stride={stride_dim}")
+            raise ValueError(f"(src-tile) not divisible by stride at dim {i}: "
+                             f"src={src_dim}, tile={tile_dim}, stride={stride_dim}")
         grid.append(remainder // stride_dim + 1)
 
     # Parse index: dynamic scalar tensor or static scalar/multi-dim.
