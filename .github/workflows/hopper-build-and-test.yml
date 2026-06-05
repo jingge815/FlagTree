@@ -180,7 +180,16 @@ jobs:
           python3 python/tutorials/tle/01-fft.py
           python3 python/tutorials/tle/02-moe_align_block_size.py
           python3 python/tutorials/tle/03-topk.py
-          python3 python/tutorials/tle/04-cluster-gemm.py
+          echo "::group::TLE 04 debug: suspected BK=256 remote config"
+          PYTHONUNBUFFERED=1 FLAGTREE_CI_DEBUG_CLUSTER_GEMM=1 CUDA_LAUNCH_BLOCKING=1 \
+            python3 python/tutorials/tle/04-cluster-gemm.py \
+              --no-autotune --bm 32 --bn 512 --bk 256 --num-warps 4 --num-stages 2 \
+              --warmup 2 --rep 5
+          echo "::endgroup::"
+          echo "::group::TLE 04 debug: full default run"
+          PYTHONUNBUFFERED=1 FLAGTREE_CI_DEBUG_CLUSTER_GEMM=1 CUDA_LAUNCH_BLOCKING=1 \
+            python3 python/tutorials/tle/04-cluster-gemm.py
+          echo "::endgroup::"
           python3 python/tutorials/tle/deepseek_v32/01-topk_selector.py
           python3 python/tutorials/tle/deepseek_v32/02-sparse-mla.py
           # python unit test
