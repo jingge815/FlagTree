@@ -64,3 +64,19 @@ def spec_func(function_name: str):
     if mod is not None and hasattr(mod, function_name):
         return getattr(mod, function_name)
     return None
+
+
+# flagtree language extension
+def bind_language_extension_symbols_to_tl(extension):
+    import triton.language as tl
+
+    names = getattr(extension, "__all__", None)
+    if not names:
+        return
+
+    for name in names:
+        if not hasattr(extension, name):
+            continue
+        if hasattr(tl, name):
+            continue
+        setattr(tl, name, getattr(extension, name))
