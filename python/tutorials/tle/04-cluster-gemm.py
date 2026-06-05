@@ -14,8 +14,6 @@ Run example:
 from __future__ import annotations
 
 import argparse
-import os
-import sys
 from dataclasses import dataclass
 from typing import Callable
 
@@ -24,27 +22,7 @@ import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 
-CI_DEBUG = os.environ.get("FLAGTREE_CI_DEBUG_CLUSTER_GEMM") == "1"
-
 BLOCK_CLUSTER_MESH = tle.device_mesh({"block_cluster": [("cluster_x", 2)]})
-
-
-def _debug(msg: str) -> None:
-    if CI_DEBUG:
-        print(f"[ci-debug] {msg}", flush=True)
-
-
-def _print_runtime_debug(args: argparse.Namespace) -> None:
-    if not CI_DEBUG:
-        return
-    _debug(f"python={sys.version.split()[0]} executable={sys.executable}")
-    _debug(f"torch={torch.__version__} triton={getattr(triton, '__version__', 'unknown')}")
-    _debug(f"triton_file={triton.__file__}")
-    _debug(f"triton_cache_dir={os.environ.get('TRITON_CACHE_DIR', '<default>')}")
-    _debug(f"cuda_launch_blocking={os.environ.get('CUDA_LAUNCH_BLOCKING', '<unset>')}")
-    if torch.cuda.is_available():
-        _debug(f"cuda_device={torch.cuda.get_device_name()} capability={torch.cuda.get_device_capability()}")
-    _debug(f"args={args}")
 
 
 def _select_dot_k(bk: int) -> int:
@@ -507,14 +485,10 @@ def _autotune_config(
 ) -> KernelConfig:
     best_cfg = candidates[0]
     best_ms = float("inf")
-    for idx, cfg in enumerate(candidates, start=1):
-        _debug(f"{name}: candidate {idx}/{len(candidates)} launch cfg={cfg}")
+    for cfg in candidates:
         run_fn(cfg)
-        _debug(f"{name}: candidate {idx}/{len(candidates)} launch returned; synchronizing")
         torch.cuda.synchronize()
-        _debug(f"{name}: candidate {idx}/{len(candidates)} synchronized; benchmarking warmup={warmup} rep={rep}")
         ms = triton.testing.do_bench(lambda: run_fn(cfg), warmup=warmup, rep=rep)
-        _debug(f"{name}: candidate {idx}/{len(candidates)} bench_ms={ms:.6f}")
         if ms < best_ms:
             best_ms = ms
             best_cfg = cfg
@@ -562,8 +536,6 @@ def main(argv: list[str] | None = None) -> None:
     if skip_reason is not None:
         print(f"SKIP: {skip_reason}")
         return
-
-    _print_runtime_debug(args)
 
     torch.manual_seed(args.seed)
     dtype = torch.float16
