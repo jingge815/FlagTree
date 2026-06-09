@@ -50,12 +50,9 @@ jobs:
       - name: Direct Kernel Test on Mthreads
         if: steps.check_backend.outputs.should_skip != 'true'
         shell: bash
-        env:
-          MTHREADS_KERNEL_TEST_KERNEL: ${{ vars.MTHREADS_KERNEL_TEST_KERNEL }}
         run: |
           set -x
           export TRITON_DEFAULT_BACKEND=mthreads
-          kernel="${MTHREADS_KERNEL_TEST_KERNEL:-gelu}"
           python3 third_party/mthreads/python/test/test_verify_service.py \
             --chip moore \
-            --kernel "${kernel}"
+            --all
