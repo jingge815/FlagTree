@@ -46,3 +46,18 @@ jobs:
         run: |
           set -x
           python3 -m pytest -s third_party/mthreads/python/test/unit --device musa
+
+      - name: Verify Service Test on Mthreads
+        if: steps.check_backend.outputs.should_skip != 'true'
+        shell: bash
+        env:
+          MTHREADS_VERIFY_SERVICE_URL: ${{ vars.MTHREADS_VERIFY_SERVICE_URL }}
+          MTHREADS_VERIFY_SERVICE_KERNEL: ${{ vars.MTHREADS_VERIFY_SERVICE_KERNEL }}
+        run: |
+          set -x
+          verify_service_url="${MTHREADS_VERIFY_SERVICE_URL:-http://10.7.66.1:8912}"
+          verify_service_kernel="${MTHREADS_VERIFY_SERVICE_KERNEL:-gelu}"
+          python3 third_party/mthreads/python/test/test_verify_service.py \
+            --url "${verify_service_url}" \
+            --chip moore \
+            --kernel "${verify_service_kernel}"
