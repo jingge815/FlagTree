@@ -90,9 +90,8 @@ def matmul_kernel(
         acc += tl.dot(a, b)
         A += BLOCK_K * stride_ak
         B += BLOCK_K * stride_bk
-    c = acc.to(tl.float16)
     C = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(C, c, mask=(rm[:, None] < M) & (rn[None, :] < N))
+    tl.store(C, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
 
 
 def matmul(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
@@ -281,12 +280,21 @@ def run_matmul(device_type: str, device: str) -> int:
 
     def case(config):
         M, N, K = config
-        A = torch.randn(M, K, device=device, dtype=torch.float16)
-        B = torch.randn(K, N, device=device, dtype=torch.float16)
+        torch.manual_seed(42)
+        A = torch.randn(M, K, device=device, dtype=torch.float32)
+        B = torch.randn(K, N, device=device, dtype=torch.float32)
         actual = matmul(A, B)
         expected = A @ B
         _synchronize(device_type)
-        _assert_close(f"matmul shape=({M},{N},{K})", actual, expected, rtol=1e-2, atol=1e-2)
+        diff = (actual.float() - expected.float()).abs()
+        max_diff = diff.max().item()
+        ok = torch.allclose(actual, expected, rtol=1e-2, atol=1e-2)
+        print(f"    ({M},{N},{K}): max_diff={max_diff:.6e} {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            tile = diff[:64, :64]
+            for row in range(0, 64, 16):
+                print(f"      Row {row:2d} max diff: {tile[row].max().item():.4e}")
+            raise AssertionError(f"matmul shape=({M},{N},{K}): max_diff={max_diff:.6e}, rtol=1e-2, atol=1e-2")
 
     return _run_cases("matmul", configs, case)
 
@@ -314,7 +322,7 @@ KERNELS = {
     ),
     "matmul": KernelSpec(
         name="matmul",
-        desc="FP16 matrix multiplication correctness",
+        desc="FP32 tl.dot loop accumulation correctness",
         runner=run_matmul,
     ),
     "add": KernelSpec(
