@@ -1,35 +1,51 @@
 """
-2D Depthwise Conv with Triton (TLE Tutorial style)
-==================================================
+2D Depthwise Conv with TLE extract_tile
+========================================
 
-This tutorial implements a 2D depthwise convolution and compares a Triton
-baseline kernel against a TLE kernel that uses ``tle.extract_tile`` for
-static halo reuse, against PyTorch's ``F.conv2d`` reference.
+Compares a Triton baseline depthwise conv kernel against a TLE optimized
+version that uses ``tle.extract_tile``.
 
-Notes
+Layout is HWC (channels-last). Kernel size K is odd, padding = 0 (valid conv).
+
+Usage
 -----
-- Layout is HWC (channels-last) for both input and weight.
-- Kernel size K is odd; padding = 0 (valid conv). Output (H-K+1, W-K+1, C).
-- TLE uses a register-only halo path: load a (HALO_H_P2, HALO_W_P2, TC)
-  halo block once into registers, then ``tle.extract_tile`` with constexpr
-  indices for K*K reuse without any shared memory or barriers.
-- The benchmark focuses on K=5 with a 4x4 spatial tile.
+::
+
+    # correctness only (default)
+    python python/tutorials/tle/06-2D_Depthwise_Conv.py
+
+    # correctness + benchmark table
+    python python/tutorials/tle/06-2D_Depthwise_Conv.py --benchmark
+
+    # specify dtype
+    python python/tutorials/tle/06-2D_Depthwise_Conv.py --benchmark --dtype float16
 """
 
-# %%
-# Setup
-# -----
 
 import argparse
 import math
+import subprocess
 import sys
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def _print_env():
+    """Print test environment information for reproducibility."""
+    print(f"GPU: {torch.cuda.get_device_name()} | CUDA: {torch.version.cuda} | Triton: {triton.__version__}")
+    print()
+
+
+# Benchmark parameters
+BENCH_WARMUP = 25
+BENCH_REP = 100
+BENCH_RUNS = 5  # number of runs for stddev
 
 
 def _next_pow2(x: int) -> int:
@@ -253,7 +269,7 @@ def run_correctness(H, W, C, KH, KW, TOH, TOW, TC, dtype):
     atol = 1e-2 if dtype == torch.float16 else 1e-3
     torch.testing.assert_close(y_triton.float(), ref.float(), rtol=atol, atol=atol)
     torch.testing.assert_close(y_tle.float(), ref.float(), rtol=atol, atol=atol)
-    print("Correctness check passed (triton/tle).")
+    print(f"  pass  H={H} W={W} C={C} K={KH}x{KW}")
 
 
 if "--only_unit_test" in sys.argv:
@@ -307,6 +323,49 @@ def benchmark(H, C, KH, KW, TOH, TOW, TC, provider, dtype):
 # ----
 
 
+def _bench_one(fn, warmup=BENCH_WARMUP, rep=BENCH_REP, runs=BENCH_RUNS):
+    """Run do_bench multiple times with quantiles, return stats dict."""
+    p50s, p20s, p80s = [], [], []
+    for _ in range(runs):
+        ms, p80, p20 = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8])
+        p50s.append(ms if isinstance(ms, float) else ms[0])
+        p20s.append(p20 if isinstance(p20, float) else p20[0])
+        p80s.append(p80 if isinstance(p80, float) else p80[0])
+    p50s = np.array(p50s)
+    return {
+        "mean": float(p50s.mean()),
+        "std": float(p50s.std()),
+        "p50": float(np.median(p50s)),
+        "p90": float(np.percentile(p50s, 90)),
+        "min": float(np.min(p20s)),
+        "max": float(np.max(p80s)),
+    }
+
+
+
+
+def run_benchmark_table(dtype=torch.float32):
+    """Print a detailed benchmark table with latency, p50, p90, throughput, speedup, and regression."""
+    H_vals = [112, 128, 256, 512]
+    C, KH, KW, TOH, TOW, TC = 64, 5, 5, 4, 4, 64
+    dtype_str = "fp16" if dtype == torch.float16 else "fp32"
+
+    print(f"2D Depthwise Conv | H=[112,128,256,512] W=H C={C} K={KH}x{KW} | layout=HWC {dtype_str} | Warmup={BENCH_WARMUP} Rep={BENCH_REP} Runs={BENCH_RUNS}")
+    print()
+    print(f"{'H':<8} {'Triton mean':<12} {'p50':<12} {'p90':<12} {'TLE mean':<12} {'p50':<12} {'p90':<12} {'Speedup':<10}")
+
+    for H in H_vals:
+        inp, wgt = _make_input(H, H, C, KH, KW, dtype)
+
+        s_b = _bench_one(lambda: triton_dwconv(inp, wgt, KH, KW, TOH, TOW, TC))
+        s_t = _bench_one(lambda: tle_dwconv(inp, wgt, KH, KW, TOH, TOW, TC))
+
+        sp = s_b["p50"] / s_t["p50"] if s_t["p50"] > 0 else 0.0
+
+        print(f"{H:<8} {s_b['mean']:<12.4f} {s_b['p50']:<12.4f} {s_b['p90']:<12.4f} "
+              f"{s_t['mean']:<12.4f} {s_t['p50']:<12.4f} {s_t['p90']:<12.4f} {sp:.2f}x")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--H", type=int, default=128, help="spatial H for correctness")
@@ -319,15 +378,23 @@ def main(argv=None):
     parser.add_argument("--TC", type=int, default=64)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float16", "float32", "fp16", "fp32"])
     parser.add_argument("--show_plots", action="store_true", help="show plots in benchmark")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="print detailed benchmark table")
     args = parser.parse_args(argv)
 
     dtype = _get_dtype(args.dtype)
 
-    check_H = min(args.H, 256)
-    check_W = min(args.W, 256)
-    run_correctness(check_H, check_W, args.C, args.KH, args.KW, args.TOH, args.TOW, args.TC, dtype)
+    _print_env()
 
-    benchmark.run(print_data=True, show_plots=args.show_plots, dtype=dtype)
+    print("--- correctness ---")
+    for H in [112, 128, 256, 512]:
+        run_correctness(H, H, args.C, args.KH, args.KW, args.TOH, args.TOW, args.TC, dtype)
+    print()
+
+    if args.benchmark:
+        run_benchmark_table(dtype)
+    else:
+        benchmark.run(print_data=True, show_plots=args.show_plots, dtype=dtype)
 
 
 if __name__ == "__main__":

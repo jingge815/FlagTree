@@ -1,17 +1,52 @@
+"""
+GLU with TLE extract_tile
+==========================
+
+Compares a Triton baseline GLU kernel against a TLE optimized version
+that uses ``tle.extract_tile``.
+
+Usage
+-----
+::
+
+    # correctness only (default)
+    python python/tutorials/tle/05-glu.py
+
+    # correctness + benchmark table
+    python python/tutorials/tle/05-glu.py --benchmark
+
+    # specify dtype
+    python python/tutorials/tle/05-glu.py --benchmark --dtype float16
+"""
+
 # %%
 # Setup
 # -----
 
 import argparse
 import math
+import subprocess
 import sys
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 import triton.experimental.tle.language as tle
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def _print_env():
+    """Print test environment information for reproducibility."""
+    print(f"GPU: {torch.cuda.get_device_name()} | CUDA: {torch.version.cuda} | Triton: {triton.__version__}")
+    print()
+
+
+# Benchmark parameters
+BENCH_WARMUP = 25
+BENCH_REP = 100
+BENCH_RUNS = 5  # number of runs for stddev
 
 
 def _next_pow2(x: int) -> int:
@@ -124,11 +159,29 @@ def torch_glu(x):
 
 
 # %%
-# Baseline BLOCK_D autotune  ★ FIXED ★
 # ------------------------------------
 # Two-phase: (1) warm-compile all candidates, (2) timing pass.
 # Without phase 1, the first-compile time of BLOCK_D=1024 gets folded into
 # do_bench and the autotuner mis-elects BLOCK_D=256 as "fastest".
+
+def _bench_one(fn, warmup=BENCH_WARMUP, rep=BENCH_REP, runs=BENCH_RUNS):
+    """Run do_bench multiple times with quantiles, return stats dict."""
+    p50s, p20s, p80s = [], [], []
+    for _ in range(runs):
+        ms, p80, p20 = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8])
+        p50s.append(ms if isinstance(ms, float) else ms[0])
+        p20s.append(p20 if isinstance(p20, float) else p20[0])
+        p80s.append(p80 if isinstance(p80, float) else p80[0])
+    p50s = np.array(p50s)
+    return {
+        "mean": float(p50s.mean()),
+        "std": float(p50s.std()),
+        "p50": float(np.median(p50s)),
+        "p90": float(np.percentile(p50s, 90)),
+        "min": float(np.min(p20s)),
+        "max": float(np.max(p80s)),
+    }
+
 
 _BLOCK_D_CANDIDATES = [64, 128, 256, 512, 1024]
 _block_d_cache: dict = {}
@@ -226,7 +279,7 @@ def run_correctness(N, D, dtype, BLOCK_D=None):
     torch.testing.assert_close(y_triton.float(), ref.float(), rtol=rtol, atol=atol)
     torch.testing.assert_close(y_tle.float(), ref.float(), rtol=rtol, atol=atol)
     dt = "fp16" if dtype == torch.float16 else "fp32"
-    print(f"  [OK]  N={N} D={D} {dt}  BLOCK_D={BLOCK_D}")
+    print(f"  pass  batch={N} dim={D} {dt}  BLOCK_D={BLOCK_D}")
 
 
 if "--only_unit_test" in sys.argv:
@@ -276,6 +329,30 @@ def benchmark(N, D, provider, dtype_str):
 # ----
 
 
+def run_benchmark_table(dtype_str="fp32"):
+    """Print a detailed benchmark table with p50, p90, throughput, speedup, and regression."""
+    dtype = _get_dtype(dtype_str)
+    D_vals = [256, 512, 1024, 2048, 4096]
+    N = 4096
+
+    print(f"GLU Benchmark | batch={N} dim=[256,512,1024,2048,4096] | {dtype_str} | Warmup={BENCH_WARMUP} Rep={BENCH_REP} Runs={BENCH_RUNS}")
+    print()
+    print(f"{'D':<8} {'Triton mean':<12} {'p50':<12} {'p90':<12} {'TLE mean':<12} {'p50':<12} {'p90':<12} {'Speedup':<10}")
+
+    for D in D_vals:
+        _check_static_feasibility(D)
+        x = _make_input(N, D, dtype)
+        BLOCK_D = best_block_d(N, D, dtype)
+
+        s_b = _bench_one(lambda: triton_glu(x, BLOCK_D))
+        s_t = _bench_one(lambda: tle_glu(x))
+
+        sp = s_b["p50"] / s_t["p50"] if s_t["p50"] > 0 else 0.0
+
+        print(f"{D:<8} {s_b['mean']:<12.4f} {s_b['p50']:<12.4f} {s_b['p90']:<12.4f} "
+              f"{s_t['mean']:<12.4f} {s_t['p50']:<12.4f} {s_t['p90']:<12.4f} {sp:.2f}x")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--N", type=int, default=4096, help="rows for correctness")
@@ -284,9 +361,13 @@ def main(argv=None):
     parser.add_argument("--dtype", type=str, default="float32", choices=["float16", "float32", "fp16", "fp32"])
     parser.add_argument("--show_plots", action="store_true", help="show plots in benchmark")
     parser.add_argument("--verbose_autotune", action="store_true", help="print autotune timing for each BLOCK_D")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="print detailed benchmark table")
     args = parser.parse_args(argv)
 
     dtype = _get_dtype(args.dtype)
+
+    _print_env()
 
     # Optionally pre-warm autotune for the benchmark sizes with verbose
     # output so the user can see what BLOCK_D actually got picked.
@@ -297,10 +378,15 @@ def main(argv=None):
         print()
 
     print("--- correctness ---")
-    run_correctness(args.N, args.D, dtype)
+    N = 4096
+    for D in [256, 512, 1024, 2048, 4096]:
+        run_correctness(N, D, dtype)
     print()
 
-    benchmark.run(print_data=True, show_plots=args.show_plots, dtype_str=args.dtype.replace("float", "fp"))
+    if args.benchmark:
+        run_benchmark_table(args.dtype.replace("float", "fp"))
+    else:
+        benchmark.run(print_data=True, show_plots=args.show_plots, dtype_str=args.dtype.replace("float", "fp"))
 
 
 if __name__ == "__main__":

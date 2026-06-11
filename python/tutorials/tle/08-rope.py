@@ -2,34 +2,21 @@
 Rotary Position Embedding with TLE extract_tile
 ================================================
 
-This tutorial compares a Triton baseline RoPE kernel against a TLE
-optimized version that uses ``tle.extract_tile`` for register-only head reuse.
-
-**Key optimization**: Instead of loading each attention head's row from global
-memory one-by-one (v1), the TLE version loads **all heads as a single 2D block**
-``[NUM_HEADS, HEAD_DIM]`` into registers, then uses ``extract_tile`` to slice
-out individual head rows — eliminating redundant memory round-trips.
-
-Both **inplace** (modifies input tensors) and **outplace** (writes to new output
-tensors) variants are benchmarked.
+Compares a Triton baseline RoPE kernel against a TLE optimized version
+that uses ``tle.extract_tile``.
 
 Usage
 -----
 ::
 
-    # correctness check only (default)
+    # correctness only (default)
     python python/tutorials/tle/08-rope.py
 
-    # correctness + benchmark tables with speedup
+    # correctness + benchmark table
     python python/tutorials/tle/08-rope.py --benchmark
 
-The speedup is largest when **head_dim is small** (e.g. 128) and **num_heads is
-large** — the per-head loop overhead saved by the block load dominates.
-When head_dim is large (256+) and total work is large, arithmetic dominates and
-the gain shrinks to near zero.
-
-Both non-interleaved (default LLaMA-style) and interleaved (GPT-NeoX-style)
-RoPE variants are included.
+    # specify dtype
+    python python/tutorials/tle/08-rope.py --benchmark --dtype float16
 """
 
 # %%
@@ -38,6 +25,8 @@ RoPE variants are included.
 
 import argparse
 import random
+import subprocess
+import sys
 
 import torch
 import triton
@@ -45,6 +34,13 @@ import triton.language as tl
 import triton.experimental.tle.language as tle
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
+
+
+def _print_env():
+    """Print test environment information for reproducibility."""
+    print(f"GPU: {torch.cuda.get_device_name()} | CUDA: {torch.version.cuda} | Triton: {triton.__version__}")
+    print()
+
 
 # %%
 # Helper: build cos/sin cache
@@ -526,7 +522,7 @@ def rope_inplace_v2(q, k, cos, sin, rotary_interleaved=False):
 # -----------------
 
 
-def _assert_close_robust(name, a, b, rtol=5e-2, atol=2e-1):
+def _assert_close_robust(name, a, b, rtol=1e-2, atol=1e-2):
     """Robust comparison: pass if allclose OR quantile-based relaxed check passes.
 
     Bfloat16 arithmetic is non-deterministic across different memory access
@@ -551,7 +547,7 @@ def _assert_close_robust(name, a, b, rtol=5e-2, atol=2e-1):
     abs_p999 = torch.quantile(flat_diff, 0.999).item()
     rel_p999 = torch.quantile(flat_rel, 0.999).item()
 
-    if abs_p999 < 0.25 and rel_p999 < 0.25:
+    if abs_p999 < 0.1 and rel_p999 < 0.1:
         return  # robust check passed
 
     raise AssertionError(f"{name} mismatch: allclose failed and robust check failed; "
@@ -581,7 +577,7 @@ def check_correctness(batch=4, seq_len=256, q_heads=32, k_heads=8, head_dim=128,
     _assert_close_robust("inplace_k", ik1, ik2)
 
     inter = "interleaved" if rotary_interleaved else "non-interleaved"
-    print(f"[OK] Correctness passed ({inter}, {dtype}, dim={head_dim}) [outplace + inplace]")
+    print(f"  pass  {inter} batch={batch} seq={seq_len} qh={q_heads} kh={k_heads} dim={head_dim} {dtype}")
 
 
 # %%
@@ -629,7 +625,10 @@ def _do_bench_rigorous(fn, reset_fn):
 
 
 def _robust_bench(fn, reset_fn):
-    """Multiple rounds with outlier trimming for stable measurement."""
+    """Multiple rounds with outlier trimming for stable measurement.
+
+    Returns dict with mean, std, p50, p90.
+    """
     medians = []
     for _ in range(BENCH_ROUNDS):
         medians.append(_do_bench_rigorous(fn, reset_fn))
@@ -643,16 +642,24 @@ def _robust_bench(fn, reset_fn):
             keep = torch.ones_like(t, dtype=torch.bool)
     else:
         keep = torch.ones_like(t, dtype=torch.bool)
-    return float(torch.quantile(t[keep], 0.5).item())
+    kept = t[keep]
+    return {
+        "mean": float(kept.mean().item()),
+        "std": float(kept.std().item()),
+        "p50": float(torch.quantile(kept, 0.5).item()),
+        "p90": float(torch.quantile(kept, 0.9).item()),
+    }
+
+
 
 
 def _run_benchmark_table(title, configs, dtype, rotary_interleaved, rope_v1_fn, rope_v2_fn, inplace):
     """Print a benchmark table for a set of (batch, seq_len, q_heads, k_heads, head_dim)."""
     mode = "inplace" if inplace else "outplace"
-    print(f"\n--- {title} [{mode}] (dtype={dtype}) ---")
-    print(f"{'batch':>6} {'seq':>6} {'qh':>4} {'kh':>4} {'dim':>5} | "
-          f"{'Baseline(ms)':>13} {'TLE(ms)':>10} {'Speedup':>8}")
-    print("-" * 72)
+    print(f"\n--- {title} [{mode}] | {dtype} | Warmup={BENCH_WARMUP} Rep={BENCH_REP} Rounds={BENCH_ROUNDS} Trim={BENCH_TRIM} ---")
+    print()
+    print(f"{'batch':<6} {'seq_len':<8} {'q_heads':<8} {'k_heads':<8} {'head_dim':<9} "
+          f"{'Baseline mean':<14} {'p50':<12} {'p90':<12} {'TLE mean':<14} {'p50':<12} {'p90':<12} {'Speedup':<10} {'correctness':<12}")
 
     for batch, seq_len, q_heads, k_heads, head_dim in configs:
         torch.manual_seed(0)
@@ -687,10 +694,23 @@ def _run_benchmark_table(title, configs, dtype, rotary_interleaved, rope_v1_fn, 
         for name, fn, rst in runners:
             stats[name] = _robust_bench(fn, rst)
 
-        ms_v1, ms_v2 = stats["v1"], stats["v2"]
-        speedup = ms_v1 / ms_v2 if ms_v2 > 0 else 0.0
-        print(f"{batch:>6} {seq_len:>6} {q_heads:>4} {k_heads:>4} {head_dim:>5} | "
-              f"{ms_v1:>13.5f} {ms_v2:>10.5f} {speedup:>7.2f}×")
+        s1, s2 = stats["v1"], stats["v2"]
+        speedup = s1["p50"] / s2["p50"] if s2["p50"] > 0 else 0.0
+
+        # correctness check
+        try:
+            oq1, ok1 = rope_v1_fn(q_src.clone(), k_src.clone(), cos, sin, rotary_interleaved)
+            oq2, ok2 = rope_v2_fn(q_src.clone(), k_src.clone(), cos, sin, rotary_interleaved)
+            _assert_close_robust("check_q", oq1, oq2)
+            _assert_close_robust("check_k", ok1, ok2)
+            check = "pass"
+        except Exception:
+            check = "FAIL"
+
+        sp_str = f"{speedup:.2f}x"
+        print(f"{batch:<6} {seq_len:<8} {q_heads:<8} {k_heads:<8} {head_dim:<9} "
+              f"{s1['mean']:<14.5f} {s1['p50']:<12.5f} {s1['p90']:<12.5f} "
+              f"{s2['mean']:<14.5f} {s2['p50']:<12.5f} {s2['p90']:<12.5f} {sp_str:<10} {check}")
 
 
 # %%
@@ -707,6 +727,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     dtype = torch.bfloat16 if "bf" in args.dtype else torch.float16
+
+    _print_env()
 
     # --- Correctness ---------------------------------------------------------
     print("=" * 60)

@@ -2,21 +2,21 @@
 Causal Conv1d with TLE extract_tile
 ====================================
 
-This tutorial compares a Triton baseline causal_conv1d kernel against a TLE
-optimized version that uses ``tle.extract_tile`` for register-only state reuse.
+Compares a Triton baseline causal_conv1d kernel against a TLE optimized
+version that uses ``tle.extract_tile``.
+
+Both varlen forward and update (step/update) are included.
 
 Usage
 -----
-::
-
-    # correctness check only (default)
+    # correctness only (default)
     python python/tutorials/tle/07-causal-conv1d.py
 
-    # correctness + benchmark tables with speedup
+    # correctness + benchmark table
     python python/tutorials/tle/07-causal-conv1d.py --benchmark
 
-Both ``causal_conv1d_fn`` (varlen forward) and ``causal_conv1d_update``
-(step/update) are included.
+    # specify dtype
+    python python/tutorials/tle/07-causal-conv1d.py --benchmark --dtype float16
 """
 
 # %%
@@ -24,6 +24,8 @@ Both ``causal_conv1d_fn`` (varlen forward) and ``causal_conv1d_update``
 # -----
 
 import argparse
+import subprocess
+import sys
 
 import numpy as np
 import torch
@@ -33,6 +35,19 @@ import triton.experimental.tle.language as tle
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 PAD_SLOT_ID = -1
+
+
+def _print_env():
+    """Print test environment information for reproducibility."""
+    print(f"GPU: {torch.cuda.get_device_name()} | CUDA: {torch.version.cuda} | Triton: {triton.__version__}")
+    print()
+
+
+# Benchmark parameters
+BENCH_WARMUP = 10
+BENCH_REP = 100
+BENCH_RUNS = 5  # number of runs for stddev
+
 
 # %%
 # Kernels (baseline v1)
@@ -1495,8 +1510,8 @@ def run_correctness(dim=1024, total_seqlen=2048, batch=32, width=4, dtype=torch.
                                  has_initial_state, activation="silu")
     out_v2 = causal_conv1d_fn_v2(x.clone(), weight, bias, conv_states.clone(), query_start_loc, cache_indices,
                                  has_initial_state, activation="silu")
-    torch.testing.assert_close(out_v1.float(), out_v2.float(), rtol=5e-2, atol=2e-1)
-    print("[OK] varlen forward correctness passed")
+    torch.testing.assert_close(out_v1.float(), out_v2.float(), rtol=1e-2, atol=1e-2)
+    print(f"  pass  varlen dim={dim} seqlen={total_seqlen} batch={batch} width={width} {dtype}")
 
     # update
     x_u, weight_u, bias_u, conv_state_u, conv_state_indices_u = \
@@ -1506,13 +1521,33 @@ def run_correctness(dim=1024, total_seqlen=2048, batch=32, width=4, dtype=torch.
                                        conv_state_indices=conv_state_indices_u)
     out_u_v2 = causal_conv1d_update_v2(x_u.clone(), conv_state_u.clone(), weight_u, bias_u, activation="silu",
                                        conv_state_indices=conv_state_indices_u)
-    torch.testing.assert_close(out_u_v1.float(), out_u_v2.float(), rtol=5e-2, atol=2e-1)
-    print("[OK] update correctness passed")
+    torch.testing.assert_close(out_u_v1.float(), out_u_v2.float(), rtol=1e-2, atol=1e-2)
+    print(f"  pass  update dim={dim} batch={batch} width={width} {dtype}")
 
 
 # %%
 # Benchmark
 # ---------
+
+
+def _bench_one(fn, warmup=BENCH_WARMUP, rep=BENCH_REP, runs=BENCH_RUNS):
+    """Run do_bench multiple times with quantiles, return stats dict."""
+    p50s, p20s, p80s = [], [], []
+    for _ in range(runs):
+        ms, p80, p20 = triton.testing.do_bench(fn, warmup=warmup, rep=rep, quantiles=[0.5, 0.2, 0.8])
+        p50s.append(ms if isinstance(ms, float) else ms[0])
+        p20s.append(p20 if isinstance(p20, float) else p20[0])
+        p80s.append(p80 if isinstance(p80, float) else p80[0])
+    p50s = np.array(p50s)
+    return {
+        "mean": float(p50s.mean()),
+        "std": float(p50s.std()),
+        "p50": float(np.median(p50s)),
+        "p90": float(np.percentile(p50s, 90)),
+        "min": float(np.min(p20s)),
+        "max": float(np.max(p80s)),
+    }
+
 
 # %%
 # Main
@@ -1531,6 +1566,7 @@ def main(argv=None):
 
     dtype = torch.bfloat16 if "bf" in args.dtype else torch.float16
 
+    _print_env()
     run_correctness(args.dim, args.total_seqlen, args.batch, args.width, dtype)
 
     if args.benchmark:
@@ -1549,33 +1585,53 @@ def main(argv=None):
 def _run_benchmark_varlen(dim, batch, dtype):
     width = 4
     x_vals = [2048, 4096, 8192, 16384]
-    print(f"\n--- Varlen benchmark  (dim={dim}, batch={batch}, width={width}, dtype={dtype}) ---")
-    print(f"{'total_seqlen':>12} | {'Baseline(ms)':>12} {'TLE(ms)':>10} {'Speedup':>8}")
-    print("-" * 52)
+    print(f"\n--- Varlen | dim={dim} batch={batch} width={width} {dtype} | Warmup={BENCH_WARMUP} Rep={BENCH_REP} Runs={BENCH_RUNS} ---")
+    print()
+    print(f"{'seqlen':<10} {'Baseline mean':<14} {'p50':<12} {'p90':<12} {'TLE mean':<14} {'p50':<12} {'p90':<12} {'Speedup':<10} {'correctness':<12}")
+
     for total_seqlen in x_vals:
         x, w, b, cs, qsl, ci, his = _make_varlen_data(dim, total_seqlen, batch, width, dtype)
-        ms_b, _, _ = triton.testing.do_bench(lambda: causal_conv1d_fn_v1(x, w, b, cs, qsl, ci, his, "silu"), warmup=10,
-                                             rep=100, quantiles=[0.5, 0.2, 0.8])
-        ms_t, _, _ = triton.testing.do_bench(lambda: causal_conv1d_fn_v2(x, w, b, cs, qsl, ci, his, "silu"), warmup=10,
-                                             rep=100, quantiles=[0.5, 0.2, 0.8])
-        sp = ms_b / ms_t if ms_t > 0 else 1.0
-        print(f"{total_seqlen:>12} | {ms_b:>12.4f} {ms_t:>10.4f} {sp:>7.2f}x")
+        s_b = _bench_one(lambda: causal_conv1d_fn_v1(x, w, b, cs, qsl, ci, his, "silu"))
+        s_t = _bench_one(lambda: causal_conv1d_fn_v2(x, w, b, cs, qsl, ci, his, "silu"))
+        sp = s_b["p50"] / s_t["p50"] if s_t["p50"] > 0 else 1.0
+        out_v1 = causal_conv1d_fn_v1(x.clone(), w, b, cs.clone(), qsl, ci, his, "silu")
+        out_v2 = causal_conv1d_fn_v2(x.clone(), w, b, cs.clone(), qsl, ci, his, "silu")
+        try:
+            torch.testing.assert_close(out_v1.float(), out_v2.float(), rtol=1e-2, atol=1e-2)
+            chk = "pass"
+        except Exception:
+            chk = "FAIL"
+        sp_str = f"{sp:.2f}x"
+        print(f"{total_seqlen:<10} {s_b['mean']:<14.4f} {s_b['p50']:<12.4f} {s_b['p90']:<12.4f} "
+              f"{s_t['mean']:<14.4f} {s_t['p50']:<12.4f} {s_t['p90']:<12.4f} {sp_str:<10} {chk}")
 
 
 def _run_benchmark_update(batch, dtype):
     width = 4
     x_vals = [1024, 2048, 4096, 8192]
-    print(f"\n--- Update benchmark  (batch={batch}, width={width}, dtype={dtype}) ---")
-    print(f"{'dim':>6} | {'Baseline(ms)':>12} {'TLE(ms)':>10} {'Speedup':>8}")
-    print("-" * 46)
+    print(f"\n--- Update | batch={batch} dim=[1024,2048,4096,8192] width={width} {dtype} | Warmup={BENCH_WARMUP} Rep={BENCH_REP} Runs={BENCH_RUNS} ---")
+    print()
+    print(f"{'dim':<8} {'Baseline mean':<14} {'p50':<12} {'p90':<12} {'TLE mean':<14} {'p50':<12} {'p90':<12} {'Speedup':<10} {'correctness':<12}")
+
     for dim in x_vals:
         x, w, b, cs, ci = _make_update_data(dim, batch, width, dtype)
-        ms_b, _, _ = triton.testing.do_bench(lambda: causal_conv1d_update_v1(x, cs, w, b, "silu", ci), warmup=10,
-                                             rep=100, quantiles=[0.5, 0.2, 0.8])
-        ms_t, _, _ = triton.testing.do_bench(lambda: causal_conv1d_update_v2(x, cs, w, b, "silu", ci), warmup=10,
-                                             rep=100, quantiles=[0.5, 0.2, 0.8])
-        sp = ms_b / ms_t if ms_t > 0 else 1.0
-        print(f"{dim:>6} | {ms_b:>12.4f} {ms_t:>10.4f} {sp:>7.2f}x")
+        s_b = _bench_one(lambda: causal_conv1d_update_v1(x, cs, w, b, "silu", ci))
+        s_t = _bench_one(lambda: causal_conv1d_update_v2(x, cs, w, b, "silu", ci))
+        sp = s_b["p50"] / s_t["p50"] if s_t["p50"] > 0 else 1.0
+        # re-generate data for correctness check (benchmark calls modified x/cs in place)
+        x2, _, _, cs2, _ = _make_update_data(dim, batch, width, dtype)
+        cs_v1 = cs2.clone()
+        cs_v2 = cs2.clone()
+        out_v1 = causal_conv1d_update_v1(x2.clone(), cs_v1, w, b, "silu", ci)
+        out_v2 = causal_conv1d_update_v2(x2.clone(), cs_v2, w, b, "silu", ci)
+        try:
+            torch.testing.assert_close(out_v1.float(), out_v2.float(), rtol=1e-2, atol=1e-2)
+            chk = "pass"
+        except Exception:
+            chk = "FAIL"
+        sp_str = f"{sp:.2f}x"
+        print(f"{dim:<8} {s_b['mean']:<14.4f} {s_b['p50']:<12.4f} {s_b['p90']:<12.4f} "
+              f"{s_t['mean']:<14.4f} {s_t['p50']:<12.4f} {s_t['p90']:<12.4f} {sp_str:<10} {chk}")
 
 
 if __name__ == "__main__":
