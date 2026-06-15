@@ -11,11 +11,13 @@ import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 try:
-    from ..kernels import add_rms_inv_scale, attention, embedding, gate_up_silu, head_rmsnorm_rope
+    from ..kernels import add_rms_inv_scale, attention, attention_decode, attention_ws, embedding, gate_up_silu
+    from ..kernels import head_rmsnorm_rope
     from ..kernels import linear, linear_add, qkv_linear
     from ..kernels import rms_inv_scale, store_cache
 except ImportError:  # pragma: no cover - supports direct script execution from mega/
-    from kernels import add_rms_inv_scale, attention, embedding, gate_up_silu, head_rmsnorm_rope
+    from kernels import add_rms_inv_scale, attention, attention_decode, attention_ws, embedding, gate_up_silu
+    from kernels import head_rmsnorm_rope
     from kernels import linear, linear_add, qkv_linear
     from kernels import rms_inv_scale, store_cache
 
@@ -65,15 +67,19 @@ class Qwen3TLEEngine:
         device: torch.device,
         dtype: torch.dtype,
         max_seq_len: int,
+        attention_backend: str = "base",
     ) -> None:
         if dtype is not torch.bfloat16:
             raise ValueError("Qwen3TLEEngine currently supports bf16 only")
+        if attention_backend not in ("base", "ws"):
+            raise ValueError(f"attention_backend must be 'base' or 'ws', got {attention_backend!r}")
         self.config = config
         self.weights = weights
         self.tokenizer = tokenizer
         self.device = device
         self.dtype = dtype
         self.max_seq_len = max_seq_len
+        self.attention_backend = attention_backend
         self.cos, self.sin = self._build_rotary_cache(max_seq_len)
         self.cache: KVCache | None = None
 
@@ -87,6 +93,7 @@ class Qwen3TLEEngine:
         max_seq_len: int | None = None,
         trust_remote_code: bool = False,
         local_files_only: bool = False,
+        attention_backend: str = "base",
     ) -> "Qwen3TLEEngine":
         torch_dtype = _parse_dtype(dtype)
         torch_device = torch.device(device)
@@ -116,6 +123,7 @@ class Qwen3TLEEngine:
             device=torch_device,
             dtype=torch_dtype,
             max_seq_len=max_len,
+            attention_backend=attention_backend,
         )
 
     def _build_rotary_cache(self, max_seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -173,6 +181,25 @@ class Qwen3TLEEngine:
         return gate_up_silu(x.contiguous(), weights.weight, weights.bias, intermediate_size=self.config.intermediate_size,
                             input_scale=input_scale)
 
+    def _attention(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        q_len: int,
+        start_pos: int,
+        kv_len: int,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        if self.attention_backend == "ws" and q_len == 1:
+            fn = attention_decode
+        elif self.attention_backend == "ws":
+            fn = attention_ws
+        else:
+            fn = attention
+        return fn(q, k_cache, v_cache, q_len=q_len, start_pos=start_pos, kv_len=kv_len, sm_scale=sm_scale)
+
     def _run_layer(
         self,
         x: torch.Tensor,
@@ -202,7 +229,7 @@ class Qwen3TLEEngine:
         store_cache(k, self.cache.k[layer_idx], q_len=q_len, start_pos=start_pos)
         store_cache(v, self.cache.v[layer_idx], q_len=q_len, start_pos=start_pos)
 
-        attn = attention(
+        attn = self._attention(
             q,
             self.cache.k[layer_idx],
             self.cache.v[layer_idx],

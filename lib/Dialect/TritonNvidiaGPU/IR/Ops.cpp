@@ -302,10 +302,9 @@ LogicalResult ArriveBarrierOp::verify() {
   if (getCount() < 1)
     return emitOpError("count must be greater than or equal to 1");
 #ifdef __TLE__
-  if (getParticipantArrive() && !getReleaseFence())
+  bool isConsumerRelease = !getReleasedFields().empty();
+  if (getParticipantArrive() && !isConsumerRelease && !getReleaseFence())
     return emitOpError("participant_arrive requires release_fence");
-  if (getParticipantArrive() && !getReleasedFields().empty())
-    return emitOpError("participant_arrive does not support released fields");
 #endif
   return success();
 }

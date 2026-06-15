@@ -473,6 +473,26 @@ static bool hasPositiveConstantStep(scf::ForOp forOp) {
   return step && *step > 0;
 }
 
+static Value createConstLike(OpBuilder &builder, Location loc, Type type,
+                             int64_t value) {
+  return arith::ConstantOp::create(builder, loc,
+                                   builder.getIntegerAttr(type, value));
+}
+
+static Value computePositiveTripCount(OpBuilder &builder, Location loc,
+                                      Value lowerBound, Value upperBound,
+                                      Value step) {
+  Value diff = arith::SubIOp::create(builder, loc, upperBound, lowerBound);
+  return arith::CeilDivSIOp::create(builder, loc, diff, step);
+}
+
+static Value materializeLoopIvFromIter(OpBuilder &builder, Location loc,
+                                       Value lowerBound, Value step,
+                                       Value iter) {
+  Value offset = arith::MulIOp::create(builder, loc, iter, step);
+  return arith::AddIOp::create(builder, loc, lowerBound, offset);
+}
+
 static void stripPipelineAttrs(Operation *op) {
   op->removeAttr(tt::kLoopStageAttrName);
   op->removeAttr(tt::kLoopClusterAttrName);
@@ -884,10 +904,24 @@ static Operation *materializeExplicitOneStepLead(OpBuilder &builder,
       steadyInitArgs.append((*nextInit).tokens);
       steadyInitArgs.push_back(one);
 
-      Value upperMinusStep = arith::SubIOp::create(
-          then2Builder, forOp.getLoc(), forOp.getUpperBound(), forOp.getStep());
-      Value steadyUpper = arith::SubIOp::create(
-          then2Builder, forOp.getLoc(), upperMinusStep, forOp.getStep());
+      // scf.for upper bounds do not need to be step-aligned. Compute the last
+      // legal IVs from the trip count instead of subtracting from upperBound.
+      Type ivType = forOp.getLowerBound().getType();
+      Value tripCount = computePositiveTripCount(
+          then2Builder, forOp.getLoc(), forOp.getLowerBound(),
+          forOp.getUpperBound(), forOp.getStep());
+      Value penultimateIter = arith::SubIOp::create(
+          then2Builder, forOp.getLoc(), tripCount,
+          createConstLike(then2Builder, forOp.getLoc(), ivType, 2));
+      Value lastIter = arith::SubIOp::create(
+          then2Builder, forOp.getLoc(), tripCount,
+          createConstLike(then2Builder, forOp.getLoc(), ivType, 1));
+      Value steadyUpper = materializeLoopIvFromIter(
+          then2Builder, forOp.getLoc(), forOp.getLowerBound(), forOp.getStep(),
+          penultimateIter);
+      Value lastIv = materializeLoopIvFromIter(
+          then2Builder, forOp.getLoc(), forOp.getLowerBound(), forOp.getStep(),
+          lastIter);
       auto steadyFor = then2Builder.create<scf::ForOp>(
           forOp.getLoc(), forOp.getLowerBound(), steadyUpper, forOp.getStep(),
           steadyInitArgs);
@@ -978,7 +1012,7 @@ static Operation *materializeExplicitOneStepLead(OpBuilder &builder,
         return eraseAndFail();
       FailureOr<SmallVector<Value>> nextEpilogueResults = materializeConsumeAt(
           then2Builder, forOp, plan, baseAllocs, *curEpilogueResults,
-          nextCarriedFinal, nextTokensFinal, nextSlotFinal, upperMinusStep,
+          nextCarriedFinal, nextTokensFinal, nextSlotFinal, lastIv,
           /*waitNum=*/0);
       if (failed(nextEpilogueResults))
         return eraseAndFail();

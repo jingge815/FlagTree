@@ -171,6 +171,7 @@ class TestBufferedTensor:
         def __init__(self):
             self.memdesc_type_args = None
             self.memdesc_index_args = None
+            self.memdesc_subslice_args = None
             self.swizzled_encoding_args = None
             self.pipe_create_args = None
             self.pipe_ops = []
@@ -199,6 +200,10 @@ class TestBufferedTensor:
         def create_memdesc_index(self, result_ty, src, index):
             self.memdesc_index_args = (result_ty, src, index)
             return "slot_handle"
+
+        def create_memdesc_subslice(self, result_ty, src, offsets):
+            self.memdesc_subslice_args = (result_ty, src, list(offsets))
+            return "subslice_handle"
 
         def create_pipe_create(self, fields, capacity, scope, pipe_name, field_names, reader_names, one_shot):
             self.pipe_create_args = (list(fields), capacity, scope, pipe_name, list(field_names), list(reader_names),
@@ -262,6 +267,7 @@ class TestBufferedTensor:
         assert hasattr(tle.gpu.buffered_tensor, '_flatten_ir')
         assert hasattr(tle.gpu.buffered_tensor, 'make_permute')
         assert hasattr(tle.gpu.buffered_tensor, 'slot')
+        assert hasattr(tle.gpu.buffered_tensor, 'subslice')
 
     def test_buffered_tensor_slot_indexes_leading_dimension(self):
         """slot(stage) returns a typed view with the leading stage dimension removed."""
@@ -281,6 +287,38 @@ class TestBufferedTensor:
             "base",
             "stage_1",
         )
+
+    def test_buffered_tensor_subslice_creates_typed_view(self):
+        """subslice(offsets, shape) returns a static memdesc_subslice view."""
+        buffer, semantic = self._make_buffer([4, 16, 32])
+
+        sub = buffer.subslice([1, 0, 8], [2, 16, 16], _semantic=semantic)
+
+        assert isinstance(sub, tle.gpu.buffered_tensor)
+        assert sub.handle == "subslice_handle"
+        assert sub.shape == [2, 16, 16]
+        assert sub.dtype == tl.float16
+        assert sub.type.storage is tle.gpu.smem
+        assert semantic.builder.memdesc_type_args == ([2, 16, 16], "fp16", "fake_layout", "smem", [4, 16, 32])
+        assert semantic.builder.memdesc_subslice_args == (
+            ("memdesc", (2, 16, 16), "fp16", "fake_layout", "smem", (4, 16, 32)),
+            "base",
+            [1, 0, 8],
+        )
+
+    def test_buffered_tensor_subslice_rejects_dynamic_offsets(self):
+        """subslice(offsets, shape) is a static memdesc view."""
+        buffer, semantic = self._make_buffer([4, 16, 32])
+
+        with pytest.raises(ValueError, match="compile-time int"):
+            buffer.subslice([0, semantic.to_tensor(0), 0], [1, 16, 16], _semantic=semantic)
+
+    def test_buffered_tensor_subslice_rejects_out_of_bounds(self):
+        """subslice validates static ranges against the source shape."""
+        buffer, semantic = self._make_buffer([4, 16, 32])
+
+        with pytest.raises(ValueError, match="invalid range"):
+            buffer.subslice([0, 0, 24], [1, 16, 16], _semantic=semantic)
 
     def test_buffered_tensor_slot_rejects_rank_zero_buffer(self):
         """slot(stage) only indexes a real leading stage dimension."""

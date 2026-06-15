@@ -68,3 +68,35 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     tt.return %17#0, %17#2 : tensor<128x64xf32, #mma>, tensor<128x16xf32, #mma1>
   }
 }
+
+// -----
+
+#mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 16}>
+#shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+// CHECK-LABEL: loop_carried_elementwise_acc_requires_wait_before_yield
+  tt.func @loop_carried_elementwise_acc_requires_wait_before_yield(
+      %a: !ttg.memdesc<64x64xbf16, #shared, #smem>,
+      %b: !ttg.memdesc<64x64xbf16, #shared1, #smem, mutable>,
+      %out: tensor<64x64x!tt.ptr<f32>, #mma>) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %c8 = arith.constant 8 : index
+    %one = arith.constant dense<1.000000e+00> : tensor<64x64xf32, #mma>
+    %zero = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
+    %res = scf.for %iv = %c0 to %c8 step %c1 iter_args(%acc = %zero) -> (tensor<64x64xf32, #mma>) {
+      %scaled = arith.mulf %acc, %one : tensor<64x64xf32, #mma>
+      // CHECK:          %[[DOT:.+]] = ttng.warp_group_dot
+      %dot = ttng.warp_group_dot %a, %b, %scaled {inputPrecision = 0 : i32} : !ttg.memdesc<64x64xbf16, #shared, #smem> * !ttg.memdesc<64x64xbf16, #shared1, #smem, mutable> -> tensor<64x64xf32, #mma>
+      // CHECK-NEXT:     ttng.warp_group_dot_commit
+      // CHECK-NEXT:     %[[WAIT:.+]]:{{.*}} = ttng.warp_group_dot_wait %[[DOT]]
+      // CHECK-SAME:       {pendings = 0 : i32}
+      // CHECK-NEXT:     scf.yield %[[WAIT]]#0
+      scf.yield %dot : tensor<64x64xf32, #mma>
+    }
+    tt.store %out, %res : tensor<64x64x!tt.ptr<f32>, #mma>
+    tt.return
+  }
+}

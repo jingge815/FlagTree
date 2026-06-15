@@ -21,7 +21,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 1>}
   // CHECK: ttg.local_load {{.*}} {async_task_id = array<i32: 1>}
   // CHECK: arith.cmpi ne
-  // CHECK: ttng.arrive_barrier {{.*}}, 128 released[{{.*}}] ({{.*}}) {async_task_id = array<i32: 1>}
+  // CHECK: ttng.arrive_barrier {{.*}}, 128 released[{{.*}}] ({{.*}})
+  // CHECK-SAME: async_task_id = array<i32: 1>
+  // CHECK-SAME: participant_arrive = true
   tt.func @pipe_to_mbarrier(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
     %c0 = arith.constant 0 : i32
     %c1 = arith.constant 1 : i32
@@ -41,7 +43,9 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
   // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 0>}
   // CHECK: ttng.arrive_barrier {{.*}}, 128 {async_task_id = array<i32: 0>, release_fence = true}
   // CHECK: ttng.wait_barrier {{.*}} {async_task_id = array<i32: 0>}
-  // CHECK: ttng.arrive_barrier {{.*}}, 128 released[{{.*}}] ({{.*}}) {async_task_id = array<i32: 0>}
+  // CHECK: ttng.arrive_barrier {{.*}}, 128 released[{{.*}}] ({{.*}})
+  // CHECK-SAME: async_task_id = array<i32: 0>
+  // CHECK-SAME: participant_arrive = true
   tt.func @pipe_same_task_to_mbarrier(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
     %c0 = arith.constant 0 : i32
     %false = arith.constant false
@@ -52,6 +56,17 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     scf.if %closed {
     }
     tle.pipe.reader_release %a[%c0] {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "same_task", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tt.return
+  }
+
+  // CHECK-LABEL: @generic_consumer_release_keeps_elected_arrive
+  // CHECK: ttng.arrive_barrier {{.*}}, 128 released[{{.*}}] ({{.*}})
+  // CHECK-NOT: participant_arrive = true
+  // CHECK: tt.return
+  tt.func @generic_consumer_release_keeps_elected_arrive(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %token = nvws.create_token {loadType = 3 : i32, numBuffers = 2 : i32} : tensor<2x!nvws.token>
+    nvws.consumer_release %token, %c0, %a {async_task_id = array<i32: 1>, release_count = 128 : i32} : tensor<2x!nvws.token>, i32, !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
     tt.return
   }
 

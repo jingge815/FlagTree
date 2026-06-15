@@ -38,6 +38,11 @@ namespace mlir {
 #define DBGS() (llvm::dbgs() << "[" DEBUG_TYPE "]: ")
 #define LDBG(X) LLVM_DEBUG(DBGS() << X << "\n")
 
+#ifdef __TLE__
+constexpr llvm::StringLiteral
+    kTleParticipantConsumerReleaseAttr("tle.participant_consumer_release");
+#endif
+
 // Lower to use GetCanonicalWarpIdOp.
 // In Hopper, each task is a warpgroup consisting of 4 warps.
 static const int WARPS_PER_TASK = 4;
@@ -227,6 +232,13 @@ void processConsumerReleaseOp(OpBuilder &builder, ttnvws::ConsumerReleaseOp op,
   SmallVector<Value> releasedFields(op.getReleasedFields());
   auto arriveOp = ttng::ArriveBarrierOp::create(
       builder, loc, bufferEmpty, releaseCnt, op.getIdx(), releasedFields);
+  // TLE pipe lowering marks releases whose reader task and released payload
+  // contract has been established. In that case each reader lane can arrive
+  // once after its own reads. Generic NVWS consumer releases keep the
+  // conservative elected arrive path.
+  if (op->hasAttr(kTleParticipantConsumerReleaseAttr) &&
+      !releasedFields.empty())
+    arriveOp.setParticipantArrive(true);
 #else
   auto arriveOp =
       ttng::ArriveBarrierOp::create(builder, loc, bufferEmpty, releaseCnt);

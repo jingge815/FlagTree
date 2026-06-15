@@ -317,6 +317,42 @@ class buffered_tensor(tl.base_value):
         return buffered_tensor(slot_handle, self.dtype, slot_shape, self.type.storage, slot_layout, _semantic,
                                alloc_shape=slot_ty.alloc_shape)
 
+    @tl.builtin
+    def subslice(self, offsets, shape, _semantic=None):
+        offsets = tl._unwrap_if_constexpr(offsets)
+        shape = tl._unwrap_if_constexpr(shape)
+        if isinstance(offsets, tl.tuple):
+            offsets = tuple(offsets.values)
+        if isinstance(shape, tl.tuple):
+            shape = tuple(shape.values)
+        if not isinstance(offsets, (tuple, list)):
+            raise ValueError(f"buffered_tensor.subslice offsets must be a tuple/list, got {type(offsets).__name__}")
+        if not isinstance(shape, (tuple, list)):
+            raise ValueError(f"buffered_tensor.subslice shape must be a tuple/list, got {type(shape).__name__}")
+        if len(offsets) != len(self.shape) or len(shape) != len(self.shape):
+            raise ValueError(
+                "buffered_tensor.subslice offsets and shape must have the same rank as the source buffer")
+        if self.type.storage is not smem:
+            raise ValueError(f"buffered_tensor.subslice currently supports only smem storage, got {self.type.storage}")
+
+        offsets = [tl._unwrap_if_constexpr(offset) for offset in offsets]
+        sub_shape = [tl._unwrap_if_constexpr(dim) for dim in shape]
+        for axis, (offset, dim, full_dim) in enumerate(zip(offsets, sub_shape, self.shape)):
+            if not isinstance(offset, int):
+                raise ValueError(f"buffered_tensor.subslice offset for axis {axis} must be a compile-time int")
+            if not isinstance(dim, int):
+                raise ValueError(f"buffered_tensor.subslice shape for axis {axis} must be a compile-time int")
+            if offset < 0 or dim <= 0 or offset + dim > int(full_dim):
+                raise ValueError(
+                    f"buffered_tensor.subslice axis {axis} has invalid range [{offset}, {offset + dim}) for dim {full_dim}"
+                )
+
+        sub_ty = buffered_tensor_type(self.dtype, sub_shape, self.type.storage, self.type.layout, _semantic,
+                                      alloc_shape=self.type.alloc_shape)
+        sub_handle = _semantic.builder.create_memdesc_subslice(sub_ty.to_ir(_semantic.builder), self.handle, offsets)
+        return buffered_tensor(sub_handle, self.dtype, sub_shape, self.type.storage, self.type.layout, _semantic,
+                               alloc_shape=sub_ty.alloc_shape)
+
     def make_permute(self, handle, dims):
         permuted_layout = self.type.layout.make_permute(dims)
         return buffered_tensor(

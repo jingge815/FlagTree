@@ -258,10 +258,12 @@ def TTNG_ArriveBarrierOp : TTNG_Op<"arrive_barrier", [
     release fence before the single elected thread arrives at the mbarrier.
     When `participant_arrive` is set, `count` names the number of prefix
     participant threads in the current partition. Each participant performs its
-    own release fence and one-unit arrive; non-participants do neither. This is
-    used when a compiler pass has proven the exact writer lanes for a shared
-    memory payload, so ordinary shared stores can be published without a full
-    partition rendezvous.
+    own one-unit arrive; non-participants do not arrive. With `release_fence`,
+    each participant also performs its own release fence. This is used when a
+    compiler pass has proven the exact writer lanes for a shared memory payload,
+    so ordinary shared stores can be published without a full partition
+    rendezvous, and for consumer release barriers where all reader lanes must
+    individually finish before the buffer is made empty again.
 
     Example:
 

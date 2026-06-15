@@ -91,4 +91,19 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     ttng.arrive_barrier %barrier, 64 {participant_arrive = true, release_fence = true} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>
     tt.return
   }
+
+  // CHECK-LABEL: llvm.func @participant_release_after_local_read_skips_cta_barrier
+  // CHECK-NOT: nvvm.barrier0
+  // CHECK: "mbarrier.arrive.shared::cta.b64 _, [$1];", "b,r"
+  // CHECK: llvm.return
+  tt.func @participant_release_after_local_read_skips_cta_barrier(%barrier: !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %row0 = arith.constant dense<0> : tensor<64xi32, #blocked1>
+    %offs = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32, #blocked1>
+    %smem = ttg.local_alloc : () -> !ttg.memdesc<2x64xi8, #shared2, #smem, mutable>
+    %ptr0 = "tle.local_pointers"(%smem, %row0, %offs) : (!ttg.memdesc<2x64xi8, #shared2, #smem, mutable>, tensor<64xi32, #blocked1>, tensor<64xi32, #blocked1>) -> tensor<64x!tt.ptr<i8, 3>, #blocked1>
+    %v0 = tt.load %ptr0 : tensor<64x!tt.ptr<i8, 3>, #blocked1>
+    ttng.arrive_barrier %barrier, 128 released[%c0] (%smem) {participant_arrive = true} : !ttg.memdesc<1xi64, #barrier_shared, #smem, mutable>, i32, !ttg.memdesc<2x64xi8, #shared2, #smem, mutable>
+    tt.return
+  }
 }

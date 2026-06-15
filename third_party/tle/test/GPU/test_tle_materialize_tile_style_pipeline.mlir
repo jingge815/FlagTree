@@ -297,7 +297,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     tt.return %out : tensor<64x64xf32, #mma>
   }
 
-  // CHECK-LABEL: tt.func @dynamic_loop_with_direct_async_tile_family
+  // CHECK-LABEL: tt.func @dynamic_loop_with_non_unit_step_direct_async_tile_family
   // CHECK: scf.if
   // CHECK: ttg.local_alloc : () -> !ttg.memdesc<2x64x512xbf16
   // CHECK: ttg.memdesc_index
@@ -305,21 +305,25 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   // CHECK: ttg.async_copy_global_to_local
   // CHECK: ttg.async_commit_group
   // CHECK: scf.if
-  // CHECK: arith.subi %arg0
-  // CHECK: scf.for {{.*}} iter_args({{.*}}!ttg.async.token, {{.*}}i32, {{.*}}!ttg.async.token, {{.*}}i32)
+  // CHECK: %[[DIFF:.*]] = arith.subi %arg0, {{.*}} : i32
+  // CHECK: %[[TRIP_COUNT:.*]] = arith.ceildivsi %[[DIFF]], {{.*}} : i32
+  // CHECK: %[[PENULTIMATE_ITER:.*]] = arith.subi %[[TRIP_COUNT]], {{.*}} : i32
+  // CHECK: %[[PENULTIMATE_OFFSET:.*]] = arith.muli %[[PENULTIMATE_ITER]], {{.*}} : i32
+  // CHECK: %[[PENULTIMATE_IV:.*]] = arith.addi {{.*}}, %[[PENULTIMATE_OFFSET]] : i32
+  // CHECK: scf.for {{.*}} to %[[PENULTIMATE_IV]] step {{.*}} iter_args({{.*}}!ttg.async.token, {{.*}}i32, {{.*}}!ttg.async.token, {{.*}}i32)
   // CHECK: ttg.async_wait {{.*}} {num = 1 : i32}
   // CHECK: ttng.warp_group_dot
   // CHECK: ttg.async_copy_global_to_local
   // CHECK: ttg.async_commit_group
   // CHECK: } {tle.async_tile_producer_count = 1 : i32, tle.explicit_tile_style_pipeline = 1 : i32, tle.tile_style_pipeline = 1 : i32}
   // CHECK: ttg.async_wait {{.*}} {num = 0 : i32}
-  tt.func @dynamic_loop_with_direct_async_tile_family(
+  tt.func @dynamic_loop_with_non_unit_step_direct_async_tile_family(
       %ub: i32,
       %base: !tt.ptr<bf16> {tt.divisibility = 16 : i32},
       %a: !ttg.memdesc<64x512xbf16, #shared, #smem, mutable>,
       %dst: !ttg.memdesc<64x512xbf16, #shared, #smem, mutable>) -> tensor<64x64xf32, #mma> {
     %c0_i32 = arith.constant 0 : i32
-    %c1_i32 = arith.constant 1 : i32
+    %c128_i32 = arith.constant 128 : i32
     %other = arith.constant dense<0.000000e+00> : tensor<64x128xbf16, #blocked>
     %mask = arith.constant dense<true> : tensor<64x128xi1, #blocked>
     %acc0 = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
@@ -333,10 +337,12 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %k_b = tt.broadcast %k : tensor<1x128xi32, #blocked> -> tensor<64x128xi32, #blocked>
     %offs = arith.addi %m_off_b, %k_b : tensor<64x128xi32, #blocked>
     %ptr = tt.splat %base : !tt.ptr<bf16> -> tensor<64x128x!tt.ptr<bf16>, #blocked>
-    %ptrs = tt.addptr %ptr, %offs : tensor<64x128x!tt.ptr<bf16>, #blocked>, tensor<64x128xi32, #blocked>
-    %out = scf.for %i = %c0_i32 to %ub step %c1_i32 iter_args(%acc = %acc0) -> (tensor<64x64xf32, #mma>) : i32 {
+    %out = scf.for %i = %c0_i32 to %ub step %c128_i32 iter_args(%acc = %acc0) -> (tensor<64x64xf32, #mma>) : i32 {
+      %iv = tt.splat %i : i32 -> tensor<64x128xi32, #blocked>
+      %offs_i = arith.addi %offs, %iv : tensor<64x128xi32, #blocked>
+      %ptrs_i = tt.addptr %ptr, %offs_i : tensor<64x128x!tt.ptr<bf16>, #blocked>, tensor<64x128xi32, #blocked>
       %sub = ttg.memdesc_subslice %dst[0, 0] {loop.cluster = 0 : i32, loop.stage = 0 : i32} : !ttg.memdesc<64x512xbf16, #shared, #smem, mutable> -> !ttg.memdesc<64x128xbf16, #shared, #smem, mutable, 64x512>
-      %tok = ttg.async_copy_global_to_local %ptrs, %sub mask %mask other %other {loop.cluster = 0 : i32, loop.stage = 0 : i32, tle.local_ptr_async_store} : tensor<64x128x!tt.ptr<bf16>, #blocked> -> <64x128xbf16, #shared, #smem, mutable, 64x512>
+      %tok = ttg.async_copy_global_to_local %ptrs_i, %sub mask %mask other %other {loop.cluster = 0 : i32, loop.stage = 0 : i32, tle.local_ptr_async_store} : tensor<64x128x!tt.ptr<bf16>, #blocked> -> <64x128xbf16, #shared, #smem, mutable, 64x512>
       %commit = ttg.async_commit_group tokens %tok {loop.cluster = 0 : i32, loop.stage = 0 : i32}
       %wait = ttg.async_wait %commit {loop.cluster = 0 : i32, loop.stage = 0 : i32, num = 0 : i32}
       %view = tle.memdesc_wgmma_view %dst {loop.cluster = 0 : i32, loop.stage = 1 : i32, order = array<i32: 1, 0>} : !ttg.memdesc<64x512xbf16, #shared, #smem, mutable> -> !ttg.memdesc<512x64xbf16, #shared1, #smem, mutable>

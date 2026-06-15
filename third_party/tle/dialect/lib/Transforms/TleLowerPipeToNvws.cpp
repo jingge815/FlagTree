@@ -35,6 +35,8 @@ constexpr llvm::StringLiteral
     kTleInferArriveCountAttr("tle.infer_arrive_count");
 constexpr llvm::StringLiteral
     kTleInferFullCountOffsetAttr("tle.infer_full_count_offset");
+constexpr llvm::StringLiteral
+    kTleParticipantConsumerReleaseAttr("tle.participant_consumer_release");
 
 enum class PipeCommitTransport {
   LocalStore,
@@ -1581,6 +1583,9 @@ public:
       auto nvwsOp = ttnvws::ConsumerReleaseOp::create(
           builder, loc, token, release.getStage(), releasedFields,
           releaseCountAttr);
+      if (!releasedFields.empty())
+        nvwsOp->setAttr(kTleParticipantConsumerReleaseAttr,
+                        builder.getUnitAttr());
       setRoleTaskId(op, nvwsOp.getOperation(), *taskId);
       release.erase();
     }

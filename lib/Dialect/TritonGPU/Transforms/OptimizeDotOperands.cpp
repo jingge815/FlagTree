@@ -192,6 +192,12 @@ static bool isLegalWGMMAOperandDescriptorLayout(MemDescType type,
     return nvmma.getTransposed();
   return false;
 }
+
+static bool isSafeWGMMAOperandReuseUser(Operation *user) {
+  return isa<triton::nvidia_gpu::WarpGroupDotOp,
+             triton::nvidia_gpu::WarpGroupDotWaitOp,
+             triton::tle::WGMMASharedOperandFenceOp>(user);
+}
 #endif
 
 // Given
@@ -510,10 +516,7 @@ public:
             allocTy.getEncoding()))
       return failure();
 
-    if (!llvm::all_of(allocOp->getUsers(), [](Operation *user) {
-          return isa<triton::nvidia_gpu::WarpGroupDotOp,
-                     triton::nvidia_gpu::WarpGroupDotWaitOp>(user);
-        }))
+    if (!llvm::all_of(allocOp->getUsers(), isSafeWGMMAOperandReuseUser))
       return failure();
 
     Attribute viewEncoding;
@@ -830,10 +833,7 @@ public:
     if (!isLegalWGMMAOperandDescriptorLayout(srcMemDescTy, /*operandIdx=*/1))
       return failure();
 
-    if (!llvm::all_of(allocOp->getUsers(), [](Operation *user) {
-          return isa<triton::nvidia_gpu::WarpGroupDotOp,
-                     triton::nvidia_gpu::WarpGroupDotWaitOp>(user);
-        }))
+    if (!llvm::all_of(allocOp->getUsers(), isSafeWGMMAOperandReuseUser))
       return failure();
 
     mlir::triton::replaceUsesAndPropagateType(rewriter, allocOp, srcMemDesc);

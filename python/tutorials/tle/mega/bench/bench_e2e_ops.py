@@ -18,7 +18,8 @@ MEGA_ROOT = Path(__file__).resolve().parents[1]
 if str(MEGA_ROOT) not in sys.path:
     sys.path.insert(0, str(MEGA_ROOT))
 
-from kernels import add_rms_inv_scale, attention, embedding, gate_up_silu, head_rmsnorm_rope  # noqa: E402
+from kernels import add_rms_inv_scale, attention, attention_decode, attention_ws, embedding, gate_up_silu  # noqa: E402
+from kernels import head_rmsnorm_rope  # noqa: E402
 from kernels import linear, linear_add, qkv_linear  # noqa: E402
 from kernels import rms_inv_scale, store_cache  # noqa: E402
 from models import Qwen3TLEEngine  # noqa: E402
@@ -116,6 +117,33 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
             ),
         )
 
+    def _attention_timed(
+        self,
+        layer: int,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        *,
+        q_len: int,
+        start_pos: int,
+        kv_len: int,
+        sm_scale: float,
+    ):
+        if self.attention_backend == "ws" and q_len == 1:
+            fn = attention_decode
+            op = "attention.decode"
+        elif self.attention_backend == "ws":
+            fn = attention_ws
+            op = "attention.ws"
+        else:
+            fn = attention
+            op = "attention"
+        return self.timer.record(
+            op,
+            layer,
+            lambda: fn(q, k_cache, v_cache, q_len=q_len, start_pos=start_pos, kv_len=kv_len, sm_scale=sm_scale),
+        )
+
     def _run_layer(
         self,
         x: torch.Tensor,
@@ -160,11 +188,15 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
         self.timer.record("store_cache.v", layer_idx,
                           lambda: store_cache(v, self.cache.v[layer_idx], q_len=q_len, start_pos=start_pos))
 
-        attn = self.timer.record(
-            "attention",
+        attn = self._attention_timed(
             layer_idx,
-            lambda: attention(q, self.cache.k[layer_idx], self.cache.v[layer_idx], q_len=q_len, start_pos=start_pos,
-                              kv_len=start_pos + q_len, sm_scale=1.0 / math.sqrt(self.config.head_dim)),
+            q,
+            self.cache.k[layer_idx],
+            self.cache.v[layer_idx],
+            q_len=q_len,
+            start_pos=start_pos,
+            kv_len=start_pos + q_len,
+            sm_scale=1.0 / math.sqrt(self.config.head_dim),
         )
         attn_flat = attn.reshape(tokens, q_dim).contiguous()
         attn_out = self._linear_timed("linear.o_proj", layer_idx, attn_flat, layer.o_proj)
@@ -225,6 +257,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", default="build/mega/qwen3-32b")
+    parser.add_argument("--attention-backend", choices=("base", "ws"), default="base")
     return parser
 
 
@@ -356,6 +389,7 @@ def _write_report(path: Path, summary: dict) -> None:
         "",
         f"- Model: `{summary['model_path']}`",
         f"- Output dir: `{summary['output_dir']}`",
+        f"- Attention backend: `{summary['attention_backend']}`",
         f"- Warmup: `{summary['warmup']}`",
         f"- Iters: `{summary['iters']}`",
         "",
@@ -367,6 +401,13 @@ def _write_report(path: Path, summary: dict) -> None:
         "projection consumes the unnormalized hidden state with norm weights pre-folded into the projection "
         "weights. The scale reductions use the global TLE path because host descriptor TMA measured slower "
         "for these row-wise reductions on Qwen3-32B/H800 shapes.",
+        "",
+        "Attention backend `ws` uses the dot-based TLE pipe prefill kernel for `q_len > 1`. Decode uses the "
+        "TileOps-style split/no-split GQA algorithm. On sm90+ tensors that satisfy host descriptor alignment, "
+        "decode stages K/V tiles through a `tle.pipe` producer that issues explicit `tle.gpu.copy` TMA operations "
+        "from host `TensorDescriptor` objects, while a warp-specialized consumer runs QK/PV. Q and output/partial "
+        "output tiles also use host descriptor TMA. K/V descriptors use logical `[batch, kv_head, seq, dim]` "
+        "shape/stride so GQA cache loads do not flatten across adjacent KV heads.",
         "",
         "## End-to-End Latency",
         "",
@@ -437,6 +478,7 @@ def main() -> None:
         max_seq_len=args.max_seq_len or max(prompt + decode for prompt, decode in scenarios),
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
+        attention_backend=args.attention_backend,
     )
     engine.timer = timer
 
@@ -465,6 +507,7 @@ def main() -> None:
             "scenario": scenario_name,
             "model_path": args.model_path,
             "backend": "tle",
+            "attention_backend": args.attention_backend,
             "batch_size": args.batch_size,
             "prompt_len": prompt_len,
             "decode_steps": decode_steps,
@@ -492,6 +535,7 @@ def main() -> None:
     summary = {
         "model_path": args.model_path,
         "output_dir": str(output_dir),
+        "attention_backend": args.attention_backend,
         "report_path": str(report_path),
         "run_id": run_id,
         "warmup": args.warmup,

@@ -574,13 +574,15 @@ void MembarAnalysis::update(Operation *op, BlockInfo *blockInfo,
     // all shared memory transactions are complete beforehand.
 #ifdef __TLE__
     if (auto arrive = dyn_cast<triton::nvidia_gpu::ArriveBarrierOp>(op)) {
-      // `participant_arrive` is only emitted after the pipe lowering has proven
-      // the prefix set of writer lanes. Those lanes each execute their own
-      // release fence and one-unit mbarrier arrive, so adding a CTA rendezvous
-      // here would duplicate the publication edge that the op already models.
-      // Non-participant/elected arrives still need this conservative
-      // all-shared-memory dependency because one elected lane cannot publish
-      // stores performed by other lanes without a preceding barrier.
+      // `participant_arrive` is only emitted after pipe lowering has proven a
+      // prefix participant contract. Producer-side participants publish their
+      // own writes with lane-local release fences; consumer-side participants
+      // each release the read slot only after their own reads. Adding a CTA
+      // rendezvous here would duplicate the synchronization edge that the op
+      // already models. Non-participant/elected arrives still need this
+      // conservative all-shared-memory dependency because one elected lane
+      // cannot publish stores or represent all readers without a preceding
+      // barrier.
       if (!arrive.getParticipantArrive()) {
         Interval<size_t> allIntervals(0, std::numeric_limits<size_t>::max());
         curBlockInfo.syncWriteIntervals[allIntervals].insert(op);
