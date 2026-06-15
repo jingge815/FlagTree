@@ -1224,6 +1224,7 @@ emitDesliceToSmem(OpBuilder &rewriter, Location loc, Value smemBuf,
                            lastUser, firstUser, userAnalysis, replaced2Origin);
 }
 
+#ifdef __TLE__
 // ============================================================================
 // Lowering: tle.extract_tile (tensor src)
 //
@@ -1454,6 +1455,7 @@ struct TleInsertTileLowering : SharedGenericConversionPattern {
     return success();
   }
 };
+#endif // __TLE__
 
 // ============================================================================
 // Lowering: triton_gcu.slice_from_local (SMEM src, always from memdesc)
@@ -1614,7 +1616,9 @@ void mlir::triton::populateTTSmemOpToGCUPatterns(
                DesliceToLocalOpLowering>(converter, patterns.getContext(),
                                          userAnalysis, replaced2Origin,
                                          pTagPool);
+#ifdef __TLE__
   patterns.add<TleExtractTileLowering, TleInsertTileLowering>(
       converter, patterns.getContext(), userAnalysis, replaced2Origin,
       pTagPool);
+#endif
 }

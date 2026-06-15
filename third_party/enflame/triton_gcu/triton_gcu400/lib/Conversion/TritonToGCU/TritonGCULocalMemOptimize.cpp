@@ -1109,6 +1109,7 @@ static Value computeAdjustedPtr(PatternRewriter &rewriter, Location loc,
   return rewriter.create<triton::gcu::IntToPtrOp>(loc, ptrTy, adjusted);
 }
 
+#ifdef __TLE__
 // ===----------------------------------------------------------------------===
 // Pattern: Fuse triton_gcu.load/tt.load + tle.extract_tile (multi-warp)
 //
@@ -1634,6 +1635,7 @@ private:
         << (kDsmCapacityBytes / elemBytes) << " elements.";
   }
 };
+#endif // __TLE__
 
 // ===----------------------------------------------------------------------===
 // Pass definition
@@ -1661,8 +1663,10 @@ struct TritonGCULocalMemOptimizePass
                  FuseGcuLoadGcuStoreToSmemPattern,
                  FuseGcuLoadGcuStoreDynShapeToSmemPattern,
                  ReplaceGcuSmemLoadWithLocalLoadPattern,
-                 FuseTritonLoadLocalAllocToGatherPattern,
-                 FuseExtractTileSmemRelay, FuseInsertTileSmemRelay>(ctx);
+                 FuseTritonLoadLocalAllocToGatherPattern>(ctx);
+#ifdef __TLE__
+    patterns.add<FuseExtractTileSmemRelay, FuseInsertTileSmemRelay>(ctx);
+#endif
     if (failed(applyPatternsGreedily(module, std::move(patterns))))
       signalPassFailure();
   }
