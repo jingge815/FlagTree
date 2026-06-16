@@ -411,9 +411,9 @@ class CMakeBuild(build_ext):
 
         if check_env_flag("TRITON_BUILD_WITH_CLANG_LLD"):
             cmake_args += [
-                "-DCMAKE_C_COMPILER=clang",
-                "-DCMAKE_CXX_COMPILER=clang++",
-                "-DCMAKE_LINKER=lld",
+                "-DCMAKE_C_COMPILER=" + os.getenv("CC", "clang"),
+                "-DCMAKE_CXX_COMPILER=" + os.getenv("CXX", "clang++"),
+                "-DCMAKE_LINKER=" + os.getenv("LD", "lld"),
                 "-DCMAKE_EXE_LINKER_FLAGS=-fuse-ld=lld",
                 "-DCMAKE_MODULE_LINKER_FLAGS=-fuse-ld=lld",
                 "-DCMAKE_SHARED_LINKER_FLAGS=-fuse-ld=lld",
@@ -597,7 +597,8 @@ def get_packages():
     packages += helper.get_language_extra()
     packages += ['triton/language/extra/hip' for backend in backends if backend.name != 'mlu']
     packages += [f'triton/backends/{backend.name}' for backend in backends]
-    packages += ["triton/profiler"]
+    if check_env_flag("TRITON_BUILD_PROTON", "ON"):
+        packages += ["triton/profiler"]
     return packages
 
 

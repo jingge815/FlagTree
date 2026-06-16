@@ -60,10 +60,18 @@ class DriverConfig:
 driver = DriverConfig()
 
 
+def _active_driver_if_initialized():
+    active = driver.active
+    if isinstance(active, LazyProxy) and active._obj is None:
+        return None
+    return active
+
+
 # flagtree backend specialization
 def spec(function_name: str, *args, **kwargs):
-    if hasattr(driver.active, "spec"):
-        spec = driver.active.spec
+    active = _active_driver_if_initialized()
+    if active is not None and hasattr(active, "spec"):
+        spec = active.spec
         if hasattr(spec, function_name):
             func = getattr(spec, function_name)
             return func(*args, **kwargs)
@@ -72,8 +80,9 @@ def spec(function_name: str, *args, **kwargs):
 
 # flagtree backend func specialization
 def spec_func(function_name: str):
-    if hasattr(driver.active, "spec"):
-        spec = driver.active.spec
+    active = _active_driver_if_initialized()
+    if active is not None and hasattr(active, "spec"):
+        spec = active.spec
         if hasattr(spec, function_name):
             func = getattr(spec, function_name)
             return func
