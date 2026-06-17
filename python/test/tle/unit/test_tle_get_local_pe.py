@@ -8,8 +8,15 @@ DEVICE_MESH = tle.device_mesh(tle.MeshConfig(device=2))
 
 @triton.jit
 def _tle_local_pe_kernel(in_ptr, out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
     local_rank = tle.my_pe(in_ptr)
+    n_rank = tle.n_pes(in_ptr)
+    peer = (local_rank + 1) % n_rank
+    peer_ptr = tle.remote(in_ptr, space="device", shard_id=peer)
     tl.static_print("local_rank", local_rank)
+    val = tl.load(peer_ptr)
+
+    tl.store(out_ptr + pid, val)
 
 
 class TestLocalPeCount:

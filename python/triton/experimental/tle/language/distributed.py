@@ -42,7 +42,7 @@ def my_pe(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
 def n_pes(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
     builder = _semantic.builder
     ret_ir_ty = ret_dtype.to_ir(builder)
-    result = builder.create_n_pes(ret_ir_ty, dev_mem_ptr)
+    result = builder.get_n_pes(ret_ir_ty, dev_mem_ptr)
     return tl.tensor(result, ret_dtype)
 
 

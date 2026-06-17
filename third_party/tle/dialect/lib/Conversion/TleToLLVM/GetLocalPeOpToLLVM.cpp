@@ -1,4 +1,6 @@
 #include "tle/dialect/include/Conversion/TleToLLVM/GetLocalPeOpToLLVM.h"
+#include "tle/dialect/include/Tools/FlagcxUtils.h"
+
 
 #include "mlir/Conversion/LLVMCommon/Pattern.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -19,23 +21,30 @@ using namespace mlir;
 namespace ttg = mlir::triton::gpu;
 namespace tle = mlir::triton::tle;
 
-static LLVM::LLVMFuncOp getLocalPeFuction(ModuleOp module, MLIRContext *ctx) {
+struct GetNumPesOpConversion
+    : public ConvertOpToLLVMPattern<tle::GetNumPesOp> {
+  GetNumPesOpConversion(LLVMTypeConverter &typeConverter,
+                         PatternBenefit benefit)
+      : ConvertOpToLLVMPattern(typeConverter, benefit) {}
 
-  const char *funcName = "flagcxDevCommGetIntraRank";
-  if (auto func = module.lookupSymbol<LLVM::LLVMFuncOp>(funcName))
-    return func;
+  LogicalResult
+  matchAndRewrite(tle::GetNumPesOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
+    auto getLocalPeCall = tle::getNumPesFunCall(loc, rewriter, srcElems[0]);
 
-  auto PtrTy = LLVM::LLVMPointerType::get(ctx, 1);
+    Value n_pes = getLocalPeCall.getResult();
+    rewriter.replaceOp(op, n_pes);
+    return success();
 
-  auto funcType = LLVM::LLVMFunctionType::get(PtrTy, {PtrTy}, false);
+    op.dump();
 
-  OpBuilder builder(module.getBodyRegion());
-  auto func =
-      builder.create<LLVM::LLVMFuncOp>(module.getLoc(), funcName, funcType);
+    llvm::errs() << "[GetLocalPeOpConversion]";
+    return success();
+  }
+};
 
-  func.setLinkage(LLVM::Linkage::External);
-  return func;
-}
 
 struct GetLocalPeOpConversion
     : public ConvertOpToLLVMPattern<tle::GetLocalPeOp> {
@@ -47,23 +56,8 @@ struct GetLocalPeOpConversion
   matchAndRewrite(tle::GetLocalPeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     auto loc = op.getLoc();
-    auto *ctx = op.getContext();
     auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
-    Value memPtr = srcElems[0];
-    ModuleOp module = rewriter.getInsertionPoint()
-                          ->getParentOp()
-                          ->getParentOfType<ModuleOp>();
-
-    if (!module) {
-      return rewriter.notifyMatchFailure(loc, "expected module context");
-    }
-    auto func = getLocalPeFuction(module, rewriter.getContext());
-    auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
-
-    Value comm_dev_ptr = rewriter.create<LLVM::IntToPtrOp>(loc, ptrTy, memPtr);
-    auto getLocalPeCall = rewriter.create<LLVM::CallOp>(
-        loc, TypeRange{func.getFunctionType().getReturnType()},
-        FlatSymbolRefAttr::get(func), ValueRange{comm_dev_ptr});
+    auto getLocalPeCall = tle::getLocalPeFuncCall(loc, rewriter, srcElems[0]);
 
     Value my_pe = getLocalPeCall.getResult();
     rewriter.replaceOp(op, my_pe);
@@ -81,4 +75,10 @@ void tle::populateGetLocalPeOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
                                              RewritePatternSet &patterns,
                                              PatternBenefit benefit) {
   patterns.add<GetLocalPeOpConversion>(typeConverter, benefit);
+}
+
+void tle::populateGetNumPesOpToLLVMPatterns(LLVMTypeConverter &typeConverter,
+                                             RewritePatternSet &patterns,
+                                             PatternBenefit benefit) {
+  patterns.add<GetNumPesOpConversion>(typeConverter, benefit);
 }

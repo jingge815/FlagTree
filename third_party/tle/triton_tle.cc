@@ -416,6 +416,11 @@ void init_triton_tle_ir(py::module &&m) {
              auto &builder = self.getBuilder();
              return self.create<tle::GetLocalPeOp>(resultTy, src);
            })
+      .def("get_n_pes",
+           [](TritonOpBuilder &self, Value src, Type resultTy) -> Value {
+             auto &builder = self.getBuilder();
+             return self.create<tle::GetNumPesOp>(resultTy, src);
+           })
       .def("get_memdesc_type",
            [](TritonOpBuilder &self, std::vector<int64_t> shape,
               Type &elementType, Attribute &encoding,

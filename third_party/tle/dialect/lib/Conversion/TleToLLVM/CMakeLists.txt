@@ -14,4 +14,8 @@ add_triton_library(TleToLLVM
     DEPENDS
     TleTableGen
     TritonGPUTypeInterfacesIncGen
+    TleTools
+
+    LINK_LIBS PUBLIC
+    TleTools
 )

@@ -247,6 +247,14 @@ def Tle_RemotePointersOp : Tle_Op<"remote_pointers", [Pure]> {
   let results = (outs Tle_LocalPointerResultType:$result);
   let hasVerifier = 1;
 }
+def Tle_GetNumPesOp : Tle_Op<"get_num_pes"> {
+  let summary = "Get nume pes";
+  let arguments = (ins
+    Tle_LocalPointerResultType:$src
+  );
+  let results = (outs I32:$result);
+  let hasVerifier = 1;
+}
 
 def Tle_GetLocalPeOp : Tle_Op<"get_local_pe"> {
   let summary = "Get local PE id";
