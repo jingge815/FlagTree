@@ -14,6 +14,7 @@ import pytest
 import torch
 import triton.language as tl
 import triton.experimental.tle.language as tle
+import triton.experimental.tle.mega as tlem
 from triton.language.core import base_value
 from triton.experimental.tle.language.gpu.core import _deduplicate_warp_specialize_captures
 from triton.experimental.tle.language.gpu.semantic import TLESemanticError, TLESemantic
@@ -175,6 +176,8 @@ class TestBufferedTensor:
             self.swizzled_encoding_args = None
             self.pipe_create_args = None
             self.pipe_ops = []
+            self.task_grid_create_args = None
+            self.task_grid_ops = []
 
         def get_half_ty(self):
             return "fp16"
@@ -231,6 +234,16 @@ class TestBufferedTensor:
             self.pipe_ops.append(
                 ("reader_release", list(fields), stage, capacity, scope, pipe_name, list(field_names), reader_name,
                  list(reader_field_names)))
+
+        def create_task_grid_create(self, fields, scope, grid_name, field_names, shape):
+            self.task_grid_create_args = (list(fields), scope, grid_name, list(field_names), list(shape))
+
+        def create_task_grid_tile_id(self, fields, scope, grid_name, field_names, shape):
+            self.task_grid_ops.append(("tile_id", list(fields), scope, grid_name, list(field_names), list(shape)))
+            return [f"{grid_name}_tile_{axis}" for axis in range(len(shape))]
+
+        def create_task_grid_commit(self, fields, scope, grid_name, field_names):
+            self.task_grid_ops.append(("commit", list(fields), scope, grid_name, list(field_names)))
 
     class _FakeSemantic:
 
@@ -535,6 +548,103 @@ class TestPipeFrontend:
             writer.close(0, _semantic=semantic)
 
 
+class TestTaskGridFrontend:
+    """Test front-end validation for tle.task_grid."""
+
+    def _make_buffer(self, shape, storage=tle.gpu.smem):
+        semantic = TestBufferedTensor._FakeSemantic()
+        layout = tle.gpu.swizzled_shared_layout.make_default(len(shape))
+        buffer = tle.gpu.buffered_tensor("base", tl.float16, shape, storage, layout, semantic)
+        return buffer, semantic
+
+    def test_task_grid_validates_and_keeps_fields(self):
+        y, semantic = self._make_buffer([16, 32])
+        residual, _ = self._make_buffer([16, 32])
+
+        grid = tle.task_grid(name="linear_out", scope="device", shape=(16, 2), y=y, residual=residual,
+                             _semantic=semantic)
+
+        assert isinstance(grid, tle.task_grid_value)
+        assert grid.name == "linear_out"
+        assert grid.scope == "device"
+        assert grid.shape == (16, 2)
+        assert grid.fields == {"y": y, "residual": residual}
+        assert grid.type.fields == [("y", y.type), ("residual", residual.type)]
+        assert grid.type.shape == (16, 2)
+        assert semantic.builder.task_grid_create_args == (["base", "base"], "device", "linear_out",
+                                                          ["y", "residual"], [16, 2])
+
+    def test_task_grid_rejects_invalid_create_arguments(self):
+        y, semantic = self._make_buffer([16, 32])
+
+        with pytest.raises(ValueError, match="scope"):
+            tle.task_grid(name="out", scope="cluster", y=y, _semantic=semantic)
+        with pytest.raises(ValueError, match="compile-time string"):
+            tle.task_grid(y=y, _semantic=semantic)
+        with pytest.raises(ValueError, match="at least one"):
+            tle.task_grid(name="empty", _semantic=semantic)
+        with pytest.raises(ValueError, match="reserved"):
+            tle.task_grid(name="bad", fields=y, _semantic=semantic)
+        with pytest.raises(ValueError, match="reserved"):
+            tle.task_grid(name="bad", commit=y, _semantic=semantic)
+        with pytest.raises(ValueError, match="must not be None"):
+            tle.task_grid(name="bad", y=None, _semantic=semantic)
+        with pytest.raises(ValueError, match="IR handle"):
+            tle.task_grid(name="bad", y="not-a-value", _semantic=semantic)
+
+    def test_task_grid_rejects_invalid_shape(self):
+        y, semantic = self._make_buffer([16, 32])
+
+        with pytest.raises(ValueError, match="tuple/list"):
+            tle.task_grid(name="out", shape="16", y=y, _semantic=semantic)
+        with pytest.raises(ValueError, match="must not be empty"):
+            tle.task_grid(name="out", shape=(), y=y, _semantic=semantic)
+        with pytest.raises(ValueError, match="positive"):
+            tle.task_grid(name="out", shape=(16, 0), y=y, _semantic=semantic)
+        with pytest.raises(ValueError, match="compile-time ints"):
+            tle.task_grid(name="out", shape=(16, "2"), y=y, _semantic=semantic)
+
+    def test_task_grid_tile_id_and_commit_emit_marker_ops(self):
+        y, semantic = self._make_buffer([16, 32])
+        residual, _ = self._make_buffer([16, 32])
+        grid = tle.task_grid(name="out", scope="device", shape=(16, 2), y=y, residual=residual, _semantic=semantic)
+
+        tile = grid.tile_id(_semantic=semantic)
+        grid.commit(_semantic=semantic)
+
+        assert isinstance(tile, tuple)
+        assert len(tile) == 2
+        assert tile[0].handle == "out_tile_0"
+        assert tile[0].dtype == tl.int32
+        assert tile[1].handle == "out_tile_1"
+        assert tile[1].dtype == tl.int32
+        assert [op[0] for op in semantic.builder.task_grid_ops] == ["tile_id", "commit"]
+        assert semantic.builder.task_grid_ops[0] == ("tile_id", ["base", "base"], "device", "out",
+                                                     ["y", "residual"], [16, 2])
+        assert semantic.builder.task_grid_ops[1] == ("commit", ["base", "base"], "device", "out",
+                                                     ["y", "residual"])
+
+    def test_task_grid_rank_one_tile_id_returns_scalar(self):
+        y, semantic = self._make_buffer([16, 32])
+        grid = tle.task_grid(name="out", shape=16, y=y, _semantic=semantic)
+
+        tile = grid.tile_id(_semantic=semantic)
+
+        assert tile.handle == "out_tile_0"
+        assert tile.dtype == tl.int32
+        assert semantic.builder.task_grid_ops[0] == ("tile_id", ["base"], "device", "out", ["y"], [16])
+
+    def test_task_grid_commit_rejects_invalid_explicit_tile(self):
+        y, semantic = self._make_buffer([16, 32])
+        grid = tle.task_grid(name="out", shape=(16, 2), y=y, _semantic=semantic)
+        dynamic_grid = tle.task_grid(name="dynamic_out", y=y, _semantic=semantic)
+
+        with pytest.raises(ValueError, match="requires task_grid shape"):
+            dynamic_grid.commit(tile=0, _semantic=semantic)
+        with pytest.raises(ValueError, match="rank must be 2"):
+            grid.commit(tile=(0, ), _semantic=semantic)
+
+
 class TestIntegration:
     """Integration tests"""
 
@@ -546,6 +656,15 @@ class TestIntegration:
         assert hasattr(tle, 'pipe')
         assert hasattr(tle, 'pipe_reader')
         assert hasattr(tle, 'pipe_writer')
+        assert hasattr(tle, 'task_grid')
+        assert hasattr(tle, 'task_grid_value')
+        assert not hasattr(tle, 'task_grid_reader')
+        assert not hasattr(tle, 'task_grid_writer')
+        assert hasattr(tlem, 'ALL')
+        assert hasattr(tlem, 'affine_map')
+        assert hasattr(tlem, 'GraphArgSpec')
+        assert hasattr(tlem, 'mega_graph')
+        assert not hasattr(tle, 'mega_graph')
         assert hasattr(tle.gpu, 'alloc')
         assert not hasattr(tle.gpu, 'pipe')
         assert hasattr(tle.gpu, 'copy')
@@ -558,10 +677,95 @@ class TestIntegration:
         """Test TLE functions have docstrings"""
         # Check if main functions have documentation
         assert tle.pipe.__doc__ is not None
+        assert tle.task_grid.__doc__ is not None
+        assert tlem.affine_map.__doc__ is not None
+        assert tlem.mega_graph.__doc__ is not None
         assert tle.gpu.alloc.__doc__ is not None
         assert tle.gpu.copy.__doc__ is not None
         assert tle.gpu.local_ptr.__doc__ is not None
         assert tle.gpu.pipeline.__doc__ is not None
+
+    def test_tle_mega_host_api_imports_as_tlem(self):
+        """Test host-side TLE mega graph API."""
+        graph = tlem.mega_graph("linear_rmsnorm")
+        linear_grid = graph.grid("linear_to_rms", shape=(16, 2),
+                                 fields={"scratch": "!tt.ptr<f16>", "partial": "!tt.ptr<f32>"})
+        stat_grid = graph.grid("rms_stat", shape=(16, ), fields={"stat": "!tt.ptr<f32>"})
+        out_grid = graph.grid("rms_out", shape=(16, 2), fields={"out": "!tt.ptr<f16>"})
+
+        linear_task = graph.task("linear_tile", domain=(16, 2), reads={},
+                                 writes={linear_grid: tlem.affine_map(2, 0, 1)})
+        reduce_task = graph.task("rms_reduce", domain=(16, ),
+                                 reads={linear_grid: tlem.affine_map(1, 0, tlem.ALL)},
+                                 writes={stat_grid: tlem.affine_map(1, 0)})
+        apply_task = graph.task("rms_apply", domain=(16, 2),
+                                reads={
+                                    linear_grid: tlem.affine_map(2, 0, 1),
+                                    stat_grid: tlem.affine_map(2, 0),
+                                },
+                                writes={out_grid: tlem.affine_map(2, 0, 1)})
+
+        assert graph.grids == [linear_grid, stat_grid, out_grid]
+        assert graph.tasks == [linear_task, reduce_task, apply_task]
+        assert reduce_task.reads[0].map.wildcard_dims == (1, )
+
+        mlir = graph.to_mlir()
+        assert 'tt.func @linear_rmsnorm' in mlir
+        assert 'tle.task_grid.create %linear_to_rms_scratch, %linear_to_rms_partial' in mlir
+        assert 'task_name = "linear_tile"' in mlir
+        assert 'task_name = "rms_reduce"' in mlir
+        assert 'wildcard_dims = array<i64: 1>' in mlir
+        assert 'task_name = "rms_apply"' in mlir
+        with pytest.raises(NotImplementedError, match="scheduler codegen"):
+            graph.compile()
+
+    def test_tle_mega_graph_lowers_args_and_callees(self):
+        """Test host graph lowering for scheduler entry functions."""
+        class FakeJitBody:
+            def repr(self, _):
+                return "linear_tile_body"
+
+        graph = tlem.mega_graph("linear_rmsnorm")
+        x = graph.arg("x", "!tt.ptr<f32>")
+        weight = graph.arg("linear_weight", "!tt.ptr<f32>")
+        linear_grid = graph.grid("linear_to_rms", shape=(2, 4),
+                                 fields={"scratch": "!tt.ptr<f32>", "partial": "!tt.ptr<f32>"})
+        stat_grid = graph.grid("rms_stat", shape=(2, ), fields={"stat": "!tt.ptr<f32>"})
+        graph.task(FakeJitBody(), name="linear_tile", domain=(2, 4), reads={},
+                   writes={linear_grid: tlem.affine_map(2, 0, 1)})
+        graph.task("rms_reduce_body", name="rms_reduce", domain=(2, ),
+                   reads={linear_grid: tlem.affine_map(1, 0, tlem.ALL)},
+                   writes={stat_grid: tlem.affine_map(1, 0)})
+
+        assert graph.args == [x, weight]
+        mlir_func = graph.to_mlir_function("scheduler")
+        assert "tt.func @scheduler(%x: !tt.ptr<f32>, %linear_weight: !tt.ptr<f32>" in mlir_func
+        assert "callee = @linear_tile_body" in mlir_func
+        assert "task_name = \"linear_tile\"" in mlir_func
+        assert "callee = @rms_reduce_body" in mlir_func
+        assert "wildcard_dims = array<i64: 1>" in mlir_func
+
+    def test_tle_mega_graph_rejects_invalid_metadata(self):
+        """Test fail-fast host graph validation."""
+        graph = tlem.mega_graph()
+        grid = graph.grid("linear_to_rms", shape=(16, 2), fields={"scratch": "!tt.ptr<f16>"})
+
+        with pytest.raises(ValueError, match="duplicate grid"):
+            graph.grid("linear_to_rms", shape=(16, 2), fields={"other": "!tt.ptr<f16>"})
+        with pytest.raises(ValueError, match="explicit reads"):
+            graph.task("missing_reads", domain=(16, ), writes={grid: tlem.affine_map(1, 0, tlem.ALL)})
+        with pytest.raises(ValueError, match="explicit writes"):
+            graph.task("missing_writes", domain=(16, ), reads={})
+        with pytest.raises(ValueError, match="unknown grid"):
+            graph.task("unknown_grid", domain=(16, ), reads={}, writes={"missing": tlem.affine_map(1, 0)})
+        with pytest.raises(ValueError, match="domain rank"):
+            graph.task("bad_domain", domain=(16, ), reads={}, writes={grid: tlem.affine_map(2, 0, 1)})
+        with pytest.raises(ValueError, match="targets rank"):
+            graph.task("bad_target", domain=(16, ), reads={}, writes={grid: tlem.affine_map(1, 0)})
+        with pytest.raises(ValueError, match="must not contain"):
+            graph.task("wildcard_write", domain=(16, ), reads={}, writes={grid: tlem.affine_map(1, 0, tlem.ALL)})
+        with pytest.raises(ValueError, match="created with tlem.affine_map"):
+            graph.task("raw_map", domain=(16, 2), reads={}, writes={grid: "(d0, d1) -> (d0, d1)"})
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA GPU")
     def test_tle_with_cuda(self):

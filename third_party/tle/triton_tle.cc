@@ -69,6 +69,15 @@ createTLERawRegionByLLVMFunc(TritonOpBuilder &self, std::string_view text,
                              const std::vector<Value> &args,
                              const std::vector<int64_t> &aliasOperandIndices);
 
+static ArrayAttr makeStringArrayAttr(OpBuilder &builder,
+                                     const std::vector<std::string> &names) {
+  SmallVector<Attribute> attrs;
+  attrs.reserve(names.size());
+  for (StringRef name : names)
+    attrs.push_back(builder.getStringAttr(name));
+  return builder.getArrayAttr(attrs);
+}
+
 void init_triton_tle_ir(py::module &&m) {
 
   // Get the existing builder class from the main ir module (TLX style)
@@ -343,6 +352,47 @@ void init_triton_tle_ir(py::module &&m) {
                  builder.getStringAttr(scope), pipeNameAttr,
                  builder.getArrayAttr(fieldNameAttrs), readerNameAttr);
            })
+      .def("create_task_grid_create",
+           [](TritonOpBuilder &self, std::vector<Value> fields,
+              const std::string &scope, const std::string &gridName,
+              std::vector<std::string> fieldNames,
+              std::vector<int64_t> shape) -> void {
+             auto &builder = self.getBuilder();
+             DenseI64ArrayAttr shapeAttr;
+             if (!shape.empty())
+               shapeAttr = builder.getDenseI64ArrayAttr(shape);
+             self.create<tle::TaskGridCreateOp>(
+                 fields, builder.getStringAttr(scope),
+                 builder.getStringAttr(gridName),
+                 makeStringArrayAttr(builder, fieldNames), shapeAttr);
+           })
+      .def("create_task_grid_tile_id",
+           [](TritonOpBuilder &self, std::vector<Value> fields,
+              const std::string &scope, const std::string &gridName,
+              std::vector<std::string> fieldNames,
+              std::vector<int64_t> shape) -> std::vector<Value> {
+             auto &builder = self.getBuilder();
+             SmallVector<Type> resultTypes(shape.size(), builder.getI32Type());
+             DenseI64ArrayAttr shapeAttr;
+             if (!shape.empty())
+               shapeAttr = builder.getDenseI64ArrayAttr(shape);
+             auto op = self.create<tle::TaskGridTileIdOp>(
+                 resultTypes, fields, builder.getStringAttr(scope),
+                 builder.getStringAttr(gridName),
+                 makeStringArrayAttr(builder, fieldNames), shapeAttr);
+             return std::vector<Value>(op->getResults().begin(),
+                                       op->getResults().end());
+           })
+      .def("create_task_grid_commit",
+           [](TritonOpBuilder &self, std::vector<Value> fields,
+              const std::string &scope, const std::string &gridName,
+              std::vector<std::string> fieldNames) -> void {
+             auto &builder = self.getBuilder();
+             self.create<tle::TaskGridCommitOp>(
+                 fields, builder.getStringAttr(scope),
+                 builder.getStringAttr(gridName),
+                 makeStringArrayAttr(builder, fieldNames));
+           })
       .def("create_exclusive_cumsum",
            [](TritonOpBuilder &self, Type exclusiveTy, Type totalTy, Value src,
               int axis, bool reverse) -> OpState {
@@ -357,6 +407,9 @@ void init_triton_tle_ir(py::module &&m) {
                  StringAttr(), IntegerAttr(), DenseI32ArrayAttr(),
                  DenseI32ArrayAttr(), DenseI32ArrayAttr());
            })
+      .def("create_cluster_cta_id", [](TritonOpBuilder &self) -> Value {
+        return self.create<tle::ClusterCTAIdOp>(self.getBuilder().getI32Type());
+      })
       .def(
           "create_distributed_barrier",
           [](TritonOpBuilder &self, const std::string &groupKind,
@@ -468,6 +521,18 @@ void init_triton_tle_passes(py::module &&m) {
                      tle::createTritonTleLowerAsyncLoad);
   ADD_PASS_WRAPPER_0("add_lower_pipe_to_nvws",
                      tle::createTritonTleLowerPipeToNvws);
+  ADD_PASS_WRAPPER_0("add_lower_task_grid",
+                     tle::createTritonTleLowerTaskGrid);
+  ADD_PASS_WRAPPER_0("add_verify_task_graph",
+                     tle::createTritonTleVerifyTaskGraph);
+  ADD_PASS_WRAPPER_0("add_analyze_task_graph",
+                     tle::createTritonTleAnalyzeTaskGraph);
+  ADD_PASS_WRAPPER_0("add_materialize_task_scheduler",
+                     tle::createTritonTleMaterializeTaskScheduler);
+  ADD_PASS_WRAPPER_0("add_materialize_task_runtime_state",
+                     tle::createTritonTleMaterializeTaskRuntimeState);
+  ADD_PASS_WRAPPER_0("add_lower_task_scheduler",
+                     tle::createTritonTleLowerTaskScheduler);
   ADD_PASS_WRAPPER_0("add_lower_tma_copy", tle::createTritonTleLowerTmaCopy);
   ADD_PASS_WRAPPER_0("add_schedule_tma_store_sync",
                      tle::createTritonTleScheduleTmaStoreSync);

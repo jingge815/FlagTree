@@ -1,5 +1,6 @@
 # flagtree tle
 from . import language
+from . import mega
 
 try:
     from . import raw
@@ -8,6 +9,7 @@ except ModuleNotFoundError:
 
 __all__ = [
     "language",
+    "mega",
 ]
 
 if raw is not None:

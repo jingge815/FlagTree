@@ -13,6 +13,10 @@ from .pipe import (
     pipe_wait_result,
     pipe_writer,
 )
+from .task_grid import (
+    task_grid,
+    task_grid_value,
+)
 from .distributed import (
     B,
     P,
@@ -44,6 +48,8 @@ __all__ = [
     "pipe_value",
     "pipe_wait_result",
     "pipe_writer",
+    "task_grid",
+    "task_grid_value",
     "device_mesh",
     "S",
     "P",

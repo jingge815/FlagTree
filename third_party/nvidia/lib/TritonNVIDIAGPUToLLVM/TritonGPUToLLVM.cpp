@@ -27,6 +27,7 @@
 #include "tle/dialect/include/Conversion/TleToLLVM/ExtractOpToLLVM.h"
 #include "tle/dialect/include/Conversion/TleToLLVM/LocalPointersOpToLLVM.h"
 #include "tle/dialect/include/Conversion/TleToLLVM/PackOpToLLVM.h"
+#include "tle/dialect/include/Conversion/TleToLLVM/TaskSchedulerOpToLLVM.h"
 #include "tle/dialect/include/IR/Dialect.h"
 #endif
 #include "triton/Analysis/Allocation.h"
@@ -110,6 +111,9 @@ public:
           return hasLegalRegions && typeConverter.isLegal(op);
         });
     addLegalOp<tle::RemotePointersOp>();
+    addLegalOp<tle::TaskDeclareOp, tle::TaskGridCreateOp,
+               tle::TaskGridTileIdOp, tle::TaskGridCommitOp,
+               tle::TaskGraphRuntimeStateOp>();
     // Allow non-TLE ops to remain during this partial conversion.
     markUnknownOpDynamicallyLegal([](Operation *) -> bool { return true; });
   }
@@ -187,6 +191,8 @@ struct ConvertTritonGPUToLLVM
       mlir::triton::tle::populateWGMMASharedOperandFenceOpToLLVMPatterns(
           typeConverter, patterns, benefit);
       mlir::triton::tle::populateTMAStoreCommitGroupOpToLLVMPatterns(
+          typeConverter, patterns, benefit);
+      mlir::triton::tle::populateTaskSchedulerOpToLLVMPatterns(
           typeConverter, patterns, benefit);
       if (failed(applyPartialConversion(mod, target, std::move(patterns)))) {
         return signalPassFailure();

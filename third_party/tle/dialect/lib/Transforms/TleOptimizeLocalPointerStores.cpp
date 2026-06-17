@@ -28,6 +28,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include <algorithm>
 #include <limits>
@@ -67,6 +68,34 @@ static Value stripValueWrappers(Value value) {
     }
     if (auto expand = current.getDefiningOp<tt::ExpandDimsOp>()) {
       current = expand.getSrc();
+      continue;
+    }
+    if (auto ext = current.getDefiningOp<arith::ExtSIOp>()) {
+      current = ext.getIn();
+      continue;
+    }
+    if (auto ext = current.getDefiningOp<arith::ExtUIOp>()) {
+      current = ext.getIn();
+      continue;
+    }
+    if (auto trunc = current.getDefiningOp<arith::TruncIOp>()) {
+      current = trunc.getIn();
+      continue;
+    }
+    if (auto cast = current.getDefiningOp<arith::IndexCastOp>()) {
+      current = cast.getIn();
+      continue;
+    }
+    break;
+  }
+  return current;
+}
+
+static Value stripIndexValueWrappers(Value value) {
+  Value current = value;
+  while (true) {
+    if (auto cvt = current.getDefiningOp<ttg::ConvertLayoutOp>()) {
+      current = cvt.getSrc();
       continue;
     }
     if (auto ext = current.getDefiningOp<arith::ExtSIOp>()) {
@@ -152,6 +181,73 @@ static std::optional<int64_t> getConstantIntLike(Value value) {
   if (auto cst = value.getDefiningOp<arith::ConstantIndexOp>())
     return cst.value();
   return std::nullopt;
+}
+
+static bool matchRangeWithStaticOffset(Value value, int64_t extent,
+                                       int64_t &offset) {
+  Value current = stripIndexValueWrappers(value);
+  if (auto range = current.getDefiningOp<triton::MakeRangeOp>()) {
+    offset = range.getStart();
+    return range.getEnd() - range.getStart() == extent;
+  }
+
+  auto add = current.getDefiningOp<arith::AddIOp>();
+  if (!add)
+    return false;
+
+  auto tryMatch = [&](Value lhs, Value rhs) -> bool {
+    Value lhsStripped = stripIndexValueWrappers(lhs);
+    auto range = lhsStripped.getDefiningOp<triton::MakeRangeOp>();
+    if (!range)
+      return false;
+    std::optional<int64_t> cst = getConstantIntLike(rhs);
+    if (!cst)
+      return false;
+    offset = range.getStart() + *cst;
+    return range.getEnd() - range.getStart() == extent;
+  };
+
+  return tryMatch(add.getLhs(), add.getRhs()) ||
+         tryMatch(add.getRhs(), add.getLhs());
+}
+
+static bool matchFullIndexTensorForAxis(Value index, size_t axis,
+                                        ArrayRef<int64_t> shape,
+                                        int64_t &offset) {
+  auto indexTy = dyn_cast<RankedTensorType>(index.getType());
+  if (!indexTy || !indexTy.getElementType().isInteger())
+    return false;
+  if (indexTy.getShape() != shape)
+    return false;
+
+  Value current = stripIndexValueWrappers(index);
+  if (shape.size() == 1)
+    return matchRangeWithStaticOffset(current, shape.front(), offset);
+
+  auto bcast = current.getDefiningOp<triton::BroadcastOp>();
+  if (!bcast)
+    return false;
+
+  auto bcastSrcTy = dyn_cast<RankedTensorType>(bcast.getSrc().getType());
+  if (!bcastSrcTy || bcastSrcTy.getRank() != static_cast<int64_t>(shape.size()))
+    return false;
+  for (auto [dim, dimSize] : llvm::enumerate(shape)) {
+    const int64_t expected = dim == axis ? dimSize : 1;
+    if (bcastSrcTy.getShape()[dim] != expected)
+      return false;
+  }
+
+  current = stripIndexValueWrappers(bcast.getSrc());
+  while (auto expand = current.getDefiningOp<triton::ExpandDimsOp>())
+    current = stripIndexValueWrappers(expand.getSrc());
+
+  auto rangeTy = dyn_cast<RankedTensorType>(current.getType());
+  if (!rangeTy || rangeTy.getRank() != 1)
+    return false;
+  if (rangeTy.getShape()[0] != shape[axis])
+    return false;
+
+  return matchRangeWithStaticOffset(current, shape[axis], offset);
 }
 
 static std::optional<IntRange> getIntRange(Value value, unsigned depth = 0) {
@@ -293,6 +389,76 @@ static bool isKnownAllTrueMask(Value mask, unsigned depth = 0) {
   return false;
 }
 
+struct StaticSubviewMatch {
+  Value baseMemDesc;
+  SmallVector<int32_t> offsets;
+  RankedTensorType valueType;
+};
+
+static std::optional<StaticSubviewMatch>
+matchStaticSubviewMemDesc(triton::StoreOp store) {
+  if (!store.getBoundaryCheck().empty())
+    return std::nullopt;
+
+  Value ptr = stripConvertLayouts(store.getPtr());
+  auto localPointers = ptr.getDefiningOp<tle::LocalPointersOp>();
+  if (!localPointers)
+    return std::nullopt;
+
+  auto valueTy = dyn_cast<RankedTensorType>(store.getValue().getType());
+  auto ptrTy = dyn_cast<RankedTensorType>(localPointers.getResult().getType());
+  auto memDescTy = dyn_cast<ttg::MemDescType>(localPointers.getSrc().getType());
+  if (!valueTy || !ptrTy || !memDescTy)
+    return std::nullopt;
+  if (valueTy.getShape() != ptrTy.getShape())
+    return std::nullopt;
+  if (valueTy.getElementType() != memDescTy.getElementType())
+    return std::nullopt;
+
+  SmallVector<int32_t> offsets(memDescTy.getRank(), 0);
+  auto memDescShape = memDescTy.getShape();
+  auto indices = localPointers.getIndices();
+  if (indices.empty()) {
+    if (valueTy.getShape() == memDescShape)
+      return StaticSubviewMatch{localPointers.getSrc(), std::move(offsets),
+                                valueTy};
+    return std::nullopt;
+  }
+  if (indices.size() != static_cast<size_t>(memDescTy.getRank()))
+    return std::nullopt;
+
+  for (auto [axis, index] : llvm::enumerate(indices)) {
+    int64_t offset = 0;
+    if (!matchFullIndexTensorForAxis(index, axis, valueTy.getShape(), offset))
+      return std::nullopt;
+    if (offset < 0 || offset + valueTy.getShape()[axis] > memDescShape[axis])
+      return std::nullopt;
+    if (offset > std::numeric_limits<int32_t>::max())
+      return std::nullopt;
+    offsets[axis] = static_cast<int32_t>(offset);
+  }
+
+  return StaticSubviewMatch{localPointers.getSrc(), std::move(offsets),
+                            valueTy};
+}
+
+static Value createSubviewForStore(OpBuilder &builder, Location loc,
+                                   const StaticSubviewMatch &match) {
+  auto memDescTy = cast<ttg::MemDescType>(match.baseMemDesc.getType());
+  bool isFullView = match.valueType.getShape() == memDescTy.getShape() &&
+                    std::all_of(match.offsets.begin(), match.offsets.end(),
+                                [](int32_t offset) { return offset == 0; });
+  if (isFullView)
+    return match.baseMemDesc;
+
+  auto subTy = ttg::MemDescType::get(
+      match.valueType.getShape(), match.valueType.getElementType(),
+      memDescTy.getEncoding(), memDescTy.getMemorySpace(),
+      memDescTy.getMutableMemory(), memDescTy.getAllocShape());
+  return ttg::MemDescSubsliceOp::create(builder, loc, subTy,
+                                        match.baseMemDesc, match.offsets);
+}
+
 class OptimizeLocalPointerStoresPass
     : public impl::TritonTleOptimizeLocalPointerStoresBase<
           OptimizeLocalPointerStoresPass> {
@@ -306,31 +472,28 @@ class OptimizeLocalPointerStoresPass
       if (!store)
         continue;
 
-      Value ptr = stripConvertLayouts(store.getPtr());
-      auto localPointers = ptr.getDefiningOp<tle::LocalPointersOp>();
-      if (!localPointers)
-        continue;
-
-      auto valueTy = dyn_cast<RankedTensorType>(store.getValue().getType());
-      auto memDescTy =
-          dyn_cast<ttg::MemDescType>(localPointers.getSrc().getType());
-      if (!valueTy || !memDescTy)
-        continue;
-
-      if (!store.getBoundaryCheck().empty())
-        continue;
-      if (valueTy.getShape() != memDescTy.getShape())
-        continue;
-      if (valueTy.getElementType() != memDescTy.getElementType())
+      std::optional<StaticSubviewMatch> match =
+          matchStaticSubviewMemDesc(store);
+      if (!match)
         continue;
 
       OpBuilder builder(store);
       Value valueToStore = store.getValue();
+      auto valueTy = match->valueType;
+      Value mask = store.getMask();
+      bool hasPartialMask = mask && !isKnownAllTrueMask(mask);
 
-      if (Value mask = store.getMask(); mask && !isKnownAllTrueMask(mask)) {
+      if (hasPartialMask) {
         auto maskTy = dyn_cast<RankedTensorType>(mask.getType());
         if (!maskTy || maskTy.getShape() != valueTy.getShape())
           continue;
+      }
+
+      Value storeTarget =
+          createSubviewForStore(builder, store.getLoc(), *match);
+
+      if (hasPartialMask) {
+        auto maskTy = dyn_cast<RankedTensorType>(mask.getType());
         if (maskTy.getEncoding() != valueTy.getEncoding()) {
           auto targetMaskTy =
               RankedTensorType::get(maskTy.getShape(), maskTy.getElementType(),
@@ -341,7 +504,7 @@ class OptimizeLocalPointerStoresPass
                      .getResult();
         }
         Value oldValue = builder.create<ttg::LocalLoadOp>(
-            store.getLoc(), valueTy, localPointers.getSrc());
+            store.getLoc(), valueTy, storeTarget);
         valueToStore = builder
                            .create<arith::SelectOp>(store.getLoc(), mask,
                                                     valueToStore, oldValue)
@@ -349,7 +512,7 @@ class OptimizeLocalPointerStoresPass
       }
 
       builder.create<ttg::LocalStoreOp>(store.getLoc(), valueToStore,
-                                        localPointers.getSrc());
+                                        storeTarget);
       store.erase();
     }
   }

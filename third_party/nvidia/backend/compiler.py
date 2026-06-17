@@ -251,6 +251,20 @@ class CUDABackend(BaseBackend):
             CUDABackend.instrumentation.load_dialects(ctx)
 
     @staticmethod
+    def refresh_tle_metadata_from_module(mod, metadata, opt):
+        # launch_cooperative_grid may be toggled during frontend semantic
+        # lowering or by TLE scheduler materialization. Refresh it at every
+        # pipeline entry that can receive a pre-materialized IRSource module.
+        requires_tle_cooperative_grid = bool(mod.get_int_attr("tle.requires_cooperative_grid"))
+        metadata["launch_cooperative_grid"] = (
+            metadata.get("launch_cooperative_grid", False)
+            or opt.launch_cooperative_grid
+            or requires_tle_cooperative_grid
+        )
+        # cluster_dims may also be inferred/updated by frontend mesh semantics.
+        metadata["cluster_dims"] = tuple(opt.cluster_dims)
+
+    @staticmethod
     def make_ttir(mod, metadata, opt, capability):
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -311,6 +325,8 @@ class CUDABackend(BaseBackend):
         tle.passes.add_promote_local_store_staging(pm)
         nvidia.passes.ttnvgpuir.add_optimize_descriptor_encoding(pm)
         passes.ttir.add_loop_aware_cse(pm)
+        if hasattr(tle.passes, "add_lower_task_grid"):
+            tle.passes.add_lower_task_grid(pm)
         if capability // 10 in [8, 9]:
             passes.ttgpuir.add_fuse_nested_loops(pm)
             passes.common.add_canonicalizer(pm)
@@ -372,11 +388,7 @@ class CUDABackend(BaseBackend):
 
         pm.run(mod, 'make_ttgir')
         # begin flagtree tle
-        # launch_cooperative_grid may be toggled during frontend semantic lowering
-        # (e.g. device_mesh + distributed_barrier grid mode), so refresh it here.
-        metadata["launch_cooperative_grid"] = opt.launch_cooperative_grid
-        # cluster_dims may also be inferred/updated by frontend mesh semantics.
-        metadata["cluster_dims"] = tuple(opt.cluster_dims)
+        CUDABackend.refresh_tle_metadata_from_module(mod, metadata, opt)
         # end flagtree tle
         metadata["tensordesc_meta"] = mod.get_tensordesc_metadata()
         return mod
@@ -404,6 +416,9 @@ class CUDABackend(BaseBackend):
         ptx_version = get_ptx_version_from_options(options, self.target.arch)
 
         mod = src
+        # begin flagtree tle
+        CUDABackend.refresh_tle_metadata_from_module(mod, metadata, options)
+        # end flagtree tle
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()

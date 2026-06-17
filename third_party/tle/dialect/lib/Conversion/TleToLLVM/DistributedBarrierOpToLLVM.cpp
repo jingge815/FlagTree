@@ -436,10 +436,24 @@ struct DistributedBarrierOpConversion
   }
 };
 
+struct ClusterCTAIdOpConversion
+    : public ConvertOpToLLVMPattern<tle::ClusterCTAIdOp> {
+  using ConvertOpToLLVMPattern<tle::ClusterCTAIdOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(tle::ClusterCTAIdOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<NVVM::BlockInClusterIdXOp>(
+        op, rewriter.getI32Type());
+    return success();
+  }
+};
+
 } // namespace
 
 void tle::populateDistributedBarrierOpToLLVMPatterns(
     LLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
     PatternBenefit benefit) {
-  patterns.add<DistributedBarrierOpConversion>(typeConverter, benefit);
+  patterns.add<DistributedBarrierOpConversion, ClusterCTAIdOpConversion>(
+      typeConverter, benefit);
 }

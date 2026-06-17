@@ -544,9 +544,17 @@ def shard_id(
     if launch_size <= 0:
         raise ValueError(f"invalid launch mesh shape: {launch_shape}")
 
-    _apply_mesh_cluster_launch(mesh, _semantic)
-    linear = tl.program_id(0, _semantic=_semantic)
-    if launch_size > 1:
+    cluster_dims = _apply_mesh_cluster_launch(mesh, _semantic)
+    cluster_size = _prod(cluster_dims)
+    if _mesh_has_cluster_axes(mesh) and launch_size == cluster_size:
+        builder = _semantic.builder
+        if not hasattr(builder, "create_cluster_cta_id"):
+            raise NotImplementedError("cluster shard_id requires rebuilt TLE extension with create_cluster_cta_id")
+        linear = tl.tensor(builder.create_cluster_cta_id(), tl.int32)
+    else:
+        linear = tl.program_id(0, _semantic=_semantic)
+
+    if launch_size > 1 and launch_size != cluster_size:
         linear = _semantic.mod(linear, launch_size)
 
     stride = _prod(launch_shape[axis_idx + 1:]) if axis_idx + 1 < len(launch_shape) else 1

@@ -1,10 +1,19 @@
 #include "triton/Analysis/Allocation.h"
 
 #include <algorithm>
+#ifdef __TLE__
+#include <iterator>
+#endif
 #include <limits>
 
 #include "mlir/Analysis/Liveness.h"
+#ifdef __TLE__
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#endif
 #include "mlir/Support/LLVM.h"
+#ifdef __TLE__
+#include "tle/dialect/include/IR/Dialect.h"
+#endif
 #include "triton/Analysis/Alias.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -28,6 +37,123 @@ namespace mlir {
 // Shared Memory Allocation Analysis
 //===----------------------------------------------------------------------===//
 namespace triton {
+
+#ifdef __TLE__
+namespace {
+
+void collectLocalAllocsFromMemDesc(
+    Value value, llvm::SmallPtrSetImpl<Operation *> &allocs,
+    llvm::DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return;
+
+  if (auto alloc = value.getDefiningOp<gpu::LocalAllocOp>()) {
+    if (alloc.isSharedMemoryAlloc())
+      allocs.insert(alloc.getOperation());
+    return;
+  }
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return;
+  for (Value operand : def->getOperands()) {
+    if (isa<gpu::MemDescType>(operand.getType()))
+      collectLocalAllocsFromMemDesc(operand, allocs, visited);
+  }
+}
+
+void collectRemotePointerSourceAllocs(
+    Value value, llvm::SmallPtrSetImpl<Operation *> &allocs,
+    llvm::DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return;
+
+  Operation *def = value.getDefiningOp();
+  if (!def)
+    return;
+
+  if (auto localPointers = dyn_cast<tle::LocalPointersOp>(def)) {
+    llvm::DenseSet<Value> memDescVisited;
+    collectLocalAllocsFromMemDesc(localPointers.getSrc(), allocs,
+                                  memDescVisited);
+    return;
+  }
+
+  if (auto convert = dyn_cast<gpu::ConvertLayoutOp>(def)) {
+    collectRemotePointerSourceAllocs(convert.getSrc(), allocs, visited);
+    return;
+  }
+  if (auto addPtr = dyn_cast<AddPtrOp>(def)) {
+    collectRemotePointerSourceAllocs(addPtr.getPtr(), allocs, visited);
+    return;
+  }
+  if (auto splat = dyn_cast<SplatOp>(def)) {
+    collectRemotePointerSourceAllocs(splat.getSrc(), allocs, visited);
+    return;
+  }
+  if (auto broadcast = dyn_cast<BroadcastOp>(def)) {
+    collectRemotePointerSourceAllocs(broadcast.getSrc(), allocs, visited);
+    return;
+  }
+  if (auto expand = dyn_cast<ExpandDimsOp>(def)) {
+    collectRemotePointerSourceAllocs(expand.getSrc(), allocs, visited);
+    return;
+  }
+  if (auto reshape = dyn_cast<ReshapeOp>(def)) {
+    collectRemotePointerSourceAllocs(reshape.getSrc(), allocs, visited);
+    return;
+  }
+  if (auto ifOp = dyn_cast<scf::IfOp>(def)) {
+    auto result = dyn_cast<OpResult>(value);
+    if (!result)
+      return;
+    unsigned resultIdx = result.getResultNumber();
+    if (resultIdx >= ifOp.getNumResults())
+      return;
+    collectRemotePointerSourceAllocs(ifOp.thenYield().getOperand(resultIdx),
+                                     allocs, visited);
+    if (Block *elseBlock = ifOp.elseBlock())
+      collectRemotePointerSourceAllocs(
+          cast<scf::YieldOp>(elseBlock->getTerminator()).getOperand(resultIdx),
+          allocs, visited);
+    return;
+  }
+  if (auto forOp = dyn_cast<scf::ForOp>(def)) {
+    auto result = dyn_cast<OpResult>(value);
+    if (!result)
+      return;
+    unsigned resultIdx = result.getResultNumber();
+    if (resultIdx >= forOp.getNumResults())
+      return;
+    collectRemotePointerSourceAllocs(forOp.getInitArgs()[resultIdx], allocs,
+                                     visited);
+    collectRemotePointerSourceAllocs(
+        cast<scf::YieldOp>(forOp.getBody()->getTerminator())
+            .getOperand(resultIdx),
+        allocs, visited);
+  }
+}
+
+Operation *findNextDistributedBarrier(Operation *op) {
+  Operation *cursor = op;
+  while (cursor) {
+    Block *block = cursor->getBlock();
+    if (!block)
+      return nullptr;
+
+    for (auto it = std::next(cursor->getIterator()); it != block->end();
+         ++it) {
+      if (isa<tle::DistributedBarrierOp>(&*it))
+        return &*it;
+    }
+
+    cursor = cursor->getParentOp();
+  }
+  return nullptr;
+}
+
+} // namespace
+#endif
 
 unsigned getNumScratchElemsSwizzledCvt(RankedTensorType srcTy,
                                        RankedTensorType dstTy) {
@@ -358,8 +484,51 @@ private:
 
     resolveExplicitBufferLiveness(getValueLivenessRange);
     resolveAliasBufferLiveness(getValueLivenessRange);
+#ifdef __TLE__
+    extendRemoteExposedBufferLiveness(operationId);
+#endif
     resolveScratchBufferLiveness(operationId);
   }
+
+#ifdef __TLE__
+  void extendRemoteExposedBufferLiveness(
+      const DenseMap<Operation *, size_t> &operationId) {
+    size_t fallbackEnd = operationId.size();
+    operation->walk([&](tle::RemotePointersOp remote) {
+      llvm::SmallPtrSet<Operation *, 4> allocOps;
+      llvm::DenseSet<Value> visited;
+      collectRemotePointerSourceAllocs(remote.getSrc(), allocOps, visited);
+      if (allocOps.empty())
+        return;
+
+      Operation *sync = findNextDistributedBarrier(remote.getOperation());
+      // A remote pointer exposes this CTA's shared allocation to peer CTAs.
+      // SSA liveness only sees the local pointer construction, so keep the
+      // backing allocation unavailable for scratch reuse until cluster peers
+      // have reached the next distributed barrier.
+      size_t syncEnd = fallbackEnd;
+      if (sync) {
+        auto syncIt = operationId.find(sync);
+        if (syncIt != operationId.end())
+          syncEnd = syncIt->second + 1;
+      }
+      for (Operation *allocOp : allocOps) {
+        for (Value result : allocOp->getResults()) {
+          auto bufferIt = allocation->valueBuffer.find(result);
+          if (bufferIt == allocation->valueBuffer.end())
+            continue;
+          auto *buffer = bufferIt->second;
+          auto rangeIt = bufferRange.find(buffer);
+          if (rangeIt == bufferRange.end())
+            continue;
+          auto range = rangeIt->second;
+          if (syncEnd > range.end())
+            rangeIt->second = Interval<size_t>(range.start(), syncEnd);
+        }
+      }
+    });
+  }
+#endif
 
   void dumpBuffers() const {
     LDBG("Dump bufferRange: id size offset ---------");

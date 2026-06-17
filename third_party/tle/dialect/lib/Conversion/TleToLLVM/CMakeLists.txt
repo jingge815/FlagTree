@@ -6,6 +6,7 @@ add_triton_library(TleToLLVM
     LocalPointersOpToLLVM.cpp
     PackOpToLLVM.cpp
     RemotePointerUtils.cpp
+    TaskSchedulerOpToLLVM.cpp
     TMAStoreCommitGroupOpToLLVM.cpp
     ViewOpToLLVM.cpp
     WGMMAFenceOpToLLVM.cpp
