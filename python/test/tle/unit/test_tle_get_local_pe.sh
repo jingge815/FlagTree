@@ -12,7 +12,10 @@ else
     echo "NCCL debug information disabled."
 fi
 #export FLAGCX_SOCKET_IFNAME=eth0
-export FLAGCX_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_8,mlx5_9
+export FLAGCX_SOCKET_IFNAME=ibp186s0f1
+#export FLAGCX_IB_HCA=mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_6,mlx5_7,mlx5_8,mlx5_9
+export FLAGCX_IB_HCA=mlx5
+export FLAGCX_IB_GID_INDEX=0
 export FLAGCX_USE_HETERO_COMM=1
 export FLAGCX_MEM_ENABLE=1
 export FLAGCX_VMM_ENABLE=0
@@ -23,14 +26,14 @@ export CUDA_VISIBLE_DEVICES=2,3
 #export LD_PRELOAD=/usr/local/nccl/build/lib/libnccl.so
 #export TORCH_DISTRIBUTED_DETAIL=DEBUG
 #pytest  FlagTree/python/test/tle/unit/test_tle_distributed_d2d.py
-export NCCL_DEBUG=INFO
-export CUDA_LAUNCH_BLOCKING=1
-export TORCH_USE_CUDA_DSA=1
-export NCCL_NVLS_ENABLE=0
-export FLAGCX_DMABUF_ENABLE=1
-export FLAGCX_DEBUG=TRACE
-export FLAGCX_DEBUG_SUBSY
-export NCCL_DEBUG_SUBSYS=all
+# export NCCL_DEBUG=INFO
+# export CUDA_LAUNCH_BLOCKING=1
+# export TORCH_USE_CUDA_DSA=1
+# export NCCL_NVLS_ENABLE=0
+# export FLAGCX_DMABUF_ENABLE=0
+# export FLAGCX_DEBUG=TRACE
+# export FLAGCX_DEBUG_SUBSY
+# export NCCL_DEBUG_SUBSYS=all
 
 run_test() {
     local script_dir

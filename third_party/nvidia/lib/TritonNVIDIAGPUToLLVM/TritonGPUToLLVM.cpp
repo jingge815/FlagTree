@@ -111,7 +111,6 @@ public:
           return hasLegalRegions && typeConverter.isLegal(op);
         });
     addLegalOp<tle::RemotePointersOp>();
-    addLegalOp<tle::GetLocalPeOp>();
     // Allow non-TLE ops to remain during this partial conversion.
     markUnknownOpDynamicallyLegal([](Operation *) -> bool { return true; });
   }
@@ -177,9 +176,9 @@ struct ConvertTritonGPUToLLVM
       mlir::triton::tle::populateDistributedBarrierOpToLLVMPatterns(
           typeConverter, patterns, benefit);
       mlir::triton::tle::populateGetLocalPeOpToLLVMPatterns(typeConverter,
-                                                            patterns, benefit);
+                                                            patterns, benefit + 1);
       mlir::triton::tle::populateGetNumPesOpToLLVMPatterns(typeConverter,
-                                                           patterns, benefit);
+                                                           patterns, benefit + 1);
       mlir::triton::tle::populateLocalPointersOpToLLVMPatterns(
           typeConverter, targetInfo, patterns, benefit);
       mlir::triton::tle::populateExtractTileOpToLLVMPatterns(

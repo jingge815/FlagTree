@@ -7,9 +7,9 @@ DEVICE_MESH = tle.device_mesh(tle.MeshConfig(device=2))
 
 
 @triton.jit
-def _remote_peer_d2d_kernel(in_ptr, out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
+def _remote_peer_d2d_kernel(dev_comm_dptr, dev_mem_dptr, out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
 
-    remote_mem = tle.remote(in_ptr, space="device", dtype=tl.float32, shard_id=0)
+    remote_mem = tle.remote(dev_mem_dptr, space="device", dtype=tl.float32, shard_id=0)
     x = tl.load(remote_mem)
     tl.store(out_ptr, x)
 
@@ -26,10 +26,12 @@ class TestDeviceToDevice:
             x = torch.randn((N, N), dtype=torch.float32, device="cuda")
         y = torch.empty_like(x)
 
-        dis_tensor_ptr = tle.create_comm_tensor(x)
+        dev_comm_dptr,  dev_mem_dptr = tle.create_comm_tensor(x)
+
 
         compiled = _remote_peer_d2d_kernel.warmup(
-            in_ptr=dis_tensor_ptr,
+            dev_comm_dptr=dev_comm_dptr,
+            dev_mem_dptr=dev_mem_dptr,
             out_ptr=y,
             mesh=DEVICE_MESH,
             BLOCK=block,
@@ -40,7 +42,8 @@ class TestDeviceToDevice:
         assert "remote_pointers" in compiled.asm["ttgir"]
         assert "flagcxGetIntraPointerC" in compiled.asm['ptx']
 
-        _remote_peer_d2d_kernel[(grid, )](in_ptr=dis_tensor_ptr, out_ptr=y, mesh=DEVICE_MESH, BLOCK=block)
+        _remote_peer_d2d_kernel[(grid, )](dev_comm_dptr=dev_comm_dptr,
+            dev_mem_dptr=dev_mem_dptr, out_ptr=y, mesh=DEVICE_MESH, BLOCK=block)
 
         tle.cleanup_communicator()
 

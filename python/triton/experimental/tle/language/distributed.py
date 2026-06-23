@@ -27,12 +27,27 @@ def _as_positive_int(value: Any, label: str) -> int:
     return value
 
 
+@tl.builtin
+def signal(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
+    builder = _semantic.builder
+    ret_ir_ty = ret_dtype.to_ir(builder)
+    result = builder.get_n_pes(ret_ir_ty, dev_mem_ptr)
+    return tl.tensor(result, ret_dtype)
+
+@tl.builtin
+def wait(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
+    builder = _semantic.builder
+    ret_ir_ty = ret_dtype.to_ir(builder)
+    result = builder.get_n_pes(ret_ir_ty, dev_mem_ptr)
+    return tl.tensor(result, ret_dtype)
+
+
 # Get the current device id
 @tl.builtin
 def my_pe(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
     builder = _semantic.builder
     ret_ir_ty = ret_dtype.to_ir(builder)
-    result = builder.get_my_pe(ret_ir_ty, dev_mem_ptr)
+    result = builder.get_my_pe(ret_ir_ty, dev_mem_ptr.handle)
     return tl.tensor(result, ret_dtype)
 
 
@@ -41,7 +56,7 @@ def my_pe(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
 def n_pes(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
     builder = _semantic.builder
     ret_ir_ty = ret_dtype.to_ir(builder)
-    result = builder.get_n_pes(ret_ir_ty, dev_mem_ptr)
+    result = builder.get_n_pes(ret_ir_ty, dev_mem_ptr.handle)
     return tl.tensor(result, ret_dtype)
 
 

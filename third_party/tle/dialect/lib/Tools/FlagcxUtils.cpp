@@ -13,6 +13,7 @@ using namespace mlir;
 static const llvm::StringMap<StringRef> runtimeNames = {
     {"getLocalPeFunction", "flagcxDevCommGetIntraRank"},
     {"getNumPesFunction", "flagcxDevCommGetIntraSize"},
+    {"getReadSignalFunction", "flagcxDevNetReadSignal"}
 };
 
 static inline LLVM::LLVMFuncOp createFuncInstance(const char *funcName,
@@ -31,7 +32,7 @@ static inline LLVM::LLVMFuncOp createFuncInstance(const char *funcName,
   return func;
 }
 
-Value getFlagcxMemPtr(mlir::Location loc, ConversionPatternRewriter &rewriter,
+static inline Value getFlagcxMemPtr(mlir::Location loc, ConversionPatternRewriter &rewriter,
                       Value memPtrInt) {
   auto ctx = rewriter.getContext();
   auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
@@ -39,6 +40,25 @@ Value getFlagcxMemPtr(mlir::Location loc, ConversionPatternRewriter &rewriter,
 }
 
 LLVM::CallOp getNumPesFunCall(mlir::Location loc,
+                              ConversionPatternRewriter &rewriter,
+                              Value memPtrInt) {
+  auto ctx = rewriter.getContext();
+  ModuleOp module =
+      rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
+
+  auto PtrTy = LLVM::LLVMPointerType::get(ctx, 1);
+  auto i32Ty = IntegerType::get(ctx, 32);
+  auto func = createFuncInstance(
+      runtimeNames.lookup("getNumPesFunction").data(), module, {PtrTy}, i32Ty);
+
+  auto comm_dev_ptr = getFlagcxMemPtr(loc, rewriter, memPtrInt);
+  return rewriter.create<LLVM::CallOp>(
+      loc, TypeRange{func.getFunctionType().getReturnType()},
+      FlatSymbolRefAttr::get(func), ValueRange{comm_dev_ptr});
+}
+
+
+LLVM::CallOp getReadSignalFunCall(mlir::Location loc,
                               ConversionPatternRewriter &rewriter,
                               Value memPtrInt) {
   auto ctx = rewriter.getContext();

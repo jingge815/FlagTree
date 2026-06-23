@@ -7,16 +7,12 @@ DEVICE_MESH = tle.device_mesh(tle.MeshConfig(device=2))
 
 
 @triton.jit
-def _tle_local_pe_kernel(in_ptr, out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
+def _tle_local_pe_kernel(dev_comm_dptr, dev_mem_dptr , out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
-    local_rank = tle.my_pe(in_ptr)
-    n_rank = tle.n_pes(in_ptr)
+    local_rank = tle.my_pe(dev_comm_dptr)
+    n_rank = tle.n_pes(dev_comm_dptr)
     peer = (local_rank + 1) % n_rank
-    peer_ptr = tle.remote(in_ptr, space="device", shard_id=peer)
-    tl.static_print("local_rank", local_rank)
-    val = tl.load(peer_ptr)
 
-    tl.store(out_ptr + pid, val)
 
 
 class TestLocalPeCount:
@@ -28,11 +24,11 @@ class TestLocalPeCount:
         with torch.cuda.use_mem_pool(tle.get_mem_pool()):
             x = torch.randn((N, N), dtype=torch.float32, device="cuda")
         y = torch.empty_like(x)
-
-        dis_tensor_ptr = tle.create_comm_tensor(x)
+        dev_comm_dptr,  dev_mem_dptr = tle.create_comm_tensor(x)
 
         compiled = _tle_local_pe_kernel.warmup(
-            in_ptr=dis_tensor_ptr,
+            dev_comm_dptr=dev_comm_dptr,
+            dev_mem_dptr=dev_mem_dptr,
             out_ptr=y,
             mesh=DEVICE_MESH,
             BLOCK=block,
@@ -40,10 +36,14 @@ class TestLocalPeCount:
             num_ctas=1,
             num_warps=4,
         )
-        assert "remote_pointers" in compiled.asm["ttgir"]
-        assert "flagcxGetIntraPointerC" in compiled.asm['ptx']
+        assert "get_local_pe" in compiled.asm["ttgir"]
+        assert "get_num_pes" in compiled.asm["ttgir"]
 
-        _tle_local_pe_kernel[(grid, )](in_ptr=dis_tensor_ptr, out_ptr=y, mesh=DEVICE_MESH, BLOCK=block)
+        _tle_local_pe_kernel[(grid, )](
+            dev_comm_dptr=dev_comm_dptr,
+            dev_mem_dptr=dev_mem_dptr, out_ptr=y, mesh=DEVICE_MESH, BLOCK=block)
+
+        tle.cleanup_communicator()
 
 
 TestLocalPeCount().test_tle_local_pe_kernel()

@@ -28,17 +28,18 @@ struct GetNumPesOpConversion : public ConvertOpToLLVMPattern<tle::GetNumPesOp> {
   LogicalResult
   matchAndRewrite(tle::GetNumPesOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    auto reportFailure = [&](StringRef msg) -> LogicalResult {
+      llvm::errs() << "[GetNumPesOpConversion] " << msg << "\n";
+      return failure();
+    };
     auto loc = op.getLoc();
     auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
     auto getLocalPeCall = tle::getNumPesFunCall(loc, rewriter, srcElems[0]);
 
-    Value n_pes = getLocalPeCall.getResult();
-    rewriter.replaceOp(op, n_pes);
-    return success();
-
-    op.dump();
-
-    llvm::errs() << "[GetLocalPeOpConversion]";
+    Value nPes = getLocalPeCall.getResult();
+    if (!nPes.getType().isInteger(32))
+      return reportFailure("expected i32 result");
+    rewriter.replaceOp(op, nPes);
     return success();
   }
 };
@@ -52,17 +53,20 @@ struct GetLocalPeOpConversion
   LogicalResult
   matchAndRewrite(tle::GetLocalPeOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+
+    auto reportFailure = [&](StringRef msg) -> LogicalResult {
+      llvm::errs() << "[GetLocalPeOpConversion] " << msg << "\n";
+      return failure();
+    };
     auto loc = op.getLoc();
     auto srcElems = unpackLLElements(loc, adaptor.getSrc(), rewriter);
     auto getLocalPeCall = tle::getLocalPeFuncCall(loc, rewriter, srcElems[0]);
 
-    Value my_pe = getLocalPeCall.getResult();
-    rewriter.replaceOp(op, my_pe);
-    return success();
+    Value localPe = getLocalPeCall.getResult();
+    if (!localPe.getType().isInteger(32))
+      return reportFailure("expected i32 result");
+    rewriter.replaceOp(op, localPe);
 
-    op.dump();
-
-    llvm::errs() << "[GetLocalPeOpConversion]";
     return success();
   }
 };
