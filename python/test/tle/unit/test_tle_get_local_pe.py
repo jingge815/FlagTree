@@ -7,12 +7,11 @@ DEVICE_MESH = tle.device_mesh(tle.MeshConfig(device=2))
 
 
 @triton.jit
-def _tle_local_pe_kernel(dev_comm_dptr, dev_mem_dptr , out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
+def _tle_local_pe_kernel(dev_comm_dptr, dev_mem_dptr, out_ptr, mesh: tl.constexpr, BLOCK: tl.constexpr):
     pid = tl.program_id(0)
     local_rank = tle.my_pe(dev_comm_dptr)
     n_rank = tle.n_pes(dev_comm_dptr)
     peer = (local_rank + 1) % n_rank
-
 
 
 class TestLocalPeCount:
@@ -24,7 +23,7 @@ class TestLocalPeCount:
         with torch.cuda.use_mem_pool(tle.get_mem_pool()):
             x = torch.randn((N, N), dtype=torch.float32, device="cuda")
         y = torch.empty_like(x)
-        dev_comm_dptr,  dev_mem_dptr = tle.create_comm_tensor(x)
+        dev_comm_dptr, dev_mem_dptr = tle.create_comm_tensor(x)
 
         compiled = _tle_local_pe_kernel.warmup(
             dev_comm_dptr=dev_comm_dptr,
@@ -39,9 +38,8 @@ class TestLocalPeCount:
         assert "get_local_pe" in compiled.asm["ttgir"]
         assert "get_num_pes" in compiled.asm["ttgir"]
 
-        _tle_local_pe_kernel[(grid, )](
-            dev_comm_dptr=dev_comm_dptr,
-            dev_mem_dptr=dev_mem_dptr, out_ptr=y, mesh=DEVICE_MESH, BLOCK=block)
+        _tle_local_pe_kernel[(grid, )](dev_comm_dptr=dev_comm_dptr, dev_mem_dptr=dev_mem_dptr, out_ptr=y,
+                                       mesh=DEVICE_MESH, BLOCK=block)
 
         tle.cleanup_communicator()
 

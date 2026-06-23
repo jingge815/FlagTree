@@ -34,6 +34,7 @@ def signal(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
     result = builder.get_n_pes(ret_ir_ty, dev_mem_ptr)
     return tl.tensor(result, ret_dtype)
 
+
 @tl.builtin
 def wait(dev_mem_ptr, _semantic=None, ret_dtype=tl.int32):
     builder = _semantic.builder
