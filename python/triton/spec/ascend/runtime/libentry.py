@@ -33,27 +33,17 @@ import weakref
 import ast
 from collections import OrderedDict
 from typing import (
-    Any,
-    Callable,
     Dict,
-    Final,
-    Iterator,
-    List,
     Optional,
-    Tuple,
-    Type,
-    Union,
-    overload,
 )
 
 import triton
-from triton._C import libentryC
 import torch
-import torch_npu
+import torch_npu  # noqa: F401
 
 torch_device_fn = torch.npu
 
-from .code_cache import config_cache_dir
+from .code_cache import config_cache_dir  # noqa: E402
 
 DEVICE_COUNT = torch_device_fn.device_count()
 version = triton.__version__.split(".")

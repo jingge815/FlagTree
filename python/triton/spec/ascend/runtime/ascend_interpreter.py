@@ -534,7 +534,7 @@ class AscendInterpreterBuilder(InterpreterBuilder):
         # Convert src_stride, start_offset, end_offset to integers
         src_stride_vals = [self.to_int_val(s) for s in src_stride]
         start_offset_vals = [self.to_int_val(s) for s in start_offset]
-        end_offset_vals = [self.to_int_val(s) for s in end_offset]
+        end_offset_vals = [self.to_int_val(s) for s in end_offset]  # noqa: F841
 
         # Element type
         dtype_tt = src_ptr.get_element_ty()
@@ -604,7 +604,7 @@ class AscendInterpreterBuilder(InterpreterBuilder):
         # Convert dst_stride, start_offset, end_offset to integers
         dst_stride_vals = [self.to_int_val(s) for s in dst_stride]
         start_offset_vals = [self.to_int_val(s) for s in start_offset]
-        end_offset_vals = [self.to_int_val(s) for s in end_offset]
+        end_offset_vals = [self.to_int_val(s) for s in end_offset]  # noqa: F841
 
         # Element type
         dtype_tt = dst_ptr.get_element_ty()
@@ -616,7 +616,7 @@ class AscendInterpreterBuilder(InterpreterBuilder):
         index_rank = len(index_shape)
         total_elements = np.prod(index_shape)
         flat_values = value_tensor.data.flatten()
-        flat_indices = index_tensor.data.flatten()
+        flat_indices = index_tensor.data.flatten()  # noqa: F841
 
         # Generate  coordinates
         all_coords = []
@@ -730,7 +730,7 @@ class AscendInterpreterBuilder(InterpreterBuilder):
 
     def create_annotation_mark(self, ptr_data, hint_name: str, hint_val):
         if hint_name == "overflow_mode":
-            raise ValueError(f"overflow_mode is not supported in interpreter mode, may have accuracy issues")
+            raise ValueError("overflow_mode is not supported in interpreter mode, may have accuracy issues")
         else:
             warnings.warn(f"compile_hint '{hint_name}' is not supported in interpreter mode, just pass it", UserWarning,
                           stacklevel=2)
