@@ -9,6 +9,8 @@ import triton.experimental.tle.language.gpu as tle_gpu
 
 DEVICE = triton.runtime.driver.active.get_active_torch_device()
 
+CU_FILE = Path(__file__).parent / "03-matrix-multiplication.cu"
+
 
 def get_autotune_config():
     return [
@@ -56,14 +58,19 @@ def get_autotune_config():
     ]
 
 
-@dialect(name="cuda", file=Path(__file__).parent / "03-matrix-multiplication.cu")
-def edsl(*args, **kwargs):
+@dialect(name="cuda", file=CU_FILE, extern_func_name="MatMul", deferred=True)
+def edsl_deferred(*args, **kwargs):
+    ...
+
+
+@dialect(name="cuda", file=CU_FILE)
+def edsl_eager(*args, **kwargs):
     ...
 
 
 @triton.autotune(
     configs=get_autotune_config(),
-    key=["M", "N", "K"],
+    key=["M", "N", "K", "DEFERRED"],
 )
 @triton.jit
 def matmul_kernel(
@@ -84,6 +91,7 @@ def matmul_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE_M: tl.constexpr,
     ACTIVATION: tl.constexpr,
+    DEFERRED: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
@@ -121,7 +129,10 @@ def matmul_kernel(
         b_smem = tle_gpu.alloc(shape=[BLOCK_SIZE_K, BLOCK_SIZE_N], dtype=tl.float16, layout=None, scope=tle_gpu.smem,
                                nv_mma_shared_layout=False)
         tle_gpu.copy(b_ptrs, b_smem, shape=[BLOCK_SIZE_K, BLOCK_SIZE_N])
-        acc_smem = tle_raw.call_smem(edsl, [acc_smem, a_smem, b_smem])
+        if DEFERRED:
+            acc_smem = tle_raw.call_smem(edsl_deferred, [acc_smem, a_smem, b_smem], output_indices=[0])
+        else:
+            acc_smem = tle_raw.call_smem(edsl_eager, [acc_smem, a_smem, b_smem])
         a_ptrs += BLOCK_SIZE_K * stride_ak
         b_ptrs += BLOCK_SIZE_K * stride_bk
     acc = tl.load(acc_ptrs)
@@ -140,7 +151,7 @@ def leaky_relu(x):
     return tl.where(x >= 0, x, 0.01 * x)
 
 
-def matmul(a, b, activation=""):
+def matmul(a, b, activation="", *, deferred=False):
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.is_contiguous(), "Matrix A must be contiguous"
     M, K = a.shape
@@ -162,17 +173,25 @@ def matmul(a, b, activation=""):
         c.stride(0),
         c.stride(1),
         ACTIVATION=activation,
+        DEFERRED=deferred,
     )
     return c
+
+
+def run_case(*, deferred: bool, a: torch.Tensor, b: torch.Tensor) -> None:
+    mode = "deferred" if deferred else "eager"
+    edsl = edsl_deferred if deferred else edsl_eager
+    print(f"--- tle_raw mode={mode} ---")
+    print(f"edsl.deferred={edsl.deferred}")
+    triton_output = matmul(a, b, deferred=deferred)
+    torch_output = torch.matmul(a, b)
+    torch.testing.assert_close(triton_output, torch_output, atol=1e-2, rtol=0)
+    print(f"{mode}: OK")
 
 
 if __name__ == "__main__":
     torch.manual_seed(0)
     a = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
     b = torch.rand((512, 512), device=DEVICE, dtype=torch.float16) - 0.5
-    triton_output = matmul(a, b)
-    torch_output = torch.matmul(a, b)
-    print(f"triton_output_with_fp16_inputs={triton_output}")
-    print(f"torch_output_with_fp16_inputs={torch_output}")
-
-    torch.testing.assert_close(triton_output, torch_output, atol=1e-2, rtol=0)
+    for deferred in (False, True):
+        run_case(deferred=deferred, a=a, b=b)

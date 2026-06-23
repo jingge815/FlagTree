@@ -266,9 +266,13 @@ def Tle_GetLocalPeOp : Tle_Op<"get_local_pe"> {
 }
 
 def Tle_DSLRegionOp : Tle_Op<"dsl_region", [IsolatedFromAbove, MemDescViewTrait,
-                                            RecursiveMemoryEffects]> {
+                                            DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let arguments = (ins
-    Variadic<Tle_ArgType>:$inputs
+    Variadic<Tle_ArgType>:$inputs,
+    StrAttr:$region_dialect,
+    StrAttr:$arg_dialect,
+    DenseI32ArrayAttr:$output_operand_indices,
+    OptionalAttr<StrAttr>:$hint
   );
   let results = (outs Variadic<Tle_ArgType>:$outputs);
   let regions = (region AnyRegion:$body);
