@@ -44,7 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--tle-prefill-block-n", type=int, default=64)
+    parser.add_argument("--tle-prefill-block-n", type=int, default=128)
     parser.add_argument("--tle-decode-block-n", type=int, default=128)
     parser.add_argument("--decode-num-split", type=int, default=16)
     parser.add_argument("--tilelang-prefill-config", choices=("default", "aligned"), default="aligned")

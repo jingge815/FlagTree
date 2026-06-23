@@ -8,7 +8,7 @@ import triton.language as tl
 import triton.experimental.tle.language as tle
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from ._common import cdiv, mha_config, next_power_of_2, require_cuda_contiguous
+from ._common import cdiv, next_power_of_2, require_cuda_contiguous
 
 
 def _attention_prune_configs(configs, named_args, **kwargs):
@@ -18,14 +18,26 @@ def _attention_prune_configs(configs, named_args, **kwargs):
         block_n = config.kwargs["BLOCK_N"]
         if kv_len <= 64 and block_n > 64:
             continue
+        if kv_len > 64 and block_n != 128:
+            continue
         pruned.append(config)
     return pruned or configs[:1]
 
 
-_ATTENTION_WS_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 32, "PIPE_CAPACITY": 2}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "PIPE_CAPACITY": 2}, num_warps=4, num_stages=1),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "PIPE_CAPACITY": 2}, num_warps=4, num_stages=1),
+def _attention_ws_tma_pre_hook(nargs):
+    if "k_desc" not in nargs:
+        return
+    block_n = nargs["BLOCK_N"]
+    block_d = nargs["BLOCK_D"]
+    nargs["k_desc"].block_shape = [1, 1, block_n, block_d]
+    nargs["v_desc"].block_shape = [1, 1, block_n, block_d]
+
+
+_ATTENTION_WS_PACKGQA_TMA_AUTOTUNE_CONFIGS = [
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "PIPE_CAPACITY": 2}, num_warps=4, num_stages=2,
+                  pre_hook=_attention_ws_tma_pre_hook),
+    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "PIPE_CAPACITY": 2}, num_warps=4, num_stages=2,
+                  pre_hook=_attention_ws_tma_pre_hook),
 ]
 
 
@@ -35,11 +47,11 @@ def _attention_decode_tma_pre_hook(nargs):
     block_h = nargs["BLOCK_H"]
     valid_block_h = nargs["VALID_BLOCK_H"]
     block_n = nargs["BLOCK_N"]
-    half_block_d = nargs["BLOCK_D"] // 2
-    nargs["q_desc"].block_shape = [1, block_h, half_block_d]
-    nargs["k_desc"].block_shape = [1, 1, block_n, half_block_d]
-    nargs["v_desc"].block_shape = [1, 1, block_n, half_block_d]
-    nargs["out_desc"].block_shape = [1, valid_block_h, half_block_d]
+    block_d = nargs["BLOCK_D"]
+    nargs["q_desc"].block_shape = [1, block_h, block_d]
+    nargs["k_desc"].block_shape = [1, 1, block_n, block_d]
+    nargs["v_desc"].block_shape = [1, 1, block_n, block_d]
+    nargs["out_desc"].block_shape = [1, valid_block_h, block_d]
 
 
 _ATTENTION_DECODE_AUTOTUNE_CONFIGS = [
@@ -51,50 +63,104 @@ _ATTENTION_DECODE_AUTOTUNE_CONFIGS = [
 
 
 @triton.jit
-def _attention_ws_producer(
-    kv_writer,
-    k_cache,
-    v_cache,
+def _attention_ws_packgqa_tma_producer(
+    q_writer,
+    k_writer,
+    v_writer,
+    q,
+    k_desc,
+    v_desc,
     batch,
-    q_head,
-    MAX_SEQ_LEN: tl.constexpr,
+    kv_head,
+    packed_m_block,
+    Q_LEN,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
+    START_POS,
     KV_LEN,
+    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    group: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
-    kv_head = q_head // group
+    Q_PER_KV: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
+    HALF_M: tl.constexpr = BLOCK_M // 2
     offs_d = tl.arange(0, BLOCK_D)
-    rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, BLOCK_D))
-    cols = tl.broadcast_to(tl.arange(0, BLOCK_D)[None, :], (BLOCK_N, BLOCK_D))
+    q_rows = tl.broadcast_to(tl.arange(0, HALF_M)[:, None], (HALF_M, BLOCK_D))
+    q_cols = tl.broadcast_to(tl.arange(0, BLOCK_D)[None, :], (HALF_M, BLOCK_D))
     mask_d = offs_d < HEAD_DIM
+    packed_start = packed_m_block * BLOCK_M
+    packed_stop = tl.minimum(packed_start + BLOCK_M, Q_LEN * Q_PER_KV)
+    max_q_token = (packed_stop - 1) // Q_PER_KV
+    max_key = tl.minimum(KV_LEN, START_POS + max_q_token + 1)
+    n_block_max = tl.cdiv(max_key, BLOCK_N)
 
-    for n0 in tl.range(0, KV_LEN, BLOCK_N):
-        tile = n0 // BLOCK_N
-        slot = kv_writer.acquire(tile)
-        offs_n = n0 + tl.arange(0, BLOCK_N)
-        load_mask = (offs_n[:, None] < KV_LEN) & mask_d[None, :]
-        cache_offsets = ((batch * MAX_SEQ_LEN + offs_n[:, None]) * NUM_KV_HEADS + kv_head) * HEAD_DIM + offs_d[
-            None, :]
-        k_vals = tl.load(k_cache + cache_offsets, mask=load_mask, other=0.0)
-        v_vals = tl.load(v_cache + cache_offsets, mask=load_mask, other=0.0)
-        tl.store(tle.gpu.local_ptr(slot.k, (rows, cols)), k_vals, mask=load_mask)
-        tl.store(tle.gpu.local_ptr(slot.v, (rows, cols)), v_vals, mask=load_mask)
-        kv_writer.commit(tile)
+    zero = tl.full((), 0, tl.int32)
+    one = tl.full((), 1, tl.int32)
+    q_slot = q_writer.acquire(0)
+    q_smem_lo = q_slot.q.slot(zero)
+    q_smem_hi = q_slot.q.slot(one)
+    offs_packed_lo = packed_start + tl.arange(0, HALF_M)
+    q_token_lo = offs_packed_lo // Q_PER_KV
+    q_in_group_lo = offs_packed_lo - q_token_lo * Q_PER_KV
+    q_head_lo = kv_head * Q_PER_KV + q_in_group_lo
+    q_mask_lo = offs_packed_lo < Q_LEN * Q_PER_KV
+    token_offsets_lo = batch * Q_LEN + q_token_lo
+    q_ptrs_lo = q + (token_offsets_lo[:, None] * NUM_Q_HEADS + q_head_lo[:, None]) * HEAD_DIM + offs_d[None, :]
+    if HEAD_DIM == BLOCK_D:
+        q_vals_lo = tl.load(q_ptrs_lo, mask=q_mask_lo[:, None], other=0.0)
+    else:
+        q_vals_lo = tl.load(q_ptrs_lo, mask=q_mask_lo[:, None] & mask_d[None, :], other=0.0)
+    tl.store(tle.gpu.local_ptr(q_smem_lo, (q_rows, q_cols)), q_vals_lo)
+
+    offs_packed_hi = packed_start + HALF_M + tl.arange(0, HALF_M)
+    q_token_hi = offs_packed_hi // Q_PER_KV
+    q_in_group_hi = offs_packed_hi - q_token_hi * Q_PER_KV
+    q_head_hi = kv_head * Q_PER_KV + q_in_group_hi
+    q_mask_hi = offs_packed_hi < Q_LEN * Q_PER_KV
+    token_offsets_hi = batch * Q_LEN + q_token_hi
+    q_ptrs_hi = q + (token_offsets_hi[:, None] * NUM_Q_HEADS + q_head_hi[:, None]) * HEAD_DIM + offs_d[None, :]
+    if HEAD_DIM == BLOCK_D:
+        q_vals_hi = tl.load(q_ptrs_hi, mask=q_mask_hi[:, None], other=0.0)
+    else:
+        q_vals_hi = tl.load(q_ptrs_hi, mask=q_mask_hi[:, None] & mask_d[None, :], other=0.0)
+    tl.store(tle.gpu.local_ptr(q_smem_hi, (q_rows, q_cols)), q_vals_hi)
+    q_writer.commit(0)
+
+    n_block = n_block_max - 1
+    n0 = n_block * BLOCK_N
+    k_slot = k_writer.acquire(0)
+    tle.gpu.copy(k_desc, k_slot.k, [1, 1, BLOCK_N, BLOCK_D], [batch, kv_head, n0, 0])
+    k_writer.commit(0)
+
+    for tile in tl.range(1, n_block_max):
+        n_block = n_block_max - 1 - tile
+        n0 = n_block * BLOCK_N
+        k_slot = k_writer.acquire(tile)
+        tle.gpu.copy(k_desc, k_slot.k, [1, 1, BLOCK_N, BLOCK_D], [batch, kv_head, n0, 0])
+        k_writer.commit(tile)
+
+        v_tile = tile - 1
+        v_n0 = n0 + BLOCK_N
+        v_slot = v_writer.acquire(v_tile)
+        tle.gpu.copy(v_desc, v_slot.v, [1, 1, BLOCK_N, BLOCK_D], [batch, kv_head, v_n0, 0])
+        v_writer.commit(v_tile)
+
+    v_tile = n_block_max - 1
+    v_slot = v_writer.acquire(v_tile)
+    tle.gpu.copy(v_desc, v_slot.v, [1, 1, BLOCK_N, BLOCK_D], [batch, kv_head, 0, 0])
+    v_writer.commit(v_tile)
 
 
 @triton.jit
-def _attention_ws_consumer(
-    kv_reader,
-    q,
-    q_smem,
+def _attention_ws_packgqa_consumer(
+    q_reader,
+    k_reader,
+    v_reader,
     out,
     batch,
-    q_head,
-    m_block,
+    kv_head,
+    packed_m_block,
     Q_LEN,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
@@ -108,62 +174,112 @@ def _attention_ws_consumer(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    offs_m = m_block * BLOCK_M + ROW_OFFSET + tl.arange(0, ROWS_M)
+    Q_PER_KV: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
+    offs_packed = packed_m_block * BLOCK_M + ROW_OFFSET + tl.arange(0, ROWS_M)
+    q_token = offs_packed // Q_PER_KV
+    q_in_group = offs_packed - q_token * Q_PER_KV
+    q_head = kv_head * Q_PER_KV + q_in_group
     offs_d = tl.arange(0, BLOCK_D)
     q_rows = tl.broadcast_to(tl.arange(0, ROWS_M)[:, None], (ROWS_M, BLOCK_D))
     q_cols = tl.broadcast_to(tl.arange(0, BLOCK_D)[None, :], (ROWS_M, BLOCK_D))
     kv_rows = tl.broadcast_to(tl.arange(0, BLOCK_N)[:, None], (BLOCK_N, BLOCK_D))
     kv_cols = tl.broadcast_to(tl.arange(0, BLOCK_D)[None, :], (BLOCK_N, BLOCK_D))
-    q_mask = offs_m < Q_LEN
+    q_mask = offs_packed < Q_LEN * Q_PER_KV
     mask_d = offs_d < HEAD_DIM
+    zero = tl.full((), 0, tl.int32)
+    Q_PART: tl.constexpr = ROW_OFFSET // ROWS_M
+    q_part = tl.full((), Q_PART, tl.int32)
 
-    token_offsets = batch * Q_LEN + offs_m
-    q_ptrs = q + (token_offsets[:, None] * NUM_Q_HEADS + q_head) * HEAD_DIM + offs_d[None, :]
-    q_vals = tl.load(q_ptrs, mask=q_mask[:, None] & mask_d[None, :], other=0.0)
-    q_smem_ptrs = tle.gpu.local_ptr(q_smem, (q_rows, q_cols))
-    tl.store(q_smem_ptrs, q_vals, mask=q_mask[:, None] & mask_d[None, :])
-    q_vals = tl.load(q_smem_ptrs, mask=q_mask[:, None] & mask_d[None, :], other=0.0)
+    token_offsets = batch * Q_LEN + q_token
+    q_wait = q_reader.wait(0)
+    q_tile = q_wait.slot.q.slot(q_part)
+    q_tile_ptrs = tle.gpu.local_ptr(q_tile, (q_rows, q_cols))
+    q_vals = tl.load(q_tile_ptrs)
+    q_reader.release(0)
+    packed_start = packed_m_block * BLOCK_M
+    packed_stop = tl.minimum(packed_start + BLOCK_M, Q_LEN * Q_PER_KV)
+    min_q_token = packed_start // Q_PER_KV
+    max_q_token = (packed_stop - 1) // Q_PER_KV
+    max_key = tl.minimum(KV_LEN, START_POS + max_q_token + 1)
+    n_block_max = tl.cdiv(max_key, BLOCK_N)
+    n_block_min_causal_mask = (START_POS + min_q_token) // BLOCK_N
+    causal_mask_tiles = tl.maximum(n_block_max - n_block_min_causal_mask, 0)
+    tail_mask_tiles = tl.where(n_block_max * BLOCK_N > max_key, 1, 0)
+    masked_tiles = tl.minimum(tl.maximum(causal_mask_tiles, tail_mask_tiles), n_block_max)
 
     acc = tl.zeros([ROWS_M, BLOCK_D], dtype=tl.float32)
     m_i = tl.full([ROWS_M], -float("inf"), dtype=tl.float32)
     l_i = tl.zeros([ROWS_M], dtype=tl.float32)
 
-    for n0 in tl.range(0, KV_LEN, BLOCK_N):
-        tile = n0 // BLOCK_N
-        wait = kv_reader.wait(tile)
-        slot = wait.slot
+    for tile in tl.range(0, masked_tiles):
+        n_block = n_block_max - 1 - tile
+        n0 = n_block * BLOCK_N
         offs_n = n0 + tl.arange(0, BLOCK_N)
         key_mask = offs_n < KV_LEN
-        tile_mask = key_mask[:, None] & mask_d[None, :]
-        k_vals = tl.load(tle.gpu.local_ptr(slot.k, (kv_rows, kv_cols)), mask=tile_mask, other=0.0)
-        v_vals = tl.load(tle.gpu.local_ptr(slot.v, (kv_rows, kv_cols)), mask=tile_mask, other=0.0)
 
+        k_wait = k_reader.wait(tile)
+        k_smem = k_wait.slot.k.slot(zero).slot(zero)
+        k_vals = tl.load(tle.gpu.local_ptr(k_smem, (kv_rows, kv_cols)))
         scores = tl.dot(q_vals, tl.trans(k_vals), out_dtype=tl.float32) * SM_SCALE
-        causal_mask = offs_n[None, :] <= (START_POS + offs_m[:, None])
+        k_reader.release(tile)
+
+        causal_mask = offs_n[None, :] <= (START_POS + q_token[:, None])
         scores = tl.where(q_mask[:, None] & key_mask[None, :] & causal_mask, scores, -float("inf"))
-        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        scores_max = tl.max(scores, axis=1)
+        m_new = tl.maximum(m_i, scores_max)
         m_new = tl.where(q_mask, m_new, 0.0)
-        alpha = tl.where(q_mask, tl.exp(m_i - m_new), 0.0)
-        p = tl.where(q_mask[:, None], tl.exp(scores - m_new[:, None]), 0.0)
+        safe_m_new = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.where(q_mask & (m_i != -float("inf")), tl.exp(m_i - safe_m_new), 0.0)
+        safe_scores = tl.where(scores == -float("inf"), safe_m_new[:, None], scores)
+        p = tl.exp(safe_scores - safe_m_new[:, None])
+        p = tl.where(q_mask[:, None] & (scores != -float("inf")), p, 0.0)
+
+        v_wait = v_reader.wait(tile)
+        v_smem = v_wait.slot.v.slot(zero).slot(zero)
+        v_vals = tl.load(tle.gpu.local_ptr(v_smem, (kv_rows, kv_cols)))
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_vals, out_dtype=tl.float32)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         m_i = m_new
-        kv_reader.release(tile)
+        v_reader.release(tile)
+
+    for tile in tl.range(masked_tiles, n_block_max):
+        n_block = n_block_max - 1 - tile
+        n0 = n_block * BLOCK_N
+
+        k_wait = k_reader.wait(tile)
+        k_smem = k_wait.slot.k.slot(zero).slot(zero)
+        k_vals = tl.load(tle.gpu.local_ptr(k_smem, (kv_rows, kv_cols)))
+        scores = tl.dot(q_vals, tl.trans(k_vals), out_dtype=tl.float32) * SM_SCALE
+        k_reader.release(tile)
+
+        m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new[:, None])
+
+        v_wait = v_reader.wait(tile)
+        v_smem = v_wait.slot.v.slot(zero).slot(zero)
+        v_vals = tl.load(tle.gpu.local_ptr(v_smem, (kv_rows, kv_cols)))
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_vals, out_dtype=tl.float32)
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        m_i = m_new
+        v_reader.release(tile)
 
     out_vals = acc / l_i[:, None]
-    out_ptrs = out + (token_offsets[:, None] * NUM_Q_HEADS + q_head) * HEAD_DIM + offs_d[None, :]
-    tl.store(out_ptrs, out_vals.to(out.dtype.element_ty), mask=q_mask[:, None] & mask_d[None, :])
+    o_vals = out_vals.to(out.dtype.element_ty)
+    o_tile_ptrs = q_tile_ptrs
+    tl.store(o_tile_ptrs, o_vals, mask=q_mask[:, None] & mask_d[None, :])
+    o_vals = tl.load(o_tile_ptrs, mask=q_mask[:, None] & mask_d[None, :], other=0.0)
+    out_ptrs = out + (token_offsets[:, None] * NUM_Q_HEADS + q_head[:, None]) * HEAD_DIM + offs_d[None, :]
+    tl.store(out_ptrs, o_vals, mask=q_mask[:, None] & mask_d[None, :])
 
 
 @triton.jit
-def _attention_ws_kernel(
+def _attention_ws_packgqa_tma_kernel(
     q,
-    k_cache,
-    v_cache,
+    k_desc,
+    v_desc,
     out,
-    TOKENS,
     Q_LEN,
-    MAX_SEQ_LEN: tl.constexpr,
     NUM_Q_HEADS: tl.constexpr,
     NUM_KV_HEADS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
@@ -175,32 +291,32 @@ def _attention_ws_kernel(
     BLOCK_D: tl.constexpr,
     PIPE_CAPACITY: tl.constexpr,
 ):
-    m_block = tl.program_id(0)
-    q_head = tl.program_id(1)
+    packed_m_block = tl.program_id(0)
+    kv_head = tl.program_id(1)
     batch = tl.program_id(2)
     HALF_M: tl.constexpr = BLOCK_M // 2
-    q_smem_lo = tle.gpu.alloc([HALF_M, BLOCK_D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem,
-                              nv_mma_shared_layout=False)
-    q_smem_hi = tle.gpu.alloc([HALF_M, BLOCK_D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem,
-                              nv_mma_shared_layout=False)
-    k_smem = tle.gpu.alloc([PIPE_CAPACITY, BLOCK_N, BLOCK_D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem,
-                           nv_mma_shared_layout=False)
-    v_smem = tle.gpu.alloc([PIPE_CAPACITY, BLOCK_N, BLOCK_D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem,
-                           nv_mma_shared_layout=False)
-    kv_pipe = tle.pipe(capacity=PIPE_CAPACITY, scope="cta", name="attention_kv", readers=("lo", "hi"), k=k_smem,
-                       v=v_smem)
+    q_smem = tle.gpu.alloc([1, 2, HALF_M, BLOCK_D], dtype=tl.bfloat16, layout=None, scope=tle.gpu.smem,
+                           nv_mma_shared_layout=True)
+    k_smem = tle.gpu.alloc([PIPE_CAPACITY, 1, 1, BLOCK_N, BLOCK_D], dtype=tl.bfloat16, layout=None,
+                           scope=tle.gpu.smem, nv_mma_shared_layout=True)
+    v_smem = tle.gpu.alloc([PIPE_CAPACITY, 1, 1, BLOCK_N, BLOCK_D], dtype=tl.bfloat16, layout=None,
+                           scope=tle.gpu.smem, nv_mma_shared_layout=True)
+    q_pipe = tle.pipe(capacity=1, scope="cta", name="attention_packgqa_q", readers=("lo", "hi"), one_shot=True,
+                      q=q_smem)
+    k_pipe = tle.pipe(capacity=PIPE_CAPACITY, scope="cta", name="attention_packgqa_k", readers=("lo", "hi"), k=k_smem)
+    v_pipe = tle.pipe(capacity=PIPE_CAPACITY, scope="cta", name="attention_packgqa_v", readers=("lo", "hi"), v=v_smem)
     tle.gpu.warp_specialize(
         [
             (
-                _attention_ws_consumer,
+                _attention_ws_packgqa_consumer,
                 (
-                    kv_pipe.reader(name="lo"),
-                    q,
-                    q_smem_lo,
+                    q_pipe.reader(name="lo"),
+                    k_pipe.reader(name="lo"),
+                    v_pipe.reader(name="lo"),
                     out,
                     batch,
-                    q_head,
-                    m_block,
+                    kv_head,
+                    packed_m_block,
                     Q_LEN,
                     NUM_Q_HEADS,
                     NUM_KV_HEADS,
@@ -216,15 +332,15 @@ def _attention_ws_kernel(
                 ),
             ),
             (
-                _attention_ws_consumer,
+                _attention_ws_packgqa_consumer,
                 (
-                    kv_pipe.reader(name="hi"),
-                    q,
-                    q_smem_hi,
+                    q_pipe.reader(name="hi"),
+                    k_pipe.reader(name="hi"),
+                    v_pipe.reader(name="hi"),
                     out,
                     batch,
-                    q_head,
-                    m_block,
+                    kv_head,
+                    packed_m_block,
                     Q_LEN,
                     NUM_Q_HEADS,
                     NUM_KV_HEADS,
@@ -240,18 +356,24 @@ def _attention_ws_kernel(
                 ),
             ),
             (
-                _attention_ws_producer,
+                _attention_ws_packgqa_tma_producer,
                 (
-                    kv_pipe.writer(),
-                    k_cache,
-                    v_cache,
+                    q_pipe.writer(),
+                    k_pipe.writer(),
+                    v_pipe.writer(),
+                    q,
+                    k_desc,
+                    v_desc,
                     batch,
-                    q_head,
-                    MAX_SEQ_LEN,
+                    kv_head,
+                    packed_m_block,
+                    Q_LEN,
                     NUM_Q_HEADS,
                     NUM_KV_HEADS,
                     HEAD_DIM,
+                    START_POS,
                     KV_LEN,
+                    BLOCK_M,
                     BLOCK_N,
                     BLOCK_D,
                 ),
@@ -262,12 +384,12 @@ def _attention_ws_kernel(
     )
 
 
-_attention_ws_kernel_autotuned = triton.autotune(
-    configs=_ATTENTION_WS_AUTOTUNE_CONFIGS,
+_attention_ws_packgqa_tma_kernel_autotuned = triton.autotune(
+    configs=_ATTENTION_WS_PACKGQA_TMA_AUTOTUNE_CONFIGS,
     key=["Q_LEN", "KV_LEN", "NUM_Q_HEADS", "NUM_KV_HEADS", "HEAD_DIM"],
     prune_configs_by={"early_config_prune": _attention_prune_configs},
     cache_results=True,
-)(_attention_ws_kernel)
+)(_attention_ws_packgqa_tma_kernel)
 
 
 @triton.jit
@@ -286,7 +408,6 @@ def _attention_decode_no_split_producer(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    HALF_D: tl.constexpr = BLOCK_D // 2
     bid = tl.program_id(0)
     hid = tl.program_id(1)
     kv_group_num: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
@@ -294,25 +415,16 @@ def _attention_decode_no_split_producer(
     head_start = hid * VALID_BLOCK_H
 
     q_slot = q_writer.acquire(0)
-    q_lo = q_slot.q.subslice([0, 0], [BLOCK_H, HALF_D])
-    q_hi = q_slot.q.subslice([0, HALF_D], [BLOCK_H, HALF_D])
-    tle.gpu.copy(q_desc, q_lo, [1, BLOCK_H, HALF_D], [bid, head_start, 0])
-    tle.gpu.copy(q_desc, q_hi, [1, BLOCK_H, HALF_D], [bid, head_start, HALF_D])
+    tle.gpu.copy(q_desc, q_slot.q, [1, BLOCK_H, BLOCK_D], [bid, head_start, 0])
     q_writer.commit(0)
 
     for n0 in tl.range(0, REAL_KV_LEN, BLOCK_N):
         tile = n0 // BLOCK_N
         k_slot = k_writer.acquire(tile)
-        k_lo = k_slot.k.subslice([0, 0, 0, 0], [1, 1, BLOCK_N, HALF_D])
-        k_hi = k_slot.k.subslice([0, 0, 0, HALF_D], [1, 1, BLOCK_N, HALF_D])
-        tle.gpu.copy(k_desc, k_lo, [1, 1, BLOCK_N, HALF_D], [bid, kv_head, n0, 0])
-        tle.gpu.copy(k_desc, k_hi, [1, 1, BLOCK_N, HALF_D], [bid, kv_head, n0, HALF_D])
+        tle.gpu.copy(k_desc, k_slot.k, [1, 1, BLOCK_N, BLOCK_D], [bid, kv_head, n0, 0])
         k_writer.commit(tile)
         v_slot = v_writer.acquire(tile)
-        v_lo = v_slot.v.subslice([0, 0, 0, 0], [1, 1, BLOCK_N, HALF_D])
-        v_hi = v_slot.v.subslice([0, 0, 0, HALF_D], [1, 1, BLOCK_N, HALF_D])
-        tle.gpu.copy(v_desc, v_lo, [1, 1, BLOCK_N, HALF_D], [bid, kv_head, n0, 0])
-        tle.gpu.copy(v_desc, v_hi, [1, 1, BLOCK_N, HALF_D], [bid, kv_head, n0, HALF_D])
+        tle.gpu.copy(v_desc, v_slot.v, [1, 1, BLOCK_N, BLOCK_D], [bid, kv_head, n0, 0])
         v_writer.commit(tile)
 
 
@@ -334,7 +446,6 @@ def _attention_decode_no_split_consumer(
     BLOCK_D: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
 ):
-    HALF_D: tl.constexpr = BLOCK_D // 2
     bid = tl.program_id(0)
     hid = tl.program_id(1)
     kv_group_num: tl.constexpr = NUM_Q_HEADS // NUM_KV_HEADS
@@ -393,10 +504,8 @@ def _attention_decode_no_split_consumer(
         out_vals.to(q_vals.dtype),
         mask=store_rows[:, None] & head_mask[:, None] & dim_mask[None, :],
     )
-    o_lo = o_smem.subslice([0, 0], [VALID_BLOCK_H, HALF_D])
-    o_hi = o_smem.subslice([0, HALF_D], [VALID_BLOCK_H, HALF_D])
-    tle.gpu.copy(o_lo, out_desc, [1, VALID_BLOCK_H, HALF_D], [bid, head_start, 0])
-    tle.gpu.copy(o_hi, out_desc, [1, VALID_BLOCK_H, HALF_D], [bid, head_start, HALF_D])
+    o_tile = o_smem.subslice([0, 0], [VALID_BLOCK_H, BLOCK_D])
+    tle.gpu.copy(o_tile, out_desc, [1, VALID_BLOCK_H, BLOCK_D], [bid, head_start, 0])
     q_reader.release(0)
 
 
@@ -655,15 +764,29 @@ def attention_ws(
         raise ValueError(f"kv_len={kv_len} must include current query range start_pos={start_pos} q_len={q_len}")
     out = torch.empty_like(q)
     block_d = next_power_of_2(head_dim)
+    if head_dim != block_d:
+        raise ValueError(f"attention_ws full-D TMA path requires power-of-two head_dim, got {head_dim}")
+    packed_m = q_len * (num_q_heads // num_kv_heads)
+    selected_block_n = 128 if block_n is None else block_n
+    k_desc = TensorDescriptor(
+        k_cache,
+        shape=[batch, num_kv_heads, max_seq_len, head_dim],
+        strides=[max_seq_len * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1],
+        block_shape=[1, 1, selected_block_n, block_d],
+    )
+    v_desc = TensorDescriptor(
+        v_cache,
+        shape=[batch, num_kv_heads, max_seq_len, head_dim],
+        strides=[max_seq_len * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1],
+        block_shape=[1, 1, selected_block_n, block_d],
+    )
     if block_n is not None:
-        _attention_ws_kernel[(cdiv(q_len, block_m), num_q_heads, batch)](
+        _attention_ws_packgqa_tma_kernel[(cdiv(packed_m, block_m), num_kv_heads, batch)](
             q,
-            k_cache,
-            v_cache,
+            k_desc,
+            v_desc,
             out,
-            tokens,
             q_len,
-            max_seq_len,
             num_q_heads,
             num_kv_heads,
             head_dim,
@@ -675,18 +798,16 @@ def attention_ws(
             block_d,
             2,
             num_warps=4,
-            num_stages=1,
+            num_stages=2,
         )
     else:
-        grid = lambda meta: (cdiv(q_len, meta["BLOCK_M"]), num_q_heads, batch)
-        _attention_ws_kernel_autotuned[grid](
+        grid = lambda meta: (cdiv(packed_m, meta["BLOCK_M"]), num_kv_heads, batch)
+        _attention_ws_packgqa_tma_kernel_autotuned[grid](
             q,
-            k_cache,
-            v_cache,
+            k_desc,
+            v_desc,
             out,
-            TOKENS=tokens,
             Q_LEN=q_len,
-            MAX_SEQ_LEN=max_seq_len,
             NUM_Q_HEADS=num_q_heads,
             NUM_KV_HEADS=num_kv_heads,
             HEAD_DIM=head_dim,
@@ -746,6 +867,8 @@ def attention_decode(
         valid_block_h = q_per_kv
         compute_block_h = max(compute_block_h, valid_block_h)
     block_d = next_power_of_2(head_dim)
+    if head_dim != block_d:
+        raise ValueError(f"attention_decode full-D TMA path requires power-of-two head_dim, got {head_dim}")
     out = torch.empty_like(q)
     log2e_scale = sm_scale * 1.4426950408889634
     selected_block_n = 128 if block_n is None else block_n
@@ -755,30 +878,29 @@ def attention_decode(
 
     if kv_len < split_threshold:
         grid = (batch, cdiv(num_q_heads, valid_block_h))
-        half_block_d = block_d // 2
         q_desc = TensorDescriptor(
             q,
             shape=[batch, num_q_heads, head_dim],
             strides=[num_q_heads * head_dim, head_dim, 1],
-            block_shape=[1, compute_block_h, half_block_d],
+            block_shape=[1, compute_block_h, block_d],
         )
         k_desc = TensorDescriptor(
             k_cache,
             shape=[batch, num_kv_heads, max_seq_len, head_dim],
             strides=[max_seq_len * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1],
-            block_shape=[1, 1, selected_block_n, half_block_d],
+            block_shape=[1, 1, selected_block_n, block_d],
         )
         v_desc = TensorDescriptor(
             v_cache,
             shape=[batch, num_kv_heads, max_seq_len, head_dim],
             strides=[max_seq_len * num_kv_heads * head_dim, head_dim, num_kv_heads * head_dim, 1],
-            block_shape=[1, 1, selected_block_n, half_block_d],
+            block_shape=[1, 1, selected_block_n, block_d],
         )
         out_desc = TensorDescriptor(
             out,
             shape=[batch, num_q_heads, head_dim],
             strides=[num_q_heads * head_dim, head_dim, 1],
-            block_shape=[1, valid_block_h, half_block_d],
+            block_shape=[1, valid_block_h, block_d],
         )
         if block_n is not None:
             _attention_decode_no_split_kernel[grid](
@@ -888,214 +1010,3 @@ def attention_decode(
         num_stages=1,
     )
     return out
-
-
-@triton.jit
-def _flash_varlen_fwd_kernel(
-    q_ptr,
-    k_ptr,
-    v_ptr,
-    out_ptr,
-    softmax_lse_ptr,
-    cu_seqlens_q_ptr,
-    cu_seqlens_k_ptr,
-    q_row_stride,
-    k_row_stride,
-    v_row_stride,
-    o_row_stride,
-    q_head_stride,
-    k_head_stride,
-    v_head_stride,
-    o_head_stride,
-    q_dim_stride,
-    k_dim_stride,
-    v_dim_stride,
-    o_dim_stride,
-    max_seqlen_q: tl.constexpr,
-    max_seqlen_k: tl.constexpr,
-    total_q: tl.constexpr,
-    num_q_heads: tl.constexpr,
-    num_kv_heads: tl.constexpr,
-    head_dim: tl.constexpr,
-    sm_scale: tl.constexpr,
-    is_causal: tl.constexpr,
-    block_m: tl.constexpr,
-    block_n: tl.constexpr,
-    block_d: tl.constexpr,
-):
-    m_block = tl.program_id(0)
-    bid = tl.program_id(1)
-    q_head = tl.program_id(2)
-    group_size: tl.constexpr = num_q_heads // num_kv_heads
-    kv_head = q_head // group_size
-    offs_d = tl.arange(0, block_d)
-
-    q_bos = tl.load(cu_seqlens_q_ptr + bid).to(tl.int32)
-    q_eos = tl.load(cu_seqlens_q_ptr + bid + 1).to(tl.int32)
-    k_bos = tl.load(cu_seqlens_k_ptr + bid).to(tl.int32)
-    k_eos = tl.load(cu_seqlens_k_ptr + bid + 1).to(tl.int32)
-    q_len = q_eos - q_bos
-    k_len = k_eos - k_bos
-
-    offs_m = m_block * block_m + tl.arange(0, block_m)
-    if m_block * block_m > q_len:
-        return
-
-    q_offsets = (
-        (q_bos + offs_m[:, None]) * q_row_stride
-        + q_head * q_head_stride
-        + offs_d[None, :] * q_dim_stride
-    )
-    q_mask = (offs_m[:, None] < q_len) & (offs_d[None, :] < head_dim)
-    q = tl.load(q_ptr + q_offsets, mask=q_mask, other=0.0)
-
-    acc = tl.zeros((block_m, block_d), dtype=tl.float32)
-    row_max = tl.full((block_m, ), -float("inf"), dtype=tl.float32)
-    row_sum = tl.zeros((block_m, ), dtype=tl.float32)
-    log2e: tl.constexpr = 1.4426950408889634
-
-    n_block_max = tl.cdiv(k_len, block_n)
-    if is_causal:
-        n_block_max = min(n_block_max, tl.cdiv((m_block + 1) * block_m + k_len - q_len, block_n))
-
-    for n_block in tl.range(n_block_max - 1, -1, step=-1):
-        offs_n = n_block * block_n + tl.arange(0, block_n)
-        k_offsets = (
-            (k_bos + offs_n[None, :]) * k_row_stride
-            + kv_head * k_head_stride
-            + offs_d[:, None] * k_dim_stride
-        )
-        v_offsets = (
-            (k_bos + offs_n[:, None]) * v_row_stride
-            + kv_head * v_head_stride
-            + offs_d[None, :] * v_dim_stride
-        )
-        kv_mask = offs_n < k_len
-        k = tl.load(k_ptr + k_offsets, mask=(offs_d[:, None] < head_dim) & kv_mask[None, :], other=0.0)
-        scores = tl.dot(q, k, out_dtype=tl.float32)
-        causal_limit = offs_m + k_len - q_len
-        if is_causal:
-            keep = kv_mask[None, :] & (offs_n[None, :] <= causal_limit[:, None]) & (offs_m[:, None] < q_len)
-        else:
-            keep = kv_mask[None, :] & (offs_m[:, None] < q_len)
-        scores = tl.where(keep, scores * sm_scale * log2e, -float("inf"))
-
-        new_max = tl.maximum(row_max, tl.max(scores, axis=1))
-        p = tl.exp2(scores - new_max[:, None])
-        alpha = tl.exp2(row_max - new_max)
-        row_sum = row_sum * alpha + tl.sum(p, axis=1)
-        acc = acc * alpha[:, None]
-        v = tl.load(v_ptr + v_offsets, mask=kv_mask[:, None] & (offs_d[None, :] < head_dim), other=0.0)
-        acc = tl.dot(p.to(v.dtype), v, acc)
-        row_max = new_max
-
-    inv_sum = tl.where(row_sum == 0.0, 0.0, 1.0 / row_sum)
-    out = (acc * inv_sum[:, None]).to(out_ptr.dtype.element_ty)
-    out_offsets = (
-        (q_bos + offs_m[:, None]) * o_row_stride
-        + q_head * o_head_stride
-        + offs_d[None, :] * o_dim_stride
-    )
-    tl.store(out_ptr + out_offsets, out, mask=q_mask)
-    lse = tl.where(row_sum == 0.0, float("inf"), row_max / log2e + tl.log(row_sum))
-    tl.store(softmax_lse_ptr + q_head * total_q + q_bos + offs_m, lse, mask=offs_m < q_len)
-
-
-def flash_attn_varlen_func(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    max_seqlen_q: int,
-    cu_seqlens_q: torch.Tensor,
-    max_seqlen_k: int,
-    cu_seqlens_k: torch.Tensor | None = None,
-    seqused_k: torch.Tensor | None = None,
-    q_v: torch.Tensor | None = None,
-    dropout_p: float = 0.0,
-    softmax_scale: float | None = None,
-    causal: bool = False,
-    window_size: tuple[int, int] | None = None,
-    softcap: float = 0.0,
-    alibi_slopes: torch.Tensor | None = None,
-    deterministic: bool = False,
-    return_attn_probs: bool = False,
-    block_table: torch.Tensor | None = None,
-    return_softmax_lse: bool = False,
-    out: torch.Tensor | None = None,
-    scheduler_metadata: torch.Tensor | None = None,
-    q_descale: torch.Tensor | None = None,
-    k_descale: torch.Tensor | None = None,
-    v_descale: torch.Tensor | None = None,
-    s_aux: torch.Tensor | None = None,
-    num_splits: int = 0,
-    cp_world_size: int = 1,
-    cp_rank: int = 0,
-    cp_tot_seqused_k: torch.Tensor | None = None,
-    fa_version: int = 2,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    if fa_version != 2:
-        raise RuntimeError("Only FA2-compatible local varlen attention is implemented.")
-    if cu_seqlens_k is None or seqused_k is not None:
-        raise NotImplementedError("local varlen attention currently implements non-paged cu_seqlens_k inputs")
-    if q_v is not None or dropout_p != 0.0 or return_attn_probs:
-        raise NotImplementedError("dropout, q_v, and returned attention probabilities are not implemented")
-    if window_size not in (None, (-1, -1)):
-        raise NotImplementedError("sliding-window attention is not implemented")
-    if softcap != 0.0 or alibi_slopes is not None:
-        raise NotImplementedError("softcap and alibi are not implemented")
-    if block_table is not None or num_splits > 0 or cp_world_size != 1 or cp_rank != 0:
-        raise NotImplementedError("paged/split/context-parallel attention is not implemented")
-    if any(x is not None for x in (scheduler_metadata, q_descale, k_descale, v_descale, s_aux, cp_tot_seqused_k)):
-        raise NotImplementedError("FA3 auxiliary arguments are not implemented")
-    del deterministic
-    if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** (-0.5)
-    max_seqlen_q = int(max_seqlen_q.item() if hasattr(max_seqlen_q, "item") else max_seqlen_q)
-    max_seqlen_k = int(max_seqlen_k.item() if hasattr(max_seqlen_k, "item") else max_seqlen_k)
-    q_len = int(max_seqlen_q)
-    batch_size = cu_seqlens_q.numel() - 1
-    total_q = q.shape[0]
-    num_q_heads = q.shape[1]
-    num_kv_heads = k.shape[1]
-    head_dim = q.shape[2]
-    if out is None:
-        out = torch.empty_like(q)
-    softmax_lse = torch.empty((num_q_heads, total_q), device=q.device, dtype=torch.float32)
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    block_m, block_n, num_warps, num_stages = mha_config(total_q // batch_size, num_q_heads, num_sms)
-    block_d = triton.next_power_of_2(head_dim)
-    _flash_varlen_fwd_kernel[(triton.cdiv(q_len, block_m), batch_size, num_q_heads)](
-        q,
-        k,
-        v,
-        out,
-        softmax_lse,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        q.stride(-3),
-        k.stride(-3),
-        v.stride(-3),
-        out.stride(-3),
-        q.stride(-2),
-        k.stride(-2),
-        v.stride(-2),
-        out.stride(-2),
-        q.stride(-1),
-        k.stride(-1),
-        v.stride(-1),
-        out.stride(-1),
-        max_seqlen_q,
-        max_seqlen_k,
-        total_q,
-        num_q_heads,
-        num_kv_heads,
-        head_dim,
-        softmax_scale,
-        causal,
-        block_m,
-        block_n,
-        block_d,
-        num_warps=num_warps,
-        num_stages=num_stages,
-    )
-    return (out, softmax_lse) if return_softmax_lse else out

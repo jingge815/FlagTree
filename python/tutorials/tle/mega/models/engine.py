@@ -13,11 +13,11 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 try:
     from ..kernels import attention_decode, attention_ws, embedding, fused_add_rms_norm
     from ..kernels import head_rmsnorm_rope
-    from ..kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_out, store_cache
+    from ..kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_packed_out, store_cache
 except ImportError:  # pragma: no cover - supports direct script execution from mega/
     from kernels import attention_decode, attention_ws, embedding, fused_add_rms_norm
     from kernels import head_rmsnorm_rope
-    from kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_out, store_cache
+    from kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_packed_out, store_cache
 
 from .config import Qwen3TLEConfig
 from .weights import LinearWeights, Qwen3Weights, extract_qwen3_weights
@@ -148,13 +148,13 @@ class Qwen3TLEEngine:
         self.cache.past_len = 0
 
     def _linear(self, x: torch.Tensor, weights: LinearWeights) -> torch.Tensor:
-        return linear(x.contiguous(), weights.weight, weights.bias)
+        return linear(x, weights.weight, weights.bias)
 
     def _lm_head(self, x: torch.Tensor, weights: LinearWeights) -> torch.Tensor:
-        return lm_head(x.contiguous(), weights.weight, weights.bias)
+        return lm_head(x, weights.weight, weights.bias)
 
     def _rms_norm(self, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-        return rms_norm(x.contiguous(), (self.config.hidden_size, ), weight, self.config.rms_norm_eps)
+        return rms_norm(x, (self.config.hidden_size, ), weight, self.config.rms_norm_eps)
 
     def _fused_add_rms_norm(
         self,
@@ -162,19 +162,17 @@ class Qwen3TLEEngine:
         residual: torch.Tensor,
         weight: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return fused_add_rms_norm(x.contiguous(), residual.contiguous(), (self.config.hidden_size, ), weight,
-                                  self.config.rms_norm_eps)
+        return fused_add_rms_norm(x, residual, (self.config.hidden_size, ), weight, self.config.rms_norm_eps)
 
     def _qkv_linear(self, x: torch.Tensor, weights: LinearWeights) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         q_dim = self.config.num_attention_heads * self.config.head_dim
         kv_dim = self.config.num_key_value_heads * self.config.head_dim
-        return qkv_linear(x.contiguous(), weights.weight, weights.bias, q_dim=q_dim, kv_dim=kv_dim)
+        return qkv_linear(x, weights.weight, weights.bias, q_dim=q_dim, kv_dim=kv_dim)
 
     def _mlp_activation(self, x: torch.Tensor, weights: LinearWeights) -> torch.Tensor:
         packed = self._linear(x, weights)
-        gate, up = packed.split((self.config.intermediate_size, self.config.intermediate_size), dim=-1)
-        out = torch.empty_like(gate)
-        return silu_and_mul_out(gate, up, out)
+        out = torch.empty((*packed.shape[:-1], self.config.intermediate_size), device=packed.device, dtype=packed.dtype)
+        return silu_and_mul_packed_out(packed, out)
 
     def _attention(
         self,
@@ -205,13 +203,13 @@ class Qwen3TLEEngine:
         batch_size, q_len, hidden = x.shape
         tokens = batch_size * q_len
         q_dim = self.config.num_attention_heads * self.config.head_dim
-        x_flat = x.reshape(tokens, hidden).contiguous()
+        x_flat = x.reshape(tokens, hidden)
 
         if residual is None:
             residual_flat = x_flat
             hidden_flat = self._rms_norm(x_flat, layer.input_norm_weight)
         else:
-            residual_flat = residual.reshape(tokens, hidden).contiguous()
+            residual_flat = residual.reshape(tokens, hidden)
             hidden_flat, residual_flat = self._fused_add_rms_norm(x_flat, residual_flat, layer.input_norm_weight)
 
         q_flat, k_flat, v_flat = self._qkv_linear(hidden_flat, layer.qkv_proj)
@@ -235,7 +233,7 @@ class Qwen3TLEEngine:
             kv_len=start_pos + q_len,
             sm_scale=1.0 / math.sqrt(self.config.head_dim),
         )
-        attn_flat = attn.reshape(tokens, q_dim).contiguous()
+        attn_flat = attn.reshape(tokens, q_dim)
         attn_out = self._linear(attn_flat, layer.o_proj)
 
         hidden_flat, residual_flat = self._fused_add_rms_norm(attn_out, residual_flat, layer.post_norm_weight)
@@ -264,11 +262,11 @@ class Qwen3TLEEngine:
         for layer_idx in range(self.config.num_hidden_layers):
             x, residual = self._run_layer(x, residual, layer_idx, start_pos)
 
-        last_hidden = x[:, -1, :].contiguous().view(batch_size, self.config.hidden_size)
+        last_hidden = x[:, -1, :].reshape(batch_size, self.config.hidden_size)
         if residual is None:
             last_hidden = self._rms_norm(last_hidden, self.weights.final_norm_weight)
         else:
-            last_residual = residual[:, -1, :].contiguous().view(batch_size, self.config.hidden_size)
+            last_residual = residual[:, -1, :].reshape(batch_size, self.config.hidden_size)
             last_hidden, _ = self._fused_add_rms_norm(last_hidden, last_residual, self.weights.final_norm_weight)
         return self._lm_head(last_hidden, self.weights.lm_head)
 

@@ -5,11 +5,8 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
-import triton.experimental.tle.language as tle
 
-from ._common import cdiv, default_block_m, pointwise_1d_launch, require_cuda_contiguous, row_stride
-
-_LINEAR_CLUSTER_MESH_2 = tle.device_mesh({"block_cluster": [("cluster_x", 2)]})
+from ._common import cdiv, default_block_m, require_cuda_contiguous, row_stride
 
 
 def _linear_tilewise_tma_pre_hook(nargs):
@@ -28,15 +25,6 @@ def _linear_hopper_tma_pre_hook(nargs):
     nargs["x_desc"].block_shape = [block_m, block_k]
     nargs["weight_desc"].block_shape = [block_n, block_k]
     nargs["out_desc"].block_shape = [block_m, block_n]
-
-
-def _linear_cluster_tma_pre_hook(nargs):
-    block_m = nargs["BLOCK_M"]
-    block_n = nargs["BLOCK_N"]
-    block_k = nargs["BLOCK_K"]
-    nargs["x_desc"].block_shape = [block_m, block_k]
-    nargs["weight_desc"].block_shape = [block_n // 2, block_k]
-    nargs["out_desc"].block_shape = [block_m, block_n // 2]
 
 
 def _linear_tilewise_prune_configs(configs, named_args, **kwargs):
@@ -74,33 +62,6 @@ def _linear_hopper_tma_prune_configs(configs, named_args, **kwargs):
         if n <= 64 and block_n > 64:
             continue
         if k < 128 and block_k > 64:
-            continue
-        pruned.append(config)
-    return pruned or configs[:1]
-
-
-def _linear_cluster_tma_prune_configs(configs, named_args, **kwargs):
-    m = int(kwargs["M"])
-    n = int(kwargs["N"])
-    k = int(kwargs["K"])
-    pruned = []
-    for config in configs:
-        block_m = config.kwargs["BLOCK_M"]
-        block_n = config.kwargs["BLOCK_N"]
-        block_k = config.kwargs["BLOCK_K"]
-        if m <= 16 and block_m > 16:
-            continue
-        if m < 128 and block_m > 32:
-            continue
-        if m < 512 and block_m > 64:
-            continue
-        if n <= 64 and block_n > 64:
-            continue
-        if k < 128 and block_k > 64:
-            continue
-        # The cluster reducer exports only the peer-needed half tile to DSMEM.
-        # Keep the per-CTA exported fp32 partial below 64 KiB.
-        if block_m * (block_n // 2) * 4 > 64 * 1024:
             continue
         pruned.append(config)
     return pruned or configs[:1]
@@ -172,56 +133,6 @@ _LINEAR_HOPPER_TMA_AUTOTUNE_CONFIGS = [
 ]
 
 
-_LINEAR_CLUSTER_TMA_AUTOTUNE_CONFIGS = [
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 16, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=8,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=8,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 32, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=8,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=8,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 256, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=4,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 256, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=8,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=8,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-    triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "GROUP_M": 8, "NUM_STAGES": 3}, num_warps=8,
-                  num_stages=3, pre_hook=_linear_cluster_tma_pre_hook),
-]
-
-
 def _is_tma_compatible_2d(tensor: torch.Tensor) -> bool:
     if tensor.dim() != 2 or tensor.stride(-1) != 1:
         return False
@@ -233,15 +144,6 @@ def _supports_host_tma(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor)
     if not x.is_cuda or torch.cuda.get_device_capability(x.device)[0] < 9:
         return False
     return _is_tma_compatible_2d(x) and _is_tma_compatible_2d(weight) and _is_tma_compatible_2d(out)
-
-
-def _cluster_slicedk_support_skip_reason(x: torch.Tensor) -> str | None:
-    if not x.is_cuda:
-        return "linear_cluster_slicedk requires CUDA tensors"
-    major, _minor = torch.cuda.get_device_capability(x.device)
-    if major < 9:
-        return "linear_cluster_slicedk requires sm90+ cluster DSMEM remote access"
-    return None
 
 
 @triton.jit
@@ -459,91 +361,6 @@ def _linear_hopper_tma_kernel(
 
 
 @triton.jit
-def _linear_hopper_tma_splitk_partial_kernel(
-    x_desc,
-    weight_desc,
-    partials,
-    M,
-    N,
-    K,
-    TOTAL_TILES: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    pid_k = tl.program_id(1)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-    width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // group_size
-
-    total_k_iters = tl.cdiv(K, BLOCK_K)
-    k_per_split = tl.cdiv(total_k_iters, SPLIT_K)
-    k_start = pid_k * k_per_split
-    k_end = min((pid_k + 1) * k_per_split, total_k_iters)
-
-    offs_m = (pid_m * BLOCK_M).to(tl.int32)
-    offs_n = (pid_n * BLOCK_N).to(tl.int32)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k_iter in range(k_start, k_end):
-        offs_k = (k_iter * BLOCK_K).to(tl.int32)
-        a = x_desc.load([offs_m, offs_k])
-        b = weight_desc.load([offs_n, offs_k])
-        accumulator = tl.dot(a, b.T, acc=accumulator, allow_tf32=False)
-
-    rows = tl.arange(0, BLOCK_M)
-    cols = tl.arange(0, BLOCK_N)
-    partial_ptrs = partials + ((pid_k * TOTAL_TILES + pid) * BLOCK_M * BLOCK_N +
-                               rows[:, None] * BLOCK_N + cols[None, :])
-    tl.store(partial_ptrs, accumulator)
-
-
-@triton.jit
-def _linear_hopper_tma_splitk_reduce_kernel(
-    partials,
-    out_desc,
-    bias_ptr,
-    M,
-    N,
-    TOTAL_TILES: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    SPLIT_K: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    grid_m = tl.cdiv(M, BLOCK_M)
-    grid_n = tl.cdiv(N, BLOCK_N)
-    width = GROUP_M * grid_n
-    group_id = pid // width
-    group_size = min(grid_m - group_id * GROUP_M, GROUP_M)
-    pid_m = group_id * GROUP_M + (pid % group_size)
-    pid_n = (pid % width) // group_size
-
-    rows = tl.arange(0, BLOCK_M)
-    cols = tl.arange(0, BLOCK_N)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for split in range(0, SPLIT_K):
-        partial_ptrs = partials + ((split * TOTAL_TILES + pid) * BLOCK_M * BLOCK_N +
-                                   rows[:, None] * BLOCK_N + cols[None, :])
-        accumulator += tl.load(partial_ptrs)
-
-    if HAS_BIAS:
-        offs = pid_n * BLOCK_N + cols
-        bias = tl.load(bias_ptr + offs, mask=offs < N, other=0.0).to(tl.float32)
-        accumulator += bias[None, :]
-
-    out_desc.store([pid_m * BLOCK_M, pid_n * BLOCK_N], accumulator.to(out_desc.dtype))
-
-
-@triton.jit
 def _linear_splitk_kernel(
     A,
     B,
@@ -598,315 +415,6 @@ def _linear_splitk_kernel(
 
 
 @triton.jit
-def _linear_slicedk_kernel(
-    A,
-    B,
-    C,
-    bias_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bn,
-    stride_bk,
-    stride_cm,
-    stride_cn,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    SLICES: tl.constexpr,
-    NUM_STAGES: tl.constexpr,
-):
-    # CTA-local sliced-K: each program computes one output tile, keeps per-slice
-    # partial accumulators in registers, then reduces locally before one C store.
-    pid = tl.program_id(0)
-    pid_m, pid_n = _streamk_swizzle_tile(pid, M, N, BLOCK_M, BLOCK_N, GROUP_M)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
-
-    acc0 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    acc1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    acc2 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    acc3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for start_k in tl.range(0, K, BLOCK_K * SLICES, num_stages=NUM_STAGES):
-        k0 = start_k + offs_k
-        mask_k0 = k0 < K
-        a0 = tl.load(
-            A + offs_m[:, None] * stride_am + k0[None, :] * stride_ak,
-            mask=(offs_m[:, None] < M) & mask_k0[None, :],
-            other=0.0,
-        )
-        b0 = tl.load(
-            B + offs_n[None, :] * stride_bn + k0[:, None] * stride_bk,
-            mask=(offs_n[None, :] < N) & mask_k0[:, None],
-            other=0.0,
-        )
-        acc0 += tl.dot(a0, b0, out_dtype=tl.float32, allow_tf32=False)
-
-        if SLICES >= 2:
-            k1 = start_k + BLOCK_K + offs_k
-            mask_k1 = k1 < K
-            a1 = tl.load(
-                A + offs_m[:, None] * stride_am + k1[None, :] * stride_ak,
-                mask=(offs_m[:, None] < M) & mask_k1[None, :],
-                other=0.0,
-            )
-            b1 = tl.load(
-                B + offs_n[None, :] * stride_bn + k1[:, None] * stride_bk,
-                mask=(offs_n[None, :] < N) & mask_k1[:, None],
-                other=0.0,
-            )
-            acc1 += tl.dot(a1, b1, out_dtype=tl.float32, allow_tf32=False)
-
-        if SLICES >= 3:
-            k2 = start_k + BLOCK_K * 2 + offs_k
-            mask_k2 = k2 < K
-            a2 = tl.load(
-                A + offs_m[:, None] * stride_am + k2[None, :] * stride_ak,
-                mask=(offs_m[:, None] < M) & mask_k2[None, :],
-                other=0.0,
-            )
-            b2 = tl.load(
-                B + offs_n[None, :] * stride_bn + k2[:, None] * stride_bk,
-                mask=(offs_n[None, :] < N) & mask_k2[:, None],
-                other=0.0,
-            )
-            acc2 += tl.dot(a2, b2, out_dtype=tl.float32, allow_tf32=False)
-
-        if SLICES >= 4:
-            k3 = start_k + BLOCK_K * 3 + offs_k
-            mask_k3 = k3 < K
-            a3 = tl.load(
-                A + offs_m[:, None] * stride_am + k3[None, :] * stride_ak,
-                mask=(offs_m[:, None] < M) & mask_k3[None, :],
-                other=0.0,
-            )
-            b3 = tl.load(
-                B + offs_n[None, :] * stride_bn + k3[:, None] * stride_bk,
-                mask=(offs_n[None, :] < N) & mask_k3[:, None],
-                other=0.0,
-            )
-            acc3 += tl.dot(a3, b3, out_dtype=tl.float32, allow_tf32=False)
-
-    acc = acc0 + acc1 + acc2 + acc3
-    if HAS_BIAS:
-        bias = tl.load(bias_ptr + offs_n, mask=offs_n < N, other=0.0).to(tl.float32)
-        acc += bias[None, :]
-    c_ptrs = C + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
-    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc, mask=mask)
-
-
-@triton.jit
-def _linear_cluster_slicedk_kernel(
-    A,
-    B,
-    C,
-    bias_ptr,
-    M,
-    N,
-    K,
-    stride_am,
-    stride_ak,
-    stride_bn,
-    stride_bk,
-    stride_cm,
-    stride_cn,
-    mesh: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    CLUSTER_SIZE: tl.constexpr,
-    NUM_STAGES: tl.constexpr,
-):
-    # Cluster sliced-K: two CTAs in one cluster compute disjoint K ranges for
-    # the same output tile. After the barrier, both CTAs remote-load the peer
-    # accumulator and split the final reduce/store across the N dimension.
-    pid = tl.program_id(0)
-    cluster_rank = tle.shard_id(mesh, "cluster_x")
-    cluster_id = pid // CLUSTER_SIZE
-    pid_m, pid_n = _streamk_swizzle_tile(cluster_id, M, N, BLOCK_M, BLOCK_N, GROUP_M)
-
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    start_n = pid_n * BLOCK_N
-    half_cols = tl.arange(0, BLOCK_N // CLUSTER_SIZE)
-    offs_n_low = start_n + half_cols
-    offs_n_high = start_n + (BLOCK_N // CLUSTER_SIZE) + half_cols
-    offs_k = tl.arange(0, BLOCK_K)
-    low_mask = (offs_m[:, None] < M) & (offs_n_low[None, :] < N)
-    high_mask = (offs_m[:, None] < M) & (offs_n_high[None, :] < N)
-
-    k_per_rank = tl.cdiv(K, CLUSTER_SIZE)
-    k_begin = cluster_rank * k_per_rank
-    k_end = tl.minimum(k_begin + k_per_rank, K)
-
-    acc_low = tl.zeros((BLOCK_M, BLOCK_N // CLUSTER_SIZE), dtype=tl.float32)
-    acc_high = tl.zeros((BLOCK_M, BLOCK_N // CLUSTER_SIZE), dtype=tl.float32)
-    for k0 in tl.range(k_begin, k_end, BLOCK_K, num_stages=NUM_STAGES):
-        k_idx = k0 + offs_k
-        a = tl.load(
-            A + offs_m[:, None] * stride_am + k_idx[None, :] * stride_ak,
-            mask=(offs_m[:, None] < M) & (k_idx[None, :] < K),
-            other=0.0,
-        )
-        b_low = tl.load(
-            B + offs_n_low[None, :] * stride_bn + k_idx[:, None] * stride_bk,
-            mask=(offs_n_low[None, :] < N) & (k_idx[:, None] < K),
-            other=0.0,
-        )
-        b_high = tl.load(
-            B + offs_n_high[None, :] * stride_bn + k_idx[:, None] * stride_bk,
-            mask=(offs_n_high[None, :] < N) & (k_idx[:, None] < K),
-            other=0.0,
-        )
-        acc_low += tl.dot(a, b_low, out_dtype=tl.float32, allow_tf32=False)
-        acc_high += tl.dot(a, b_high, out_dtype=tl.float32, allow_tf32=False)
-
-    rows = tl.arange(0, BLOCK_M)
-    half_rows_tile = tl.broadcast_to(rows[:, None], (BLOCK_M, BLOCK_N // CLUSTER_SIZE))
-    low_cols_tile = tl.broadcast_to(half_cols[None, :], (BLOCK_M, BLOCK_N // CLUSTER_SIZE))
-    high_cols_tile = tl.broadcast_to((half_cols + (BLOCK_N // CLUSTER_SIZE))[None, :],
-                                     (BLOCK_M, BLOCK_N // CLUSTER_SIZE))
-    acc_smem = tle.gpu.alloc(
-        [BLOCK_M, BLOCK_N],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    if cluster_rank == 0:
-        acc_smem_ptrs = tle.gpu.local_ptr(acc_smem, (half_rows_tile, high_cols_tile))
-        tl.store(acc_smem_ptrs, acc_high, mask=high_mask)
-    if cluster_rank == 1:
-        acc_smem_ptrs = tle.gpu.local_ptr(acc_smem, (half_rows_tile, low_cols_tile))
-        tl.store(acc_smem_ptrs, acc_low, mask=low_mask)
-    tle.distributed_barrier(mesh)
-
-    if cluster_rank == 0:
-        peer_acc_smem = tle.remote(acc_smem, 1, scope=mesh)
-        peer_acc_ptrs = tle.gpu.local_ptr(peer_acc_smem, (half_rows_tile, low_cols_tile))
-        peer_acc = tl.load(peer_acc_ptrs, mask=low_mask, other=0.0)
-        total = acc_low + peer_acc
-        if HAS_BIAS:
-            bias = tl.load(bias_ptr + offs_n_low, mask=offs_n_low < N, other=0.0).to(tl.float32)
-            total += bias[None, :]
-        c_ptrs = C + offs_m[:, None] * stride_cm + offs_n_low[None, :] * stride_cn
-        tl.store(c_ptrs, total, mask=low_mask)
-
-    if cluster_rank == 1:
-        peer_acc_smem = tle.remote(acc_smem, 0, scope=mesh)
-        peer_acc_ptrs = tle.gpu.local_ptr(peer_acc_smem, (half_rows_tile, high_cols_tile))
-        peer_acc = tl.load(peer_acc_ptrs, mask=high_mask, other=0.0)
-        total = acc_high + peer_acc
-        if HAS_BIAS:
-            bias = tl.load(bias_ptr + offs_n_high, mask=offs_n_high < N, other=0.0).to(tl.float32)
-            total += bias[None, :]
-        c_ptrs = C + offs_m[:, None] * stride_cm + offs_n_high[None, :] * stride_cn
-        tl.store(c_ptrs, total, mask=high_mask)
-
-    tle.distributed_barrier(mesh)
-
-
-@triton.jit
-def _linear_cluster_slicedk_tma_kernel(
-    x_desc,
-    weight_desc,
-    out_desc,
-    bias_ptr,
-    M,
-    N,
-    K,
-    mesh: tl.constexpr,
-    HAS_BIAS: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-    CLUSTER_SIZE: tl.constexpr,
-    NUM_STAGES: tl.constexpr,
-):
-    # Host-TMA variant of the 2-CTA cluster sliced-K kernel. K is split by
-    # descriptor tiles so each CTA issues TMA loads for complete BLOCK_K chunks.
-    # The final reduce/store is split across the N dimension by cluster rank.
-    pid = tl.program_id(0)
-    cluster_rank = tle.shard_id(mesh, "cluster_x")
-    cluster_id = pid // CLUSTER_SIZE
-    pid_m, pid_n = _streamk_swizzle_tile(cluster_id, M, N, BLOCK_M, BLOCK_N, GROUP_M)
-
-    offs_m = (pid_m * BLOCK_M).to(tl.int32)
-    offs_n = (pid_n * BLOCK_N).to(tl.int32)
-    rows = tl.arange(0, BLOCK_M)
-    half_cols = tl.arange(0, BLOCK_N // CLUSTER_SIZE)
-    half_rows_tile = tl.broadcast_to(rows[:, None], (BLOCK_M, BLOCK_N // CLUSTER_SIZE))
-    half_cols_tile = tl.broadcast_to(half_cols[None, :], (BLOCK_M, BLOCK_N // CLUSTER_SIZE))
-    low_mask = ((offs_m + rows)[:, None] < M) & ((offs_n + half_cols)[None, :] < N)
-    high_mask = ((offs_m + rows)[:, None] < M) & ((offs_n + (BLOCK_N // CLUSTER_SIZE) + half_cols)[None, :] < N)
-
-    total_k_iters = tl.cdiv(K, BLOCK_K)
-    iters_per_rank = tl.cdiv(total_k_iters, CLUSTER_SIZE)
-    iter_begin = cluster_rank * iters_per_rank
-    iter_end = tl.minimum(iter_begin + iters_per_rank, total_k_iters)
-
-    acc_low = tl.zeros((BLOCK_M, BLOCK_N // CLUSTER_SIZE), dtype=tl.float32)
-    acc_high = tl.zeros((BLOCK_M, BLOCK_N // CLUSTER_SIZE), dtype=tl.float32)
-    for k_iter in tl.range(iter_begin, iter_end, 1, num_stages=NUM_STAGES):
-        offs_k = (k_iter * BLOCK_K).to(tl.int32)
-        a = x_desc.load([offs_m, offs_k])
-        b_low = weight_desc.load([offs_n, offs_k])
-        b_high = weight_desc.load([offs_n + (BLOCK_N // CLUSTER_SIZE), offs_k])
-        acc_low = tl.dot(a, b_low.T, acc=acc_low, allow_tf32=False)
-        acc_high = tl.dot(a, b_high.T, acc=acc_high, allow_tf32=False)
-
-    acc_smem = tle.gpu.alloc(
-        [BLOCK_M, BLOCK_N],
-        dtype=tl.float32,
-        layout=None,
-        scope=tle.gpu.smem,
-        nv_mma_shared_layout=False,
-    )
-    low_cols_tile = half_cols_tile
-    high_cols_tile = tl.broadcast_to((half_cols + (BLOCK_N // CLUSTER_SIZE))[None, :],
-                                     (BLOCK_M, BLOCK_N // CLUSTER_SIZE))
-    if cluster_rank == 0:
-        acc_smem_ptrs = tle.gpu.local_ptr(acc_smem, (half_rows_tile, high_cols_tile))
-        tl.store(acc_smem_ptrs, acc_high, mask=high_mask)
-    if cluster_rank == 1:
-        acc_smem_ptrs = tle.gpu.local_ptr(acc_smem, (half_rows_tile, low_cols_tile))
-        tl.store(acc_smem_ptrs, acc_low, mask=low_mask)
-    tle.distributed_barrier(mesh)
-
-    if cluster_rank == 0:
-        peer_acc_smem = tle.remote(acc_smem, 1, scope=mesh)
-        peer_acc_ptrs = tle.gpu.local_ptr(peer_acc_smem, (half_rows_tile, low_cols_tile))
-        peer_acc = tl.load(peer_acc_ptrs, mask=low_mask, other=0.0)
-        total = acc_low + peer_acc
-        if HAS_BIAS:
-            bias_cols = offs_n + half_cols
-            bias = tl.load(bias_ptr + bias_cols, mask=bias_cols < N, other=0.0).to(tl.float32)
-            total += bias[None, :]
-        out_desc.store([offs_m, offs_n], total.to(out_desc.dtype))
-
-    if cluster_rank == 1:
-        peer_acc_smem = tle.remote(acc_smem, 0, scope=mesh)
-        peer_acc_ptrs = tle.gpu.local_ptr(peer_acc_smem, (half_rows_tile, high_cols_tile))
-        peer_acc = tl.load(peer_acc_ptrs, mask=high_mask, other=0.0)
-        total = acc_high + peer_acc
-        if HAS_BIAS:
-            bias_cols = offs_n + (BLOCK_N // CLUSTER_SIZE) + half_cols
-            bias = tl.load(bias_ptr + bias_cols, mask=bias_cols < N, other=0.0).to(tl.float32)
-            total += bias[None, :]
-        out_desc.store([offs_m, offs_n + (BLOCK_N // CLUSTER_SIZE)], total.to(out_desc.dtype))
-
-    tle.distributed_barrier(mesh)
-
-
-@triton.jit
 def _linear_gemv_kernel(
     x_ptr,
     weight_ptr,
@@ -946,6 +454,52 @@ def _linear_gemv_kernel(
         bias = tl.load(bias_ptr + offs_out, mask=offs_out < N, other=0.0).to(tl.float32)
         out += bias
     tl.store(out_ptr + offs_out * stride_on, out, mask=offs_out < N)
+
+
+@triton.jit
+def _linear_gemv_persistent_kernel(
+    x_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    stride_xk,
+    stride_wn,
+    stride_wk,
+    stride_on,
+    HAS_BIAS: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    NUM_STAGES: tl.constexpr,
+    NUM_CTAS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_n_base = tl.arange(0, BLOCK_N)[:, None]
+    offs_k = tl.arange(0, BLOCK_K)[None, :]
+    num_n_tiles = tl.cdiv(N, BLOCK_N)
+
+    for tile_n in tl.range(pid, num_n_tiles, NUM_CTAS):
+        offs_n = tile_n * BLOCK_N + offs_n_base
+        n_mask = offs_n < N
+        weight_ptrs = weight_ptr + offs_n * stride_wn + offs_k * stride_wk
+        x_ptrs = x_ptr + offs_k * stride_xk
+        acc = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+
+        for start_k in tl.range(0, K, BLOCK_K, num_stages=NUM_STAGES):
+            k_mask = start_k + offs_k < K
+            weight = tl.load(weight_ptrs, mask=n_mask & k_mask, other=0.0).to(tl.float32)
+            x = tl.load(x_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+            acc += weight * x
+            weight_ptrs += BLOCK_K * stride_wk
+            x_ptrs += BLOCK_K * stride_xk
+
+        out = tl.sum(acc, axis=1)
+        offs_out = tile_n * BLOCK_N + tl.arange(0, BLOCK_N)
+        if HAS_BIAS:
+            bias = tl.load(bias_ptr + offs_out, mask=offs_out < N, other=0.0).to(tl.float32)
+            out += bias
+        tl.store(out_ptr + offs_out * stride_on, out, mask=offs_out < N)
 
 
 @triton.jit
@@ -1061,14 +615,6 @@ _linear_hopper_tma_kernel_autotuned = triton.autotune(
 )(_linear_hopper_tma_kernel)
 
 
-_linear_cluster_slicedk_tma_kernel_autotuned = triton.autotune(
-    configs=_LINEAR_CLUSTER_TMA_AUTOTUNE_CONFIGS,
-    key=["M", "N", "K", "HAS_BIAS"],
-    prune_configs_by={"early_config_prune": _linear_cluster_tma_prune_configs},
-    cache_results=True,
-)(_linear_cluster_slicedk_tma_kernel)
-
-
 def _streamk_block_m(m: int) -> int:
     if m <= 16:
         return 16
@@ -1095,6 +641,10 @@ def _use_gemv_shape(m: int, n: int, k: int) -> bool:
     }
 
 
+def _use_gemv_persistent_shape(m: int, n: int, k: int) -> bool:
+    return m == 1 and n == 5_120 and k == 8_192
+
+
 def _use_splitk_shape(m: int, n: int, k: int) -> bool:
     if n == 10_240 and k == 5_120 and m <= 128:
         return True
@@ -1112,6 +662,8 @@ def _use_hopper_tma_shape(m: int, n: int, k: int) -> bool:
 
 
 def linear_backend_name(m: int, n: int, k: int) -> str:
+    if _use_gemv_persistent_shape(m, n, k):
+        return "gemv_persistent"
     if _use_gemv_shape(m, n, k):
         return "gemv"
     if _use_splitk_shape(m, n, k):
@@ -1136,6 +688,8 @@ def linear(
             m = int(x.shape[0])
             n = int(weight.shape[0])
             k = int(x.shape[1])
+            if _use_gemv_persistent_shape(m, n, k):
+                return linear_gemv_persistent(x, weight, bias)
             if _use_gemv_shape(m, n, k):
                 return linear_gemv(x, weight, bias)
             if bias is None and _use_splitk_shape(m, n, k):
@@ -1298,108 +852,6 @@ def linear_hopper_tma(
     return out
 
 
-def _hopper_tma_splitk_params(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
-    block_m = 16 if m <= 16 else 128
-    block_n = 128
-    block_k = 128
-    group_m = 8
-    if n == 51_200 and k == 5_120:
-        split_k = 1
-    elif n == 10_240 and k == 5_120:
-        split_k = 2
-    elif n == 5_120 and k == 8_192:
-        split_k = 4 if m <= 128 else 2
-    elif n == 5_120 and k == 25_600:
-        split_k = 4 if m <= 128 else 2
-    elif m <= 128 and k >= 8_192:
-        split_k = 4
-    elif m <= 128:
-        split_k = 2
-    elif k >= 16_384:
-        split_k = 2
-    else:
-        split_k = 1
-    num_warps = 4 if block_m <= 64 else 8
-    return block_m, block_n, block_k, group_m, split_k, num_warps
-
-
-def linear_hopper_tma_splitk(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    *,
-    split_k: int | None = None,
-) -> torch.Tensor:
-    """Hopper host-TMA GEMM with FP32 split-K partials and explicit reduction."""
-    require_cuda_contiguous("x", x)
-    require_cuda_contiguous("weight", weight)
-    if x.dim() != 2 or weight.dim() != 2:
-        raise ValueError(f"x and weight must be 2D, got {tuple(x.shape)} and {tuple(weight.shape)}")
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-        raise ValueError("linear_hopper_tma_splitk currently expects bfloat16 inputs and weights")
-    m, k = x.shape
-    n, wk = weight.shape
-    if k != wk:
-        raise ValueError(f"linear dimension mismatch: x={tuple(x.shape)} weight={tuple(weight.shape)}")
-    if bias is not None:
-        require_cuda_contiguous("bias", bias)
-        if bias.numel() != n:
-            raise ValueError(f"bias size {bias.numel()} does not match output size {n}")
-
-    bm, bn, bk, group_m, selected_split_k, num_warps = _hopper_tma_splitk_params(m, n, k)
-    split_k = selected_split_k if split_k is None else split_k
-    if split_k <= 1:
-        return linear_hopper_tma(x, weight, bias)
-
-    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
-    if not _supports_host_tma(x, weight, out):
-        raise RuntimeError("linear_hopper_tma_splitk requires Hopper-compatible contiguous 2D tensors for host TMA")
-
-    from triton.tools.tensor_descriptor import TensorDescriptor
-
-    x_desc = TensorDescriptor.from_tensor(x, [bm, bk])
-    weight_desc = TensorDescriptor.from_tensor(weight, [bn, bk])
-    out_desc = TensorDescriptor.from_tensor(out, [bm, bn])
-    x_desc.block_shape = [bm, bk]
-    weight_desc.block_shape = [bn, bk]
-    out_desc.block_shape = [bm, bn]
-
-    total_tiles = cdiv(m, bm) * cdiv(n, bn)
-    partials = torch.empty((split_k, total_tiles, bm, bn), device=x.device, dtype=torch.float32)
-    _linear_hopper_tma_splitk_partial_kernel[(total_tiles, split_k)](
-        x_desc,
-        weight_desc,
-        partials,
-        m,
-        n,
-        k,
-        TOTAL_TILES=total_tiles,
-        BLOCK_M=bm,
-        BLOCK_N=bn,
-        BLOCK_K=bk,
-        GROUP_M=group_m,
-        SPLIT_K=split_k,
-        num_stages=3,
-        num_warps=num_warps,
-    )
-    _linear_hopper_tma_splitk_reduce_kernel[(total_tiles, )](
-        partials,
-        out_desc,
-        bias if bias is not None else x,
-        m,
-        n,
-        TOTAL_TILES=total_tiles,
-        HAS_BIAS=bias is not None,
-        BLOCK_M=bm,
-        BLOCK_N=bn,
-        GROUP_M=group_m,
-        SPLIT_K=split_k,
-        num_stages=1,
-        num_warps=4,
-    )
-    return out
-
-
 def _splitk_params(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
     block_m = 16 if m <= 16 else 128
     block_n = 128
@@ -1461,188 +913,6 @@ def linear_splitk(
     return out
 
 
-def _slicedk_params(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
-    block_m = 16 if m <= 16 else 32
-    block_n = 64
-    block_k = 64
-    group_m = 8
-    if m <= 16 and k >= 8_192:
-        slices = 4
-    elif m <= 128:
-        slices = 2
-    else:
-        slices = 1
-    num_warps = 8 if slices >= 4 else 4
-    return block_m, block_n, block_k, group_m, slices, num_warps
-
-
-def linear_slicedk(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Single-kernel BF16 matmul with CTA-local sliced-K reduction."""
-    require_cuda_contiguous("x", x)
-    require_cuda_contiguous("weight", weight)
-    if x.dim() != 2 or weight.dim() != 2:
-        raise ValueError(f"x and weight must be 2D, got {tuple(x.shape)} and {tuple(weight.shape)}")
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-        raise ValueError("linear_slicedk currently expects bfloat16 inputs and weights")
-    m, k = x.shape
-    n, wk = weight.shape
-    if k != wk:
-        raise ValueError(f"linear dimension mismatch: x={tuple(x.shape)} weight={tuple(weight.shape)}")
-    if bias is not None:
-        require_cuda_contiguous("bias", bias)
-        if bias.numel() != n:
-            raise ValueError(f"bias size {bias.numel()} does not match output size {n}")
-
-    block_m, block_n, block_k, group_m, slices, num_warps = _slicedk_params(m, n, k)
-    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
-    grid = (cdiv(m, block_m) * cdiv(n, block_n), )
-    _linear_slicedk_kernel[grid](
-        x,
-        weight,
-        out,
-        bias if bias is not None else x,
-        m,
-        n,
-        k,
-        x.stride(0),
-        x.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        out.stride(0),
-        out.stride(1),
-        HAS_BIAS=bias is not None,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        GROUP_M=group_m,
-        SLICES=slices,
-        NUM_STAGES=3,
-        num_stages=3,
-        num_warps=num_warps,
-    )
-    return out
-
-
-def _cluster_slicedk_params(m: int, n: int, k: int) -> tuple[int, int, int, int, int]:
-    block_m = 16 if m <= 16 else 32
-    block_n = 64
-    block_k = 64
-    group_m = 8
-    num_warps = 4
-    return block_m, block_n, block_k, group_m, num_warps
-
-
-def linear_cluster_slicedk(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """BF16 matmul using a 2-CTA cluster split over K with DSMEM accumulator reduction."""
-    require_cuda_contiguous("x", x)
-    require_cuda_contiguous("weight", weight)
-    skip_reason = _cluster_slicedk_support_skip_reason(x)
-    if skip_reason is not None:
-        raise RuntimeError(skip_reason)
-    if x.dim() != 2 or weight.dim() != 2:
-        raise ValueError(f"x and weight must be 2D, got {tuple(x.shape)} and {tuple(weight.shape)}")
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-        raise ValueError("linear_cluster_slicedk currently expects bfloat16 inputs and weights")
-    m, k = x.shape
-    n, wk = weight.shape
-    if k != wk:
-        raise ValueError(f"linear dimension mismatch: x={tuple(x.shape)} weight={tuple(weight.shape)}")
-    if bias is not None:
-        require_cuda_contiguous("bias", bias)
-        if bias.numel() != n:
-            raise ValueError(f"bias size {bias.numel()} does not match output size {n}")
-
-    block_m, block_n, block_k, group_m, num_warps = _cluster_slicedk_params(m, n, k)
-    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
-    grid = (cdiv(m, block_m) * cdiv(n, block_n), )
-    _linear_cluster_slicedk_kernel[grid](
-        x,
-        weight,
-        out,
-        bias if bias is not None else x,
-        m,
-        n,
-        k,
-        x.stride(0),
-        x.stride(1),
-        weight.stride(0),
-        weight.stride(1),
-        out.stride(0),
-        out.stride(1),
-        mesh=_LINEAR_CLUSTER_MESH_2,
-        HAS_BIAS=bias is not None,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        GROUP_M=group_m,
-        CLUSTER_SIZE=2,
-        NUM_STAGES=3,
-        num_ctas=1,
-        num_stages=3,
-        num_warps=num_warps,
-    )
-    return out
-
-
-def linear_cluster_slicedk_tma(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Host-TMA BF16 matmul using a 2-CTA cluster split over K with DSMEM reduction."""
-    require_cuda_contiguous("x", x)
-    require_cuda_contiguous("weight", weight)
-    skip_reason = _cluster_slicedk_support_skip_reason(x)
-    if skip_reason is not None:
-        raise RuntimeError(skip_reason)
-    if x.dim() != 2 or weight.dim() != 2:
-        raise ValueError(f"x and weight must be 2D, got {tuple(x.shape)} and {tuple(weight.shape)}")
-    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-        raise ValueError("linear_cluster_slicedk_tma currently expects bfloat16 inputs and weights")
-    m, k = x.shape
-    n, wk = weight.shape
-    if k != wk:
-        raise ValueError(f"linear dimension mismatch: x={tuple(x.shape)} weight={tuple(weight.shape)}")
-    if bias is not None:
-        require_cuda_contiguous("bias", bias)
-        if bias.numel() != n:
-            raise ValueError(f"bias size {bias.numel()} does not match output size {n}")
-
-    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
-    if not _supports_host_tma(x, weight, out):
-        raise RuntimeError("linear_cluster_slicedk_tma requires Hopper-compatible contiguous 2D tensors for host TMA")
-
-    from triton.tools.tensor_descriptor import TensorDescriptor
-
-    dummy_block = [1, 1]
-    x_desc = TensorDescriptor.from_tensor(x, dummy_block)
-    weight_desc = TensorDescriptor.from_tensor(weight, dummy_block)
-    out_desc = TensorDescriptor.from_tensor(out, dummy_block)
-
-    grid = lambda meta: (cdiv(m, meta["BLOCK_M"]) * cdiv(n, meta["BLOCK_N"]), )
-    _linear_cluster_slicedk_tma_kernel_autotuned[grid](
-        x_desc,
-        weight_desc,
-        out_desc,
-        bias if bias is not None else x,
-        M=m,
-        N=n,
-        K=k,
-        mesh=_LINEAR_CLUSTER_MESH_2,
-        HAS_BIAS=bias is not None,
-        CLUSTER_SIZE=2,
-    )
-    return out
-
-
 def _gemv_params(n: int, k: int) -> tuple[int, int, int]:
     if n == 10_240 and k == 5_120:
         return 16, 128, 8
@@ -1655,6 +925,13 @@ def _gemv_params(n: int, k: int) -> tuple[int, int, int]:
     if n == 151_936 and k == 5_120:
         return 8, 1_024, 8
     return 16, 256, 8
+
+
+def _gemv_persistent_params(n: int, k: int) -> tuple[int, int, int, int]:
+    if n == 5_120 and k == 8_192:
+        return 4, 1_024, 4, 8
+    block_n, block_k, num_warps = _gemv_params(n, k)
+    return block_n, block_k, num_warps, 1
 
 
 def linear_gemv(
@@ -1698,6 +975,70 @@ def linear_gemv(
         BLOCK_K=block_k,
         NUM_STAGES=3,
         num_stages=3,
+        num_warps=num_warps,
+    )
+    return out
+
+
+def linear_gemv_persistent(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    *,
+    block_n: int | None = None,
+    block_k: int | None = None,
+    num_warps: int | None = None,
+    num_stages: int = 3,
+    cta_per_sm: int | None = None,
+    sm_count: int | None = None,
+) -> torch.Tensor:
+    """Decode-only persistent GEMV with a tunable number of resident CTAs per SM."""
+    require_cuda_contiguous("x", x)
+    require_cuda_contiguous("weight", weight)
+    if x.dim() != 2 or weight.dim() != 2:
+        raise ValueError(f"x and weight must be 2D, got {tuple(x.shape)} and {tuple(weight.shape)}")
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("linear_gemv_persistent currently expects bfloat16 inputs and weights")
+    m, k = x.shape
+    n, wk = weight.shape
+    if m != 1:
+        raise ValueError(f"linear_gemv_persistent expects M=1, got M={m}")
+    if k != wk:
+        raise ValueError(f"linear dimension mismatch: x={tuple(x.shape)} weight={tuple(weight.shape)}")
+    if bias is not None:
+        require_cuda_contiguous("bias", bias)
+        if bias.numel() != n:
+            raise ValueError(f"bias size {bias.numel()} does not match output size {n}")
+
+    default_block_n, default_block_k, default_num_warps, default_cta_per_sm = _gemv_persistent_params(n, k)
+    block_n = int(block_n or default_block_n)
+    block_k = int(block_k or default_block_k)
+    num_warps = int(num_warps or default_num_warps)
+    cta_per_sm = int(cta_per_sm or default_cta_per_sm)
+    if cta_per_sm < 1:
+        raise ValueError(f"cta_per_sm must be positive, got {cta_per_sm}")
+    out = torch.empty((m, n), device=x.device, dtype=x.dtype)
+    num_n_tiles = cdiv(n, block_n)
+    num_sms = int(sm_count or torch.cuda.get_device_properties(x.device).multi_processor_count)
+    num_ctas = min(num_sms * cta_per_sm, num_n_tiles)
+    grid = (num_ctas, )
+    _linear_gemv_persistent_kernel[grid](
+        x,
+        weight,
+        bias if bias is not None else x,
+        out,
+        N=n,
+        K=k,
+        stride_xk=x.stride(1),
+        stride_wn=weight.stride(0),
+        stride_wk=weight.stride(1),
+        stride_on=out.stride(1),
+        HAS_BIAS=bias is not None,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        NUM_STAGES=num_stages,
+        NUM_CTAS=num_ctas,
+        num_stages=num_stages,
         num_warps=num_warps,
     )
     return out
@@ -1865,61 +1206,69 @@ def qkv_linear(
 
 
 @triton.jit
-def _silu_and_mul_kernel(
-    a_ptr,
-    b_ptr,
+def _silu_and_mul_packed_kernel(
+    packed_ptr,
     out_ptr,
-    total: tl.constexpr,
     inner: tl.constexpr,
-    a_stride_r,
-    a_stride_c,
-    b_stride_r,
-    b_stride_c,
+    packed_stride_r,
+    packed_stride_c,
     out_stride_r,
     out_stride_c,
     tile_size: tl.constexpr,
-    tiles_per_cta: tl.constexpr,
 ):
-    pid = tl.program_id(0)
-    num_ctas = tl.num_programs(0)
-    for j in tl.static_range(0, tiles_per_cta):
-        tile_id = pid + j * num_ctas
-        offsets = tile_id * tile_size + tl.arange(0, tile_size)
-        mask = offsets < total
-        row = offsets // inner
-        col = offsets - row * inner
-        x = tl.load(a_ptr + row * a_stride_r + col * a_stride_c, mask=mask, other=0.0).to(tl.float32)
-        y = tl.load(b_ptr + row * b_stride_r + col * b_stride_c, mask=mask, other=0.0)
-        silu = tl.fdiv(x, (1.0 + tl.exp(-x)))
-        tl.store(out_ptr + row * out_stride_r + col * out_stride_c, (silu * y).to(out_ptr.dtype.element_ty),
-                 mask=mask)
+    row = tl.program_id(0)
+    tile = tl.program_id(1)
+    col = tile * tile_size + tl.arange(0, tile_size)
+    mask = col < inner
+    gate = tl.load(
+        packed_ptr + row * packed_stride_r + col * packed_stride_c,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    up = tl.load(
+        packed_ptr + row * packed_stride_r + (col + inner) * packed_stride_c,
+        mask=mask,
+        other=0.0,
+    )
+    silu = tl.fdiv(gate, (1.0 + tl.exp(-gate)))
+    tl.store(
+        out_ptr + row * out_stride_r + col * out_stride_c,
+        (silu * up).to(out_ptr.dtype.element_ty),
+        mask=mask,
+    )
 
 
-def silu_and_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    out = torch.empty_like(a)
-    return silu_and_mul_out(a, b, out)
+def _silu_and_mul_packed_launch(inner: int) -> tuple[int, int]:
+    tile_size = min(1024, triton.next_power_of_2(inner))
+    return tile_size, 1
 
 
-def silu_and_mul_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
-    if a.shape != b.shape or a.shape != out.shape:
-        raise ValueError(f"silu_and_mul inputs must have the same shape, got {a.shape}, {b.shape}, {out.shape}")
+def silu_and_mul(packed: torch.Tensor) -> torch.Tensor:
+    return silu_and_mul_packed(packed)
+
+
+def silu_and_mul_packed(packed: torch.Tensor) -> torch.Tensor:
+    if packed.shape[-1] % 2 != 0:
+        raise ValueError(f"silu_and_mul packed last dimension must be even, got {packed.shape}")
+    out = torch.empty((*packed.shape[:-1], packed.shape[-1] // 2), device=packed.device, dtype=packed.dtype)
+    return silu_and_mul_packed_out(packed, out)
+
+
+def silu_and_mul_packed_out(packed: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    if packed.shape[-1] != out.shape[-1] * 2 or packed.shape[:-1] != out.shape[:-1]:
+        raise ValueError(f"silu_and_mul packed input/output shape mismatch: packed={packed.shape}, out={out.shape}")
     inner = out.shape[-1]
-    total = out.numel()
-    tile_size, num_ctas, tiles_per_cta, num_warps = pointwise_1d_launch(total)
-    _silu_and_mul_kernel[(num_ctas, )](
-        a,
-        b,
+    rows = out.numel() // inner
+    tile_size, num_warps = _silu_and_mul_packed_launch(inner)
+    _silu_and_mul_packed_kernel[(rows, cdiv(inner, tile_size))](
+        packed,
         out,
-        total,
         inner,
-        row_stride(a),
-        a.stride(-1),
-        row_stride(b),
-        b.stride(-1),
+        row_stride(packed),
+        packed.stride(-1),
         row_stride(out),
         out.stride(-1),
         tile_size,
-        tiles_per_cta,
         num_warps=num_warps,
     )
     return out

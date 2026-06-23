@@ -11,6 +11,7 @@ from typing import Any
 
 
 DEFAULT_OUTPUT_DIR = Path("build/mega/qwen3-32b")
+VLLM_LINEAR_REFERENCE_BACKEND = "vLLM unquantized linear -> torch.matmul/cuBLASLt"
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -44,6 +45,18 @@ def _speedup(numerator: float | None, denominator: float | None) -> float | None
     if not numerator or not denominator:
         return None
     return numerator / denominator
+
+
+def _normalize_vllm_kernel(row: dict[str, Any]) -> str:
+    kernel = str(row.get("vllm_kernel", ""))
+    if str(row.get("kind", "")) == "linear":
+        return VLLM_LINEAR_REFERENCE_BACKEND
+    return kernel
+
+
+def _is_selected_row(row: dict[str, Any]) -> bool:
+    role = row.get("role")
+    return role in (None, "", "selected")
 
 
 def _scenario_key(record: dict[str, Any]) -> str:
@@ -116,10 +129,13 @@ def _build_summary(
 
     vllm_ops = []
     for row in vllm_op["rows"]:
+        if not _is_selected_row(row):
+            continue
         ours_ms = row.get("ours_ms")
         vllm_ms = row.get("vllm_ms")
         vllm_ops.append({
             **row,
+            "vllm_kernel": _normalize_vllm_kernel(row),
             "speedup_vllm_vs_tle_op": _speedup(float(ours_ms), float(vllm_ms)) if ours_ms != "" and vllm_ms != "" else None,
         })
 
@@ -152,21 +168,26 @@ def _build_summary(
         if tle_op == "linear.qkv_proj":
             parts = [(token_scenario, "linear.qkv_proj")]
             group = "linear.qkv_proj"
+            note = "reference is vLLM unquantized linear -> cuBLAS/cuBLASLt"
         elif tle_op == "linear.o_proj":
             parts = [(token_scenario, "linear.o_proj")]
             group = "linear.o_proj"
+            note = "reference is vLLM unquantized linear -> cuBLAS/cuBLASLt"
         elif tle_op == "linear.gate_up_proj":
             parts = [(token_scenario, "linear.gate_up_proj")]
             group = "linear.gate_up_proj"
+            note = "reference is vLLM unquantized linear -> cuBLAS/cuBLASLt"
         elif tle_op == "silu_and_mul":
             parts = [(token_scenario, "silu_and_mul")]
             group = "silu_and_mul"
         elif tle_op == "linear.down_proj":
             parts = [(token_scenario, "linear.down_proj")]
             group = "linear.down_proj"
+            note = "reference is vLLM unquantized linear -> cuBLAS/cuBLASLt"
         elif tle_op == "linear.lm_head":
             parts = [("lm_head", "linear.lm_head")]
             group = "linear.lm_head"
+            note = "reference is vLLM unquantized linear -> cuBLAS/cuBLASLt"
         elif tle_op == "attention.ws":
             parts = [(f"prefill{prompt_len}", "attention.prefill")]
             group = "attention.prefill"
@@ -244,7 +265,11 @@ def _build_summary(
                 "warmup": vllm_op.get("warmup"),
                 "iters": vllm_op.get("iters"),
                 "versions": vllm_op.get("versions", {}),
-                "note": "vLLM per-op rows are isolated same-shape microbenchmarks, not an end-to-end vLLM trace.",
+                "note": (
+                    "vLLM/reference per-op rows are isolated same-shape microbenchmarks, not an end-to-end "
+                    "vLLM trace. Linear rows use vLLM's unquantized dense-linear backend "
+                    "(torch.nn.functional.linear/ATen matmul -> cuBLAS/cuBLASLt), not a vLLM custom kernel."
+                ),
             },
         },
         "e2e_rows": e2e_rows,
@@ -276,10 +301,11 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         f"- vLLM e2e: warmup `{summary['methodology']['vllm_e2e'].get('warmup')}`, "
         f"iters `{summary['methodology']['vllm_e2e'].get('iters')}`, "
         f"dtype `{summary['methodology']['vllm_e2e'].get('dtype')}`.",
-        f"- vLLM op microbench: warmup `{summary['methodology']['vllm_op']['warmup']}`, "
+        f"- vLLM/reference op microbench: warmup `{summary['methodology']['vllm_op']['warmup']}`, "
         f"iters `{summary['methodology']['vllm_op']['iters']}`.",
         "- TLE e2e per-op timings are CUDA events around high-level TLE kernel calls inside the TLE engine.",
-        "- vLLM operator rows are isolated same-shape microbenchmarks against vLLM custom ops or cuBLAS, not a vLLM serving trace.",
+        "- vLLM/reference operator rows are isolated same-shape microbenchmarks, not a vLLM serving trace.",
+        "- Linear reference rows are cuBLAS/cuBLASLt through vLLM's default unquantized dense-linear path, not vLLM custom kernels.",
         "",
         "## E2E Latency",
         "",
@@ -313,8 +339,8 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         "",
         "## Scenario-Level Matched Operators",
         "",
-        "`vLLM op speedup` is `TLE avg ms/call / vLLM matched op ms`; values above 1.0 mean the vLLM op is faster. "
-        "Matched rows use the same vLLM-style operator responsibility where available.",
+        "`vLLM/reference speedup` is `TLE avg ms/call / matched reference ms`; values above 1.0 mean the matched reference is faster. "
+        "Matched rows use the same vLLM-style operator responsibility where available; linear rows are the cuBLAS/cuBLASLt backend used by vLLM unquantized dense linear.",
         "",
     ])
     for scope, rows in summary["matched_ops_by_scope"].items():
@@ -324,7 +350,7 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         lines.extend([
             f"### {scenario} / {phase}",
             "",
-            "| op group | TLE op | TLE count | TLE total ms | TLE avg ms/call | vLLM matched op(s) | vLLM op scenario | vLLM ms/call | vLLM op speedup | note |",
+            "| op group | TLE op | TLE count | TLE total ms | TLE avg ms/call | matched reference op(s) | reference scenario | reference ms/call | vLLM/reference speedup | note |",
             "|---|---|---:|---:|---:|---|---|---:|---:|---|",
         ])
         for row in rows:
@@ -367,11 +393,11 @@ def _write_markdown(path: Path, summary: dict[str, Any]) -> None:
         lines.append("")
 
     lines.extend([
-        "## TLE Kernel vs vLLM Op Microbenchmarks",
+        "## TLE Selected Kernel vs Reference Microbenchmarks",
         "",
-        "`vLLM op speedup` is `TLE/local-op ms / vLLM-op ms`; values above 1.0 mean the vLLM op is faster.",
+        "`vLLM/reference speedup` is `TLE/local-op ms / reference-op ms`; values above 1.0 mean the reference is faster.",
         "",
-        "| kind | scenario | op | shape | TLE/local ms | vLLM op ms | vLLM op speedup | TLE/local kernel | vLLM kernel |",
+        "| kind | scenario | op | shape | TLE/local ms | reference ms | vLLM/reference speedup | TLE/local kernel | vLLM/reference kernel |",
         "|---|---|---|---|---:|---:|---:|---|---|",
     ])
     for row in summary["vllm_op_rows"]:

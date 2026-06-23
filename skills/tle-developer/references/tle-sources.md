@@ -254,6 +254,97 @@ rg -n "populateLocalPointersOpToLLVMPatterns|UnrealizedConversionCastOp|GPUDiale
    - Layer: layout conversions / pipeline.
    - Action: count key TTGIR/PTX patterns before/after and verify traffic reduction.
 
+### 5.4 Known Pitfall: Do Not Guess Shared-Memory Padding
+Use this checklist when a TLE kernel's shared-memory footprint grows after a
+layout, `tle.pipe`, `local_ptr`, or epilogue-staging change.
+
+Observed case:
+1. While aligning a warp-specialized GQA prefill attention kernel with an
+   FA3-style `q`/`o` shared-memory reuse pattern, PTX shared-memory offsets grew
+   from roughly `global_smem+164152` to `global_smem+172104`.
+2. The first hypothesis was that this was padding caused by changing the query
+   buffer from two split allocations to one shaped root allocation, such as
+   `[1, 2, 64, 128]` or `[1, 128, 128]`.
+3. That hypothesis was not proven because the experiment changed multiple
+   things at once: query shared-memory shape, pipe field structure, and a TLE
+   `local_ptr` output-staging path.
+4. Important nuance: FA3 also uses output staging. The issue was not the concept
+   of O staging; it was whether the staging is represented and lowered with the
+   same storage overlay and epilogue copy strategy as FA3.
+
+Artifact-based check path:
+1. Dump TTGIR/PTX for the last known version and the changed version:
+   ```bash
+   TRITON_ALWAYS_COMPILE=1 \
+   TRITON_KERNEL_DUMP=1 \
+   TRITON_DUMP_DIR=/tmp/tle_dump_case \
+   <py_exec> <repro.py>
+   ```
+2. Inspect TTGIR `ttg.local_alloc` shapes first. In the observed case:
+   - old path: `q_smem_lo` and `q_smem_hi` were each
+     `memdesc<1x64x128xbf16>`;
+   - changed path: `q_smem` was `memdesc<1x2x64x128xbf16>` or
+     `memdesc<1x128x128xbf16>`;
+   - `k_smem`/`v_smem` remained `memdesc<2x1x1x128x128xbf16>`.
+3. Extract the maximum PTX shared-memory offset:
+   ```bash
+   perl -ne 'while(/global_smem\+([0-9]+)/g){$m=$1 if $1>$m} END{print "$m\n"}' kernel.ptx
+   ```
+4. Isolate one variable at a time. In the observed case, keeping the single
+   query root allocation `[1, 2, 64, 128]` but removing the output staging:
+   ```python
+   tl.store(q_tile_ptrs, o_vals, ...)
+   o_vals = tl.load(q_tile_ptrs, ...)
+   ```
+   reduced the PTX maximum back to `global_smem+164136`, matching the old path.
+5. Compare against FA3's storage model before drawing conclusions. FA3 declares
+   `smem_o`, but the kernel-level shared storage overlays mainloop and epilogue
+   storage with a `union`, and intentionally lines `smem_o` up with `smem_v`
+   while padding only if `sizeof(smem_o) > sizeof(smem_v)`. Its epilogue writes
+   accumulator fragments to `smem_o`, then stores from `smem_o` to global memory
+   through TMA or a vectorized global-copy path.
+
+Confirmed root cause for that case:
+1. The extra roughly 8 KiB was caused by the current TLE representation/lowering
+   of the `local_ptr` output-staging path after reusing the query tile as the
+   output staging tile.
+2. It was not caused by the query root allocation shape or rank padding: with
+   the same single query root and no output staging, shared-memory usage returned
+   to the old level.
+3. It was also not evidence that FA3-style O staging is inherently expensive.
+   FA3's O staging is paired with explicit shared-storage overlay (`smem_o`
+   over `smem_v`) and a dedicated epilogue copy/TMA path; the observed TLE path
+   did not prove the same storage reuse at the PTX level.
+4. Treat "padding" as a conclusion only after shape, staging, storage overlay,
+   and lowering path have been isolated independently.
+
+Related TLE pipe limitation found during the same investigation:
+1. Passing `subslice` results as `tle.pipe` fields can fail during lowering with:
+   ```text
+   We don't support memdesc_index of a subview
+   ```
+2. Trigger pattern:
+   ```python
+   q_smem = tle.gpu.alloc([2, HALF_M, BLOCK_D], ...)
+   q_lo = q_smem.subslice([0, 0, 0], [1, HALF_M, BLOCK_D])
+   pipe = tle.pipe(capacity=1, q_lo=q_lo)
+   ```
+3. Root cause: pipe `acquire`/`wait` stage selection lowers by applying
+   `memdesc_index` to the field. If the field is already a subview, the current
+   TLE lowering cannot index that subview.
+4. A regular fix should teach pipe/subview lowering to stage-index the root
+   memdesc and then reapply subview offsets, or introduce an explicit alias/view
+   field model. Do not work around this by silently changing the algorithm or
+   shrinking the tile.
+
+Debug rule:
+1. A shared-memory regression must be explained with TTGIR allocation evidence
+   plus PTX offset evidence.
+2. When multiple kernel edits land together, create a temporary compile-only
+   isolation variant and restore it after measuring.
+3. Preserve correctness checks for every measured variant; PTX evidence without
+   a passing kernel can identify compiler behavior but not final kernel behavior.
+
 ## 6. Implementing New TLE Features (Concrete File Map)
 
 Use this section when changing language semantics or compiler behavior.

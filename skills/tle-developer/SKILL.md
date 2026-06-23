@@ -39,7 +39,8 @@ Impact scope (optional):
    - current TLE semantics contract,
    - kernel patterns,
    - feature-development file map,
-   - debug/perf procedures.
+   - debug/perf procedures,
+   - known pitfalls and artifact-based root-cause checks.
 2. Treat `references/workflow-templates.md` as the source of truth for:
    - intake,
    - validation matrix,
@@ -59,7 +60,9 @@ Impact scope (optional):
 1. Validation commands and outcomes.
 2. Fix Summary (when fixing bugs or regressions).
 3. Lessons Entry (for fixes and optimization work).
-4. Merge Decision Package (changed layers, risks, follow-ups).
+4. For TLE perf/debug work, cite relevant known-pitfall checks from
+   `references/tle-sources.md` when the symptom matches.
+5. Merge Decision Package (changed layers, risks, follow-ups).
 
 ## Completion Checklist
 1. Acceptance criteria mapped to tests.

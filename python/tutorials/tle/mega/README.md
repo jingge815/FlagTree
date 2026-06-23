@@ -73,7 +73,9 @@ conda run -n flagtree python python/tutorials/tle/mega/bench/bench_linear_rmsnor
 This compares the generated mega scheduler against a normal non-mega Triton
 baseline that launches a linear stage and an RMSNorm stage. The benchmark
 precompiles the mega scheduler and preallocates intermediate buffers before
-timing.
+timing. By default it also runs a same-topology no-op mega scheduler to isolate
+scheduler overhead from task-body compute; use `--skip-noop` to disable that
+extra diagnostic.
 
 ## Mega Scheduler IR
 

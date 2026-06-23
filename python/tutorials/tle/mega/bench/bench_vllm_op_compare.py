@@ -170,6 +170,9 @@ def _torch_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return torch.matmul(x, weight.t())
 
 
+VLLM_UNQUANTIZED_LINEAR_BACKEND = "vLLM unquantized linear -> torch.matmul/cuBLASLt"
+
+
 def _make_row(
     *,
     kind: str,
@@ -272,12 +275,10 @@ def _bench_silu_and_mul(
 
     intermediate = int(cfg["intermediate_size"])
     x = torch.randn((tokens, 2 * intermediate), device="cuda", dtype=torch.bfloat16)
-    x_a = x[:, :intermediate]
-    x_b = x[:, intermediate:]
     ours_out = torch.empty((tokens, intermediate), device="cuda", dtype=torch.bfloat16)
     vllm_out = torch.empty_like(ours_out)
 
-    ours_ms = _time_cuda(lambda: linear_kernels.silu_and_mul_out(x_a, x_b, ours_out), warmup=warmup, iters=iters)
+    ours_ms = _time_cuda(lambda: linear_kernels.silu_and_mul_packed_out(x, ours_out), warmup=warmup, iters=iters)
     vllm_ms = _time_cuda(lambda: torch.ops._C.silu_and_mul(vllm_out, x), warmup=warmup, iters=iters)
     rows.append(
         _make_row(
@@ -286,11 +287,11 @@ def _bench_silu_and_mul(
             op="silu_and_mul",
             tokens=tokens,
             shape=f"[{tokens}, {2 * intermediate}] -> [{tokens}, {intermediate}]",
-            ours_kernel="kernels.linear.silu_and_mul_out",
+            ours_kernel="kernels.linear.silu_and_mul_packed_out",
             vllm_kernel="torch.ops._C.silu_and_mul",
             ours_ms=ours_ms,
             vllm_ms=vllm_ms,
-            note="ours uses silu_and_mul_out(A, B, out) on sliced views",
+            note="ours uses vLLM-style packed silu_and_mul_packed_out(input, out)",
         ))
 
 
@@ -353,13 +354,13 @@ def _bench_attention_prefill(
     q = torch.randn((seq_len, heads, head_dim), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((seq_len, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
+    k_cache = k.unsqueeze(0).contiguous()
+    v_cache = v.unsqueeze(0).contiguous()
     cu = torch.tensor([0, seq_len], device="cuda", dtype=torch.int32)
 
     ours_ms = _time_cuda(
-        lambda: attention_kernels.flash_attn_varlen_func(
-            q, k, v, seq_len, cu, seq_len, cu_seqlens_k=cu, dropout_p=0.0,
-            softmax_scale=scale, causal=True,
-        ),
+        lambda: attention_kernels.attention_ws(q, k_cache, v_cache, q_len=seq_len, start_pos=0, kv_len=seq_len,
+                                               sm_scale=scale),
         warmup=warmup,
         iters=iters,
     )
@@ -378,11 +379,11 @@ def _bench_attention_prefill(
             op="attention.prefill",
             tokens=seq_len,
             shape=f"q=[{seq_len}, {heads}, {head_dim}], kv=[{seq_len}, {kv_heads}, {head_dim}]",
-            ours_kernel="kernels.attention.flash_attn_varlen_func",
+            ours_kernel="kernels.attention.attention_ws",
             vllm_kernel="vllm_flash_attn.flash_attn_varlen_func(fa_version=3)",
             ours_ms=ours_ms,
             vllm_ms=vllm_ms,
-            note="ours uses varlen interface and non-paged launch heuristic",
+            note="ours uses the e2e-selected prefill attention path",
         ))
 
 
@@ -398,14 +399,14 @@ def _bench_attention_decode(
     q = torch.randn((1, heads, head_dim), device="cuda", dtype=torch.bfloat16)
     k = torch.randn((kv_len, kv_heads, head_dim), device="cuda", dtype=torch.bfloat16)
     v = torch.randn_like(k)
+    k_cache = k.unsqueeze(0).contiguous()
+    v_cache = v.unsqueeze(0).contiguous()
     cu_q = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     cu_k = torch.tensor([0, kv_len], device="cuda", dtype=torch.int32)
 
     ours_ms = _time_cuda(
-        lambda: attention_kernels.flash_attn_varlen_func(
-            q, k, v, 1, cu_q, kv_len, cu_seqlens_k=cu_k, dropout_p=0.0,
-            softmax_scale=scale, causal=True,
-        ),
+        lambda: attention_kernels.attention_decode(q, k_cache, v_cache, q_len=1, start_pos=kv_len - 1,
+                                                   kv_len=kv_len, sm_scale=scale),
         warmup=warmup,
         iters=iters,
     )
@@ -424,11 +425,11 @@ def _bench_attention_decode(
             op="attention.decode",
             tokens=1,
             shape=f"q=[1, {heads}, {head_dim}], kv=[{kv_len}, {kv_heads}, {head_dim}]",
-            ours_kernel="kernels.attention.flash_attn_varlen_func",
+            ours_kernel="kernels.attention.attention_decode",
             vllm_kernel="vllm_flash_attn.flash_attn_varlen_func(fa_version=3)",
             ours_ms=ours_ms,
             vllm_ms=vllm_ms,
-            note="ours uses non-paged cu_seqlens_k varlen path; paged attention intentionally excluded",
+            note="ours uses the e2e-selected decode attention path; paged attention intentionally excluded",
         ))
 
 
@@ -464,76 +465,11 @@ def _bench_linear(
             tokens=tokens,
             shape=f"M={tokens}, N={n}, K={k}",
             ours_kernel=ours_kernel,
-            vllm_kernel="torch.matmul/cuBLAS",
+            vllm_kernel=VLLM_UNQUANTIZED_LINEAR_BACKEND,
             ours_ms=ours_ms,
             vllm_ms=vllm_ms,
             note=note,
         ))
-
-    def append_candidate(name: str, kernel_name: str, fn: Callable[[], torch.Tensor], note: str) -> None:
-        try:
-            candidate_ms: float | None = _time_cuda(fn, warmup=warmup, iters=iters)
-        except Exception as exc:  # noqa: BLE001 - recorded in benchmark metadata.
-            candidate_ms = None
-            note = f"skipped: {type(exc).__name__}: {exc}"
-        rows.append(
-            _make_row(
-                kind="linear",
-                scenario=scenario,
-                op=f"{op}.{name}",
-                tokens=tokens,
-                shape=f"M={tokens}, N={n}, K={k}",
-                ours_kernel=kernel_name,
-                vllm_kernel="torch.matmul/cuBLAS",
-                ours_ms=candidate_ms,
-                vllm_ms=vllm_ms,
-                note=note,
-            ))
-
-    append_candidate(
-        "hopper_tma",
-        "kernels.linear.linear_hopper_tma",
-        lambda: linear_kernels.linear_hopper_tma(x, weight, None),
-        "candidate copied from FlagGems Hopper mm.py general host-TMA GEMM",
-    )
-    append_candidate(
-        "hopper_tma_splitk",
-        "kernels.linear.linear_hopper_tma_splitk",
-        lambda: linear_kernels.linear_hopper_tma_splitk(x, weight, None),
-        "candidate using host-TMA GEMM per K split with FP32 partial buffer and explicit reduction",
-    )
-    if tokens == 1:
-        append_candidate(
-            "gemv",
-            "kernels.linear.linear_gemv",
-            lambda: linear_kernels.linear_gemv(x, weight, None),
-            "candidate adapted from FlagGems mv.py for single-token decode matrix-vector projection",
-        )
-    append_candidate(
-        "slicedk",
-        "kernels.linear.linear_slicedk",
-        lambda: linear_kernels.linear_slicedk(x, weight, None),
-        "candidate using a single CTA-local sliced-K reduction with no global partial buffer",
-    )
-    append_candidate(
-        "cluster_slicedk",
-        "kernels.linear.linear_cluster_slicedk",
-        lambda: linear_kernels.linear_cluster_slicedk(x, weight, None),
-        "candidate using a 2-CTA cluster split over K with rank0 DSMEM remote accumulator reduction",
-    )
-    append_candidate(
-        "cluster_slicedk_tma",
-        "kernels.linear.linear_cluster_slicedk_tma",
-        lambda: linear_kernels.linear_cluster_slicedk_tma(x, weight, None),
-        "autotuned candidate using host-TMA A/B/C descriptors plus a 2-CTA cluster K split and DSMEM remote accumulator reduction",
-    )
-    if op != "linear.gate_up_proj":
-        append_candidate(
-            "splitk",
-            "kernels.linear.linear_splitk",
-            lambda: linear_kernels.linear_splitk(x, weight, None),
-            "candidate copied from FlagGems Hopper mm.py split-K GEMM",
-        )
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
@@ -556,7 +492,7 @@ def _fmt(value: Any) -> str:
 def _write_report(path: Path, summary: dict[str, Any]) -> None:
     rows = summary["rows"]
     lines = [
-        "# Local Qwen3 Ops vs vLLM Qwen3-32B Benchmark",
+        "# Local Qwen3 Ops vs vLLM/Reference Qwen3-32B Benchmark",
         "",
         f"- Model path: `{summary['model_path']}`",
         f"- Config source: {summary['config']['source']}",
@@ -568,16 +504,16 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         "- Ours source: local kernels in `python/tutorials/tle/mega/kernels/{norm.py,linear.py,"
         "rotary_cache.py,attention.py}`.",
         "- Imported tuning policy: RMSNorm loop uses `TILE_N={1024,2048,4096,8192}` x "
-        "`num_warps={4,8,16}`; SiluAndMul uses pointwise `max_tile_size=512` and NVIDIA warp "
-        "heuristic; attention uses non-paged `mha_block_*` heuristic.",
+        "`num_warps={4,8,16}`; SiluAndMul uses vLLM-style packed input with `tile_size<=1024` "
+        "and `num_warps=1`; attention rows call the same `attention_ws`/`attention_decode` paths used by e2e.",
         "- Interface policy: local ops expose vLLM-compatible signatures where applicable and do not "
         "force wrapper-side `.contiguous()` copies.",
         "",
-        "`speedup` is `vLLM ms / ours ms`; values above 1.0 mean our local kernel is faster.",
+        "`speedup` is `reference ms / ours ms`; values above 1.0 mean our local kernel is faster.",
         "",
-        "## Latency",
+        "## Selected Kernel Latency",
         "",
-        "| kind | scenario | op | ours ms | vLLM ms | speedup | note |",
+        "| kind | scenario | op | ours ms | reference ms | speedup | note |",
         "|---|---|---|---:|---:|---:|---|",
     ]
     for row in rows:
@@ -595,7 +531,7 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         "",
         "## Shapes And Kernels",
         "",
-        "| scenario | op | shape | ours kernel | vLLM kernel |",
+        "| scenario | op | shape | ours kernel | vLLM/reference kernel |",
         "|---|---|---|---|---|",
     ])
     for row in rows:
@@ -608,9 +544,9 @@ def _write_report(path: Path, summary: dict[str, Any]) -> None:
         "",
         "- vLLM-aligned rows use vLLM custom ops for RMSNorm, fused add RMSNorm, SiluAndMul, RoPE, and FA3 varlen attention.",
         "- RMSNorm, fused add RMSNorm, SiluAndMul, and RoPE use explicit tensor strides rather than wrapper-side contiguous copies.",
-        "- Attention exposes `flash_attn_varlen_func` and uses stride-aware non-paged `cu_seqlens_k` varlen inputs plus the `mha_block_*` launch heuristic.",
-        "- Paged attention, dropout, alibi, softcap, sliding-window, split-KV, and FA3 auxiliary arguments are intentionally excluded from this bench-local kernel.",
-        "- Linear rows are context-only: no portable public vLLM bf16 dense-linear op is available.",
+        "- Attention rows use the e2e-selected local prefill/decode implementations: `attention_ws` and `attention_decode`.",
+        "- Paged attention, dropout, alibi, softcap, sliding-window, and FA3 auxiliary arguments are intentionally excluded from this bench-local comparison.",
+        "- Linear rows use vLLM's unquantized dense-linear backend: `torch.nn.functional.linear`/ATen matmul, which dispatches to cuBLAS/cuBLASLt on CUDA. These rows are not vLLM custom kernels.",
     ])
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 

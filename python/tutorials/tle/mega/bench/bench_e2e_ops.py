@@ -20,7 +20,7 @@ if str(MEGA_ROOT) not in sys.path:
 
 from kernels import attention_decode, attention_ws, embedding, fused_add_rms_norm  # noqa: E402
 from kernels import head_rmsnorm_rope  # noqa: E402
-from kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_out, store_cache  # noqa: E402
+from kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_packed_out, store_cache  # noqa: E402
 from models import Qwen3TLEEngine  # noqa: E402
 
 
@@ -72,21 +72,21 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
         return self.timer.record(
             op,
             layer,
-            lambda: linear(x.contiguous(), weights.weight, weights.bias),
+            lambda: linear(x, weights.weight, weights.bias),
         )
 
     def _lm_head_timed(self, x: torch.Tensor, weights):
         return self.timer.record(
             "linear.lm_head",
             None,
-            lambda: lm_head(x.contiguous(), weights.weight, weights.bias),
+            lambda: lm_head(x, weights.weight, weights.bias),
         )
 
     def _rms_norm_timed(self, op: str, layer: int | None, x: torch.Tensor, weight: torch.Tensor):
         return self.timer.record(
             op,
             layer,
-            lambda: rms_norm(x.contiguous(), (self.config.hidden_size, ), weight, self.config.rms_norm_eps),
+            lambda: rms_norm(x, (self.config.hidden_size, ), weight, self.config.rms_norm_eps),
         )
 
     def _fused_add_rms_norm_timed(
@@ -100,8 +100,7 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
         return self.timer.record(
             op,
             layer,
-            lambda: fused_add_rms_norm(x.contiguous(), residual.contiguous(), (self.config.hidden_size, ), weight,
-                                       self.config.rms_norm_eps),
+            lambda: fused_add_rms_norm(x, residual, (self.config.hidden_size, ), weight, self.config.rms_norm_eps),
         )
 
     def _qkv_linear_timed(self, layer: int, x: torch.Tensor, weights):
@@ -110,14 +109,13 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
         return self.timer.record(
             "linear.qkv_proj",
             layer,
-            lambda: qkv_linear(x.contiguous(), weights.weight, weights.bias, q_dim=q_dim, kv_dim=kv_dim),
+            lambda: qkv_linear(x, weights.weight, weights.bias, q_dim=q_dim, kv_dim=kv_dim),
         )
 
     def _mlp_activation_timed(self, layer: int, x: torch.Tensor, weights):
         packed = self._linear_timed("linear.gate_up_proj", layer, x, weights)
-        gate, up = packed.split((self.config.intermediate_size, self.config.intermediate_size), dim=-1)
-        out = torch.empty_like(gate)
-        return self.timer.record("silu_and_mul", layer, lambda: silu_and_mul_out(gate, up, out))
+        out = torch.empty((*packed.shape[:-1], self.config.intermediate_size), device=packed.device, dtype=packed.dtype)
+        return self.timer.record("silu_and_mul", layer, lambda: silu_and_mul_packed_out(packed, out))
 
     def _attention_timed(
         self,
@@ -155,13 +153,13 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
         batch_size, q_len, hidden = x.shape
         tokens = batch_size * q_len
         q_dim = self.config.num_attention_heads * self.config.head_dim
-        x_flat = x.reshape(tokens, hidden).contiguous()
+        x_flat = x.reshape(tokens, hidden)
 
         if residual is None:
             residual_flat = x_flat
             hidden_flat = self._rms_norm_timed("rms_norm.input", layer_idx, x_flat, layer.input_norm_weight)
         else:
-            residual_flat = residual.reshape(tokens, hidden).contiguous()
+            residual_flat = residual.reshape(tokens, hidden)
             hidden_flat, residual_flat = self._fused_add_rms_norm_timed(
                 "fused_add_rms_norm.input",
                 layer_idx,
@@ -202,7 +200,7 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
             kv_len=start_pos + q_len,
             sm_scale=1.0 / math.sqrt(self.config.head_dim),
         )
-        attn_flat = attn.reshape(tokens, q_dim).contiguous()
+        attn_flat = attn.reshape(tokens, q_dim)
         attn_out = self._linear_timed("linear.o_proj", layer_idx, attn_flat, layer.o_proj)
 
         hidden_flat, residual_flat = self._fused_add_rms_norm_timed(
@@ -237,11 +235,11 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
         for layer_idx in range(self.config.num_hidden_layers):
             x, residual = self._run_layer(x, residual, layer_idx, start_pos)
 
-        last_hidden = x[:, -1, :].contiguous().view(batch_size, self.config.hidden_size)
+        last_hidden = x[:, -1, :].reshape(batch_size, self.config.hidden_size)
         if residual is None:
             last_hidden = self._rms_norm_timed("rms_norm.final", None, last_hidden, self.weights.final_norm_weight)
         else:
-            last_residual = residual[:, -1, :].contiguous().view(batch_size, self.config.hidden_size)
+            last_residual = residual[:, -1, :].reshape(batch_size, self.config.hidden_size)
             last_hidden, _ = self._fused_add_rms_norm_timed(
                 "fused_add_rms_norm.final",
                 None,
