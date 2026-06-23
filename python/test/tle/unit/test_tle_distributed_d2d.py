@@ -26,8 +26,7 @@ class TestDeviceToDevice:
             x = torch.randn((N, N), dtype=torch.float32, device="cuda")
         y = torch.empty_like(x)
 
-        dev_comm_dptr,  dev_mem_dptr = tle.create_comm_tensor(x)
-
+        dev_comm_dptr, dev_mem_dptr = tle.create_comm_tensor(x)
 
         compiled = _remote_peer_d2d_kernel.warmup(
             dev_comm_dptr=dev_comm_dptr,
@@ -42,8 +41,8 @@ class TestDeviceToDevice:
         assert "remote_pointers" in compiled.asm["ttgir"]
         assert "flagcxGetIntraPointerC" in compiled.asm['ptx']
 
-        _remote_peer_d2d_kernel[(grid, )](dev_comm_dptr=dev_comm_dptr,
-            dev_mem_dptr=dev_mem_dptr, out_ptr=y, mesh=DEVICE_MESH, BLOCK=block)
+        _remote_peer_d2d_kernel[(grid, )](dev_comm_dptr=dev_comm_dptr, dev_mem_dptr=dev_mem_dptr, out_ptr=y,
+                                          mesh=DEVICE_MESH, BLOCK=block)
 
         tle.cleanup_communicator()
 

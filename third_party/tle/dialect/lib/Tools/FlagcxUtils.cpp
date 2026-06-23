@@ -13,8 +13,7 @@ using namespace mlir;
 static const llvm::StringMap<StringRef> runtimeNames = {
     {"getLocalPeFunction", "flagcxDevCommGetIntraRank"},
     {"getNumPesFunction", "flagcxDevCommGetIntraSize"},
-    {"getReadSignalFunction", "flagcxDevNetReadSignal"}
-};
+    {"getReadSignalFunction", "flagcxDevNetReadSignal"}};
 
 static inline LLVM::LLVMFuncOp createFuncInstance(const char *funcName,
                                                   ModuleOp module,
@@ -32,8 +31,9 @@ static inline LLVM::LLVMFuncOp createFuncInstance(const char *funcName,
   return func;
 }
 
-static inline Value getFlagcxMemPtr(mlir::Location loc, ConversionPatternRewriter &rewriter,
-                      Value memPtrInt) {
+static inline Value getFlagcxMemPtr(mlir::Location loc,
+                                    ConversionPatternRewriter &rewriter,
+                                    Value memPtrInt) {
   auto ctx = rewriter.getContext();
   auto ptrTy = LLVM::LLVMPointerType::get(ctx, 1);
   return rewriter.create<LLVM::IntToPtrOp>(loc, ptrTy, memPtrInt);
@@ -57,10 +57,9 @@ LLVM::CallOp getNumPesFunCall(mlir::Location loc,
       FlatSymbolRefAttr::get(func), ValueRange{comm_dev_ptr});
 }
 
-
 LLVM::CallOp getReadSignalFunCall(mlir::Location loc,
-                              ConversionPatternRewriter &rewriter,
-                              Value memPtrInt) {
+                                  ConversionPatternRewriter &rewriter,
+                                  Value memPtrInt) {
   auto ctx = rewriter.getContext();
   ModuleOp module =
       rewriter.getInsertionPoint()->getParentOp()->getParentOfType<ModuleOp>();
