@@ -15,6 +15,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #ifdef __TLE__
 #include "tle/dialect/include/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
 #endif
 #include "llvm/Support/Debug.h"
 
@@ -1592,6 +1593,16 @@ void replaceUsesAndPropagateType(
       builder.getContext()->getOrLoadDialect<triton::tle::TleDialect>();
       newVal = triton::tle::MemDescWGMMAViewOp::create(
           builder, view.getLoc(), newDstType, val, view.getOrder());
+    } else if (auto alias = dyn_cast<triton::tle::MemDescAliasOp>(user)) {
+      ttg::MemDescType oldType = alias.getType();
+      bool isMutable = cast<ttg::MemDescType>(val.getType()).getMutableMemory();
+      Type newDstType = ttg::MemDescType::get(
+          oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
+          oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
+      builder.getContext()->getOrLoadDialect<triton::tle::TleDialect>();
+      newVal = triton::tle::MemDescAliasOp::create(
+          builder, alias.getLoc(), newDstType, val,
+          alias.getOffsetBytesAttr());
 #endif
     } else if (auto reshape = dyn_cast<ttg::MemDescReshapeOp>(user)) {
       auto shape = reshape.getType().getShape();
@@ -1695,7 +1706,86 @@ replaceUsesWithLocalLoad(OpBuilder &builder, OpResult old,
   return maybeLocalLoad;
 }
 
+#ifdef __TLE__
+static Value peelLoadSourceViews(Value v) {
+  // Peel out the original cvt dot_op<..., #blocked>
+  // and any other potential cvt/trans ops
+  while (true) {
+    Operation *def = v.getDefiningOp();
+    if (!def)
+      return v;
+    if (auto cvtOp = dyn_cast<ttg::ConvertLayoutOp>(def)) {
+      v = cvtOp.getSrc();
+      continue;
+    }
+    if (auto transOp = dyn_cast<tt::TransOp>(def)) {
+      v = transOp.getSrc();
+      continue;
+    }
+    if (def->hasTrait<OpTrait::MemDescViewTrait>()) {
+      v = def->getOperand(0);
+      continue;
+    }
+    return v;
+  }
+}
+
+static bool comesFromLoadOrSharedMemory(Value v, llvm::DenseSet<Value> &seen) {
+  v = peelLoadSourceViews(v);
+  if (!seen.insert(v).second)
+    return true;
+
+  // We also accept block arguments as they appear in many MLIR tests
+  // If this is problematic we can totally drop them
+  Operation *def = v.getDefiningOp();
+  bool fromLoad = def && isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp>(def);
+  bool fromSharedMemory =
+      def && def->hasAttrOfType<StringAttr>("tt.memory_space") &&
+      def->getAttrOfType<StringAttr>("tt.memory_space").getValue() ==
+          "shared_memory";
+  if (fromLoad || fromSharedMemory)
+    return true;
+
+  if (auto arg = dyn_cast<BlockArgument>(v)) {
+    auto forOp = dyn_cast<scf::ForOp>(arg.getOwner()->getParentOp());
+    if (!forOp)
+      return true;
+    unsigned argNo = arg.getArgNumber();
+    if (argNo == 0)
+      return true;
+    unsigned iterIdx = argNo - 1;
+    if (iterIdx >= forOp.getInitArgs().size())
+      return true;
+    auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+    if (!yield || iterIdx >= yield.getNumOperands())
+      return true;
+    return comesFromLoadOrSharedMemory(forOp.getInitArgs()[iterIdx], seen) &&
+           comesFromLoadOrSharedMemory(yield.getOperand(iterIdx), seen);
+  }
+
+  if (auto result = dyn_cast<OpResult>(v)) {
+    if (auto forOp = dyn_cast<scf::ForOp>(result.getOwner())) {
+      unsigned resultIdx = result.getResultNumber();
+      if (resultIdx >= forOp.getInitArgs().size())
+        return true;
+      auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+      if (!yield || resultIdx >= yield.getNumOperands())
+        return true;
+      return comesFromLoadOrSharedMemory(forOp.getInitArgs()[resultIdx], seen) &&
+             comesFromLoadOrSharedMemory(yield.getOperand(resultIdx), seen);
+    }
+  }
+
+  return false;
+}
+#endif
+
 bool comesFromLoadOrBlockArg(Value v) {
+#ifdef __TLE__
+  v = peelLoadSourceViews(v);
+  llvm::DenseSet<Value> seen;
+  return comesFromLoadOrSharedMemory(v, seen);
+#else
   // Peel out the original cvt dot_op<..., #blocked>
   // and any other potential cvt/trans ops
   while (true) {
@@ -1720,13 +1810,6 @@ bool comesFromLoadOrBlockArg(Value v) {
   // If this is problematic we can totally drop them
   Operation *def = v.getDefiningOp();
   bool fromLoad = def && isa<LoadOp, DescriptorLoadOp, DescriptorGatherOp>(def);
-#ifdef __TLE__
-  bool fromSharedMemory =
-      def && def->hasAttrOfType<StringAttr>("tt.memory_space") &&
-      def->getAttrOfType<StringAttr>("tt.memory_space").getValue() ==
-          "shared_memory";
-  return isa<BlockArgument>(v) || fromLoad || fromSharedMemory;
-#else
   return isa<BlockArgument>(v) || fromLoad;
 #endif
 }

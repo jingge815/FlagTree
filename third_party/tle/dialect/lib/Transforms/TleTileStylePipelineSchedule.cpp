@@ -23,6 +23,7 @@
 #include "tle/dialect/include/Transforms/Passes.h"
 #include "tle/dialect/include/Transforms/TransformAttrs.h"
 
+#include "tle/dialect/include/IR/Dialect.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -95,6 +96,10 @@ static Value stripProducerMemDescViews(Value value) {
       current = index.getSrc();
       continue;
     }
+    if (auto alias = current.getDefiningOp<MemDescAliasOp>()) {
+      current = alias.getSrc();
+      continue;
+    }
     break;
   }
   return current;
@@ -110,6 +115,7 @@ static bool isTleOp(Operation *op) {
 
 static bool isTileProducerViewLikeOp(Operation *op) {
   return isa<ttg::MemDescIndexOp, ttg::MemDescSubsliceOp>(op) ||
+         op->getName().getStringRef() == "tle.memdesc_alias" ||
          op->getName().getStringRef() == "tle.memdesc_wgmma_view";
 }
 

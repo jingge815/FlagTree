@@ -3,6 +3,7 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "tle/dialect/include/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Types.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
@@ -96,6 +97,10 @@ static Value getSharedMemDescRoot(Value value) {
     }
     if (auto reinterpret = current.getDefiningOp<MemDescReinterpretOp>()) {
       current = stripConvertLayouts(reinterpret.getSrc());
+      continue;
+    }
+    if (auto alias = current.getDefiningOp<triton::tle::MemDescAliasOp>()) {
+      current = stripConvertLayouts(alias.getSrc());
       continue;
     }
     if (auto trans = current.getDefiningOp<MemDescTransOp>()) {

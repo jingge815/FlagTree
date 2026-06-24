@@ -71,6 +71,10 @@ static Value stripMemDescViews(Value value) {
       value = reinterpret.getSrc();
       continue;
     }
+    if (auto alias = value.getDefiningOp<triton::tle::MemDescAliasOp>()) {
+      value = alias.getSrc();
+      continue;
+    }
     if (auto view = value.getDefiningOp<triton::tle::MemDescWGMMAViewOp>()) {
       value = view.getSrc();
       continue;

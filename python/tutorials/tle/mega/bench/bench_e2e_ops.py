@@ -20,6 +20,7 @@ if str(MEGA_ROOT) not in sys.path:
 
 from kernels import attention_decode, attention_ws, embedding, fused_add_rms_norm  # noqa: E402
 from kernels import head_rmsnorm_rope  # noqa: E402
+from kernels import linear_fused_add_rms_norm_decode_mega  # noqa: E402
 from kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_packed_out, store_cache  # noqa: E402
 from models import Qwen3TLEEngine  # noqa: E402
 
@@ -141,6 +142,28 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
             lambda: fn(q, k_cache, v_cache, q_len=q_len, start_pos=start_pos, kv_len=kv_len, sm_scale=sm_scale),
         )
 
+    def _linear_fused_add_rms_norm_decode_timed(
+        self,
+        op: str,
+        layer: int,
+        x: torch.Tensor,
+        weights,
+        residual: torch.Tensor,
+        norm_weight: torch.Tensor,
+    ):
+        return self.timer.record(
+            op,
+            layer,
+            lambda: linear_fused_add_rms_norm_decode_mega(
+                x,
+                weights.weight,
+                weights.bias,
+                residual,
+                norm_weight,
+                eps=self.config.rms_norm_eps,
+            ),
+        )
+
     def _run_layer(
         self,
         x: torch.Tensor,
@@ -201,15 +224,24 @@ class TimedQwen3TLEEngine(Qwen3TLEEngine):
             sm_scale=1.0 / math.sqrt(self.config.head_dim),
         )
         attn_flat = attn.reshape(tokens, q_dim)
-        attn_out = self._linear_timed("linear.o_proj", layer_idx, attn_flat, layer.o_proj)
-
-        hidden_flat, residual_flat = self._fused_add_rms_norm_timed(
-            "fused_add_rms_norm.post_attention",
-            layer_idx,
-            attn_out,
-            residual_flat,
-            layer.post_norm_weight,
-        )
+        if self.mega_post_attention_decode and tokens == 1 and start_pos > 0:
+            hidden_flat, residual_flat = self._linear_fused_add_rms_norm_decode_timed(
+                "mega.linear_fused_add_rms_norm.post_attention",
+                layer_idx,
+                attn_flat,
+                layer.o_proj,
+                residual_flat,
+                layer.post_norm_weight,
+            )
+        else:
+            attn_out = self._linear_timed("linear.o_proj", layer_idx, attn_flat, layer.o_proj)
+            hidden_flat, residual_flat = self._fused_add_rms_norm_timed(
+                "fused_add_rms_norm.post_attention",
+                layer_idx,
+                attn_out,
+                residual_flat,
+                layer.post_norm_weight,
+            )
         hidden_act = self._mlp_activation_timed(layer_idx, hidden_flat, layer.gate_up_proj)
         out = self._linear_timed("linear.down_proj", layer_idx, hidden_act, layer.down_proj)
         return out.view(batch_size, q_len, hidden), residual_flat.view(batch_size, q_len, hidden)
@@ -264,6 +296,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", default="build/mega/qwen3-32b")
     parser.add_argument("--attention-backend", choices=("ws", ), default="ws")
+    parser.add_argument("--mega-post-attention-decode", action="store_true",
+                        help="Use the decode-only mega linear+fused_add_rms_norm path for attention o_proj.")
     return parser
 
 
@@ -483,6 +517,7 @@ def main() -> None:
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
         attention_backend=args.attention_backend,
+        mega_post_attention_decode=args.mega_post_attention_decode,
     )
     engine.timer = timer
 
@@ -512,6 +547,7 @@ def main() -> None:
             "model_path": args.model_path,
             "backend": "tle",
             "attention_backend": args.attention_backend,
+            "mega_post_attention_decode": args.mega_post_attention_decode,
             "batch_size": args.batch_size,
             "prompt_len": prompt_len,
             "decode_steps": decode_steps,
@@ -540,6 +576,7 @@ def main() -> None:
         "model_path": args.model_path,
         "output_dir": str(output_dir),
         "attention_backend": args.attention_backend,
+        "mega_post_attention_decode": args.mega_post_attention_decode,
         "report_path": str(report_path),
         "run_id": run_id,
         "warmup": args.warmup,

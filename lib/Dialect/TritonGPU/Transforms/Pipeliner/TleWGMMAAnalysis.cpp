@@ -346,6 +346,10 @@ static Value stripMemDescViewsForLocalAlloc(Value value) {
       value = reinterpret.getSrc();
       continue;
     }
+    if (auto alias = value.getDefiningOp<tttle::MemDescAliasOp>()) {
+      value = alias.getSrc();
+      continue;
+    }
     if (auto view = value.getDefiningOp<tttle::MemDescWGMMAViewOp>()) {
       value = view.getSrc();
       continue;
@@ -533,6 +537,10 @@ static MemDescResource getMemDescResource(Value value) {
     }
     if (auto reinterpret = value.getDefiningOp<ttg::MemDescReinterpretOp>()) {
       value = reinterpret.getSrc();
+      continue;
+    }
+    if (auto alias = value.getDefiningOp<tttle::MemDescAliasOp>()) {
+      value = alias.getSrc();
       continue;
     }
     if (auto view = value.getDefiningOp<tttle::MemDescWGMMAViewOp>()) {

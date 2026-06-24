@@ -304,8 +304,10 @@ def TritonTleLowerPipeToNvws
   }];
 
   let dependentDialects = ["mlir::arith::ArithDialect",
+                           "mlir::gpu::GPUDialect",
                            "mlir::triton::TritonDialect",
                            "mlir::triton::gpu::TritonGPUDialect",
+                           "mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect",
                            "mlir::triton::nvws::NVWSDialect"];
 }
 
@@ -361,56 +363,6 @@ def TritonTleAnalyzeTaskGraph
   }];
 
   let dependentDialects = ["mlir::triton::tle::TleDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::triton::gpu::TritonGPUDialect"];
-}
-
-def TritonTleMaterializeTaskScheduler
-    : Pass<"triton-tle-materialize-task-scheduler", "mlir::ModuleOp"> {
-  let summary = "materialize TLE mega task scheduler plan IR";
-
-  let description = [{
-    This pass consumes the verified static dependency graph analysis and emits
-    a ``tle.task_graph.scheduler`` plan op. The op is the codegen boundary for
-    the persistent scheduler runtime: it contains task dispatch order, per-task
-    instance dependency counts, reverse dependency edges, and the initial ready
-    queue. The pass fails if dependency analysis has not run.
-  }];
-
-  let dependentDialects = ["mlir::triton::tle::TleDialect",
-                           "mlir::triton::TritonDialect",
-                           "mlir::triton::gpu::TritonGPUDialect"];
-}
-
-def TritonTleMaterializeTaskRuntimeState
-    : Pass<"triton-tle-materialize-task-runtime-state", "mlir::ModuleOp"> {
-  let summary = "materialize TLE mega scheduler runtime state layout";
-
-  let description = [{
-    This pass consumes a ``tle.task_graph.scheduler`` plan and emits a
-    ``tle.task_graph.runtime_state`` layout op. The state op is the formal ABI
-    between task graph analysis and persistent scheduler runtime lowering: it
-    records device-scope i32 dependency counters, queue metadata, and ready
-    queue storage offsets. It performs no runtime codegen.
-  }];
-
-  let dependentDialects = ["mlir::triton::tle::TleDialect"];
-}
-
-def TritonTleLowerTaskScheduler
-    : Pass<"triton-tle-lower-task-scheduler", "mlir::ModuleOp"> {
-  let summary = "lower a restricted TLE mega scheduler plan to task calls";
-
-  let description = [{
-    This pass consumes ``tle.task_graph.scheduler`` and emits ``tt.call``
-    dispatches for the scheduler MVP task body ABI. It intentionally supports
-    only dependency graphs whose ready set never contains more than one task
-    instance. Graphs with exposed parallelism fail instead of being silently
-    serialized. Persistent ready-queue runtime lowering remains a later step.
-  }];
-
-  let dependentDialects = ["mlir::arith::ArithDialect",
-                           "mlir::triton::tle::TleDialect",
                            "mlir::triton::TritonDialect",
                            "mlir::triton::gpu::TritonGPUDialect"];
 }

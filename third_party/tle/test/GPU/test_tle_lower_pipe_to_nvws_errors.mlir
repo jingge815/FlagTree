@@ -35,6 +35,75 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
 #smem = #ttg.shared_memory
 
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @reject_one_shot_drain(%a: !ttg.memdesc<1x16xf16, #shared, #smem, mutable>) {
+    tle.pipe.create %a {capacity = 1 : i32, pipe_name = "ready", field_names = ["a"], scope = "cta", one_shot = true} : !ttg.memdesc<1x16xf16, #shared, #smem, mutable>
+    // expected-error @+1 {{does not support wait_drained on one_shot pipe}}
+    tle.pipe.drain %a {capacity = 1 : i32, pipe_name = "ready", field_names = ["a"], scope = "cta"} : !ttg.memdesc<1x16xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @reject_drain_before_close_or_release(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
+    tle.pipe.create %a {capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    // expected-error @+1 {{requires a preceding pipe.writer_close or pipe.reader_release in the same async task before wait_drained}}
+    tle.pipe.drain %a {capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @reject_missing_reader_drain(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %false = arith.constant false
+    // expected-error @+1 {{wait_drained requires reader right release async_task_id 2 to call drain}}
+    tle.pipe.create %a {capacity = 2 : i32, pipe_name = "fanout", field_names = ["a"], readers = ["left", "right"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.writer_close %a[%c1, %false] {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "fanout", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.drain %a {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "fanout", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.reader_release %a[%c0] {async_task_id = array<i32: 1>, capacity = 2 : i32, pipe_name = "fanout", field_names = ["a"], reader_name = "left", scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.drain %a {async_task_id = array<i32: 1>, capacity = 2 : i32, pipe_name = "fanout", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.reader_release %a[%c0] {async_task_id = array<i32: 2>, capacity = 2 : i32, pipe_name = "fanout", field_names = ["a"], reader_name = "right", scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @reject_pipe_use_after_drain(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %false = arith.constant false
+    tle.pipe.create %a {capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.writer_close %a[%c1, %false] {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.reader_release %a[%c0] {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tle.pipe.drain %a {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    // expected-error @+1 {{uses pipe after wait_drained in async_task_id 0}}
+    tle.pipe.writer_acquire %a[%c0, %false] {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
   tt.func @reject_duplicate_create(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
     tle.pipe.create %a {capacity = 2 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
     // expected-error @+1 {{duplicates an existing pipe.create}}

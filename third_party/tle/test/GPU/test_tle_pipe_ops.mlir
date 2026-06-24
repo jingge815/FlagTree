@@ -20,6 +20,8 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     %closed = tle.pipe.reader_wait %a[%c0, %false] {capacity = 4 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<4x16xf16, #shared, #smem, mutable>
     // CHECK: tle.pipe.reader_release
     tle.pipe.reader_release %a[%c0] {capacity = 4 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<4x16xf16, #shared, #smem, mutable>
+    // CHECK: tle.pipe.drain
+    tle.pipe.drain %a {capacity = 4 : i32, pipe_name = "a", field_names = ["a"], scope = "cta"} : !ttg.memdesc<4x16xf16, #shared, #smem, mutable>
     tt.return
   }
 }

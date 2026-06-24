@@ -19,6 +19,10 @@ struct MemDescResource {
 
 struct PendingSharedWgmmaGroup {
   SmallVector<triton::nvidia_gpu::WarpGroupDotOp, 2> dots;
+  // SSA values that currently represent this pending group. For normal in-loop
+  // dots this is the tail dot result; for loop-carried futures it can be the
+  // region iter arg or loop result that must be threaded through a wait.
+  SmallVector<Value, 2> values;
   SmallVector<MemDescResource, 4> reads;
 };
 

@@ -17,9 +17,6 @@ add_triton_library(TritonTLETransforms
   TleLowerTaskGrid.cpp
   TleVerifyTaskGraph.cpp
   TleAnalyzeTaskGraph.cpp
-  TleMaterializeTaskScheduler.cpp
-  TleMaterializeTaskRuntimeState.cpp
-  TleLowerTaskScheduler.cpp
   TleTileToLLVMUtils.cpp
   ExtractTileToLLVM.cpp
   InsertTileToLLVM.cpp

@@ -94,6 +94,10 @@ static Value getMemDescRoot(Value value) {
       current = canonicalizeWarpSpecializeCapture(reinterpret.getSrc());
       continue;
     }
+    if (auto alias = current.getDefiningOp<MemDescAliasOp>()) {
+      current = canonicalizeWarpSpecializeCapture(alias.getSrc());
+      continue;
+    }
     if (auto wgmmaView = current.getDefiningOp<MemDescWGMMAViewOp>()) {
       current = canonicalizeWarpSpecializeCapture(wgmmaView.getSrc());
       continue;

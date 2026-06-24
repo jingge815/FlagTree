@@ -98,6 +98,31 @@ def Tle_MemDescWGMMAViewOp : Tle_Op<"memdesc_wgmma_view", [Pure,
   let hasVerifier = 1;
 }
 
+def Tle_MemDescAliasOp : Tle_Op<"memdesc_alias", [Pure, MemDescViewTrait]> {
+  let summary = "create a typed view that aliases an existing shared memory descriptor";
+
+  let description = [{
+    This operation returns a descriptor-only view into an existing shared memory
+    descriptor. It does not allocate or move shared memory.
+
+    The result type carries the logical shape, element type, and encoding used
+    by consumers. The source descriptor provides the backing storage. The
+    offset_bytes attribute is a static byte offset from the source descriptor's
+    current view base.
+  }];
+
+  let arguments = (
+    ins TTG_MemDescType:$src,
+    I64Attr:$offset_bytes
+  );
+
+  let results = (outs TTG_MemDescType:$result);
+
+  let assemblyFormat = "$src attr-dict `:` qualified(type($src)) `->` qualified(type($result))";
+
+  let hasVerifier = 1;
+}
+
 def Tle_PipeCreateOp : Tle_Op<"pipe.create"> {
   let summary = "create a typed TLE GPU pipe";
   let arguments = (ins
@@ -186,6 +211,28 @@ def Tle_PipeReaderReleaseOp : Tle_Op<"pipe.reader_release", [
   let hasVerifier = 1;
 }
 
+def Tle_PipeDrainOp : Tle_Op<"pipe.drain", [
+  DeclareOpInterfaceMethods<MemoryEffectsOpInterface>
+]> {
+  let summary = "rendezvous all pipe participants before whole-storage reuse";
+  let description = [{
+    `tle.pipe.drain` marks a one-shot lifecycle boundary for a whole pipe. The
+    op is emitted by the writer task after `pipe.writer_close` and by every
+    reader task after its final `pipe.reader_release`. Lowering verifies that
+    all required participants reach the drain and emits a dedicated named
+    barrier before the pipe backing storage may be reused through aliases.
+  }];
+  let arguments = (ins
+    Variadic<TTG_MemDescType>:$fields,
+    I32Attr:$capacity,
+    StrAttr:$scope,
+    OptionalAttr<StrAttr>:$pipe_name,
+    ArrayAttr:$field_names
+  );
+  let assemblyFormat = "$fields attr-dict `:` type($fields)";
+  let hasVerifier = 1;
+}
+
 def Tle_TaskGridCreateOp : Tle_Op<"task_grid.create"> {
   let summary = "create a typed TLE task-grid dependency edge";
   let arguments = (ins
@@ -241,86 +288,6 @@ def Tle_TaskDeclareOp : Tle_Op<"task.declare"> {
     DenseI64ArrayAttr:$domain_shape,
     ArrayAttr:$reads,
     ArrayAttr:$writes
-  );
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def Tle_TaskGraphSchedulerOp : Tle_Op<"task_graph.scheduler"> {
-  let summary = "materialized TLE mega task scheduler plan";
-  let description = [{
-    Compiler-generated scheduler boundary for a verified static task graph.
-    This op records the tables needed by scheduler runtime codegen:
-
-      - task_names: stable task-kind dispatch order
-      - dispatch: mapping from task name to task-kind integer id
-      - instances: task instances with dependency counts and produced tiles
-      - edges: reverse dependency edges from produced tiles to consumers
-      - initial_ready: initial ready queue contents
-
-    It is intentionally a plan op, not an executable synchronization
-    primitive. Lowering this op to device queues, counters, and dispatch is the
-    next runtime codegen step.
-  }];
-  let arguments = (ins
-    I64Attr:$num_tasks,
-    I64Attr:$num_instances,
-    I64Attr:$num_edges,
-    I64Attr:$queue_capacity,
-    StrAttr:$counter_type,
-    ArrayAttr:$task_names,
-    ArrayAttr:$dispatch,
-    ArrayAttr:$instances,
-    ArrayAttr:$edges,
-    ArrayAttr:$initial_ready,
-    DenseI32ArrayAttr:$task_domain_ranks,
-    DenseI32ArrayAttr:$instance_task_ids,
-    DenseI32ArrayAttr:$instance_dep_counts,
-    DenseI32ArrayAttr:$instance_coord_offsets,
-    DenseI32ArrayAttr:$instance_coords,
-    DenseI32ArrayAttr:$initial_ready_ids,
-    DenseI32ArrayAttr:$producer_edge_offsets,
-    DenseI32ArrayAttr:$edge_consumer_ids
-  );
-  let assemblyFormat = "attr-dict";
-  let hasVerifier = 1;
-}
-
-def Tle_TaskGraphRuntimeStateOp : Tle_Op<"task_graph.runtime_state"> {
-  let summary = "materialized TLE mega scheduler runtime state layout";
-  let description = [{
-    Compiler-generated layout contract for the persistent scheduler runtime
-    state. This op does not execute scheduling by itself. It records the byte
-    offsets and sizes required to initialize and operate the device-scope task
-    queue and dependency counters for a ``tle.task_graph.scheduler`` plan.
-
-    The MVP state model is single-kernel and i32-based:
-
-      - init flag
-      - queue lock
-      - queue head and tail
-      - completed task count
-      - per-instance remaining dependency counters
-      - ready queue storage
-
-    Lowering must fail if it cannot map this layout to a device-scope storage
-    allocation with acquire/release ordering.
-  }];
-  let arguments = (ins
-    I64Attr:$num_instances,
-    I64Attr:$queue_capacity,
-    I64Attr:$state_size_bytes,
-    I64Attr:$alignment_bytes,
-    StrAttr:$counter_type,
-    I64Attr:$counter_bytes,
-    I64Attr:$queue_element_bytes,
-    I64Attr:$init_flag_offset_bytes,
-    I64Attr:$queue_lock_offset_bytes,
-    I64Attr:$queue_head_offset_bytes,
-    I64Attr:$queue_tail_offset_bytes,
-    I64Attr:$completed_count_offset_bytes,
-    I64Attr:$dep_counters_offset_bytes,
-    I64Attr:$queue_storage_offset_bytes
   );
   let assemblyFormat = "attr-dict";
   let hasVerifier = 1;

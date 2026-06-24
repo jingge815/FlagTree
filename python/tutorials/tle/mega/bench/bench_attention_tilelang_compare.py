@@ -25,7 +25,7 @@ MEGA_ROOT = Path(__file__).resolve().parents[1]
 if str(MEGA_ROOT) not in sys.path:
     sys.path.insert(0, str(MEGA_ROOT))
 
-from kernels.attention import attention_decode, attention_ws  # noqa: E402
+from kernels.attention import FA3_PACKGQA_DECODE_BLOCK_H, attention_decode, attention_ws  # noqa: E402
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -268,7 +268,8 @@ def _bench_decode(
         "head_dim": head_dim,
         "tle_kernel": f"attention_decode.{path}",
         "tilelang_kernel": f"TileOps GQADecodeKernel.{path}",
-        "tle_config": f"block_h=64, valid_block_h={heads // kv_heads}, block_n={tle_block_n}, "
+        "tle_config": f"block_h=64, compute_block_h={FA3_PACKGQA_DECODE_BLOCK_H}, "
+        f"valid_block_h={heads // kv_heads}, block_n={tle_block_n}, "
         f"num_split={num_split}, tl.range_num_stages=2",
         "tilelang_config": _config_label(tilelang_config_name, tilelang_config),
         "tle_ms": tle_ms,

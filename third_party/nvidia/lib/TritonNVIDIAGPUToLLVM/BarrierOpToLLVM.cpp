@@ -189,6 +189,20 @@ struct WaitBarrierOpConversion
       }
     } else {
       if (!predicated) {
+#ifdef __TLE__
+        // TLE warp-specialized pipes can hold producer/consumer partitions in
+        // this fallback loop while sibling warp groups finish CUDA-core work;
+        // match CUTLASS/FA3's sm90 try-wait timeout so ptxas lowers the failed
+        // wait path through SYNCS nanosleep instead of tight-spinning.
+        ptx = R"(
+{
+	.reg .pred complete;
+	waitLoop:
+	mbarrier.try_wait.parity.shared.b64 complete, [$0], $1, 0x989680;
+	@!complete bra.uni waitLoop;
+}
+)";
+#else
         ptx = R"(
 {
 	.reg .pred complete;
@@ -197,7 +211,23 @@ struct WaitBarrierOpConversion
 	@!complete bra.uni waitLoop;
 }
 )";
+#endif
       } else {
+#ifdef __TLE__
+        // Keep predicated waits semantically identical: inactive lanes skip the
+        // loop, active lanes use the same CUTLASS/FA3 sm90 try-wait timeout as
+        // the unpredicated path.
+        ptx = R"(
+{
+	@!$2 bra.uni skipWait;
+	.reg .pred complete;
+	waitLoop:
+	mbarrier.try_wait.parity.shared.b64 complete, [$0], $1, 0x989680;
+	@!complete bra.uni waitLoop;
+	skipWait:
+}
+)";
+#else
         ptx = R"(
 {
 	@!$2 bra.uni skipWait;
@@ -208,6 +238,7 @@ struct WaitBarrierOpConversion
 	skipWait:
 }
 )";
+#endif
       }
     }
     ::mlir::triton::PTXBuilder ptxBuilder;

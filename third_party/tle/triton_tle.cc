@@ -206,6 +206,13 @@ void init_triton_tle_ir(py::module &&m) {
              return self.create<ttg::MemDescSubsliceOp>(resultType, src,
                                                         offsets);
            })
+      .def("create_memdesc_alias",
+           [](TritonOpBuilder &self, Type resultType, Value src,
+              int64_t offsetBytes) -> Value {
+             return self.create<tle::MemDescAliasOp>(
+                 resultType, src,
+                 self.getBuilder().getI64IntegerAttr(offsetBytes));
+           })
       .def("create_warp_return",
            [](TritonOpBuilder &self) -> Operation * {
              return self.create<ttg::WarpReturnOp>();
@@ -351,6 +358,24 @@ void init_triton_tle_ir(py::module &&m) {
                  fields, stage, builder.getI32IntegerAttr(capacity),
                  builder.getStringAttr(scope), pipeNameAttr,
                  builder.getArrayAttr(fieldNameAttrs), readerNameAttr);
+           })
+      .def("create_pipe_drain",
+           [](TritonOpBuilder &self, std::vector<Value> fields,
+              int32_t capacity, const std::string &scope,
+              const std::string &pipeName,
+              std::vector<std::string> fieldNames) -> void {
+             auto &builder = self.getBuilder();
+             SmallVector<Attribute> fieldNameAttrs;
+             fieldNameAttrs.reserve(fieldNames.size());
+             for (StringRef name : fieldNames)
+               fieldNameAttrs.push_back(builder.getStringAttr(name));
+             StringAttr pipeNameAttr;
+             if (!pipeName.empty())
+               pipeNameAttr = builder.getStringAttr(pipeName);
+             self.create<tle::PipeDrainOp>(
+                 fields, builder.getI32IntegerAttr(capacity),
+                 builder.getStringAttr(scope), pipeNameAttr,
+                 builder.getArrayAttr(fieldNameAttrs));
            })
       .def("create_task_grid_create",
            [](TritonOpBuilder &self, std::vector<Value> fields,
@@ -527,12 +552,6 @@ void init_triton_tle_passes(py::module &&m) {
                      tle::createTritonTleVerifyTaskGraph);
   ADD_PASS_WRAPPER_0("add_analyze_task_graph",
                      tle::createTritonTleAnalyzeTaskGraph);
-  ADD_PASS_WRAPPER_0("add_materialize_task_scheduler",
-                     tle::createTritonTleMaterializeTaskScheduler);
-  ADD_PASS_WRAPPER_0("add_materialize_task_runtime_state",
-                     tle::createTritonTleMaterializeTaskRuntimeState);
-  ADD_PASS_WRAPPER_0("add_lower_task_scheduler",
-                     tle::createTritonTleLowerTaskScheduler);
   ADD_PASS_WRAPPER_0("add_lower_tma_copy", tle::createTritonTleLowerTmaCopy);
   ADD_PASS_WRAPPER_0("add_schedule_tma_store_sync",
                      tle::createTritonTleScheduleTmaStoreSync);

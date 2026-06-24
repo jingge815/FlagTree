@@ -64,6 +64,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
     parser.add_argument("--output-dir", default="build/mega/qwen3-32b")
+    parser.add_argument("--mega-post-attention-decode", action="store_true",
+                        help="Use the decode-only mega linear+fused_add_rms_norm path for attention o_proj.")
     return parser
 
 
@@ -238,6 +240,7 @@ def _make_engine(
     max_seq_len: int,
     trust_remote_code: bool,
     local_files_only: bool,
+    mega_post_attention_decode: bool,
 ) -> Qwen3TLEEngine:
     return engine_cls.from_pretrained(
         model_path,
@@ -247,6 +250,7 @@ def _make_engine(
         trust_remote_code=trust_remote_code,
         local_files_only=local_files_only,
         attention_backend="ws",
+        mega_post_attention_decode=mega_post_attention_decode,
     )
 
 
@@ -283,6 +287,7 @@ def _write_report(path: Path, summary: dict) -> None:
         f"- Device: `{summary['device']}`",
         f"- Warmup: `{summary['warmup']}`",
         f"- Iters: `{summary['iters']}`",
+        f"- Mega post-attention decode: `{summary['mega_post_attention_decode']}`",
         "",
         "| scenario | mode | decode ms/token | tok/s | speedup vs eager |",
         "|---|---|---:|---:|---:|",
@@ -317,6 +322,7 @@ def main() -> None:
         max_seq_len=max_seq_len,
         trust_remote_code=args.trust_remote_code,
         local_files_only=args.local_files_only,
+        mega_post_attention_decode=args.mega_post_attention_decode,
     )
     runtime_engine = RuntimeAttentionDecodeEngine(
         config=eager_engine.config,
@@ -326,6 +332,7 @@ def main() -> None:
         dtype=eager_engine.dtype,
         max_seq_len=eager_engine.max_seq_len,
         attention_backend=eager_engine.attention_backend,
+        mega_post_attention_decode=args.mega_post_attention_decode,
     )
 
     rows = []
@@ -407,6 +414,7 @@ def main() -> None:
         "device": torch.cuda.get_device_name(),
         "warmup": args.warmup,
         "iters": args.iters,
+        "mega_post_attention_decode": args.mega_post_attention_decode,
         "rows": rows,
     }
     json_path = output_dir / f"decode-cuda-graph-{run_id}.json"

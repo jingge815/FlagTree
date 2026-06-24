@@ -173,6 +173,7 @@ class TestBufferedTensor:
             self.memdesc_type_args = None
             self.memdesc_index_args = None
             self.memdesc_subslice_args = None
+            self.memdesc_alias_args = None
             self.swizzled_encoding_args = None
             self.pipe_create_args = None
             self.pipe_ops = []
@@ -208,6 +209,10 @@ class TestBufferedTensor:
             self.memdesc_subslice_args = (result_ty, src, list(offsets))
             return "subslice_handle"
 
+        def create_memdesc_alias(self, result_ty, src, offset_bytes):
+            self.memdesc_alias_args = (result_ty, src, offset_bytes)
+            return "alias_handle"
+
         def create_pipe_create(self, fields, capacity, scope, pipe_name, field_names, reader_names, one_shot):
             self.pipe_create_args = (list(fields), capacity, scope, pipe_name, list(field_names), list(reader_names),
                                      one_shot)
@@ -234,6 +239,9 @@ class TestBufferedTensor:
             self.pipe_ops.append(
                 ("reader_release", list(fields), stage, capacity, scope, pipe_name, list(field_names), reader_name,
                  list(reader_field_names)))
+
+        def create_pipe_drain(self, fields, capacity, scope, pipe_name, field_names):
+            self.pipe_ops.append(("drain", list(fields), capacity, scope, pipe_name, list(field_names)))
 
         def create_task_grid_create(self, fields, scope, grid_name, field_names, shape):
             self.task_grid_create_args = (list(fields), scope, grid_name, list(field_names), list(shape))
@@ -332,6 +340,43 @@ class TestBufferedTensor:
 
         with pytest.raises(ValueError, match="invalid range"):
             buffer.subslice([0, 0, 24], [1, 16, 16], _semantic=semantic)
+
+    def test_alloc_alias_creates_typed_memdesc_alias_view(self):
+        """alloc(alias=...) returns a typed view without creating a new allocation."""
+        buffer, semantic = self._make_buffer([4, 16, 32])
+        alias = tle.gpu.alloc(
+            (2, 16, 16),
+            tl.float16,
+            layout=buffer.type.layout,
+            alias=buffer,
+            alias_offset_bytes=64,
+            _semantic=semantic,
+        )
+
+        assert isinstance(alias, tle.gpu.buffered_tensor)
+        assert alias.handle == "alias_handle"
+        assert alias.shape == [2, 16, 16]
+        assert alias.dtype == tl.float16
+        assert alias.type.storage is tle.gpu.smem
+        assert semantic.builder.memdesc_alias_args == (
+            ("memdesc", (2, 16, 16), "fp16", "fake_layout", "smem", None),
+            "base",
+            64,
+        )
+
+    def test_alloc_alias_rejects_init_value(self):
+        buffer, semantic = self._make_buffer([4, 16, 32])
+        init = self._FakeTensor("init", tl.float16)
+
+        with pytest.raises(ValueError, match="alias mode cannot be combined"):
+            tle.gpu.alloc(
+                (2, 16, 16),
+                tl.float16,
+                layout=buffer.type.layout,
+                init_value=init,
+                alias=buffer,
+                _semantic=semantic,
+            )
 
     def test_buffered_tensor_slot_rejects_rank_zero_buffer(self):
         """slot(stage) only indexes a real leading stage dimension."""
@@ -508,6 +553,7 @@ class TestPipeFrontend:
         recv_slot = wait_result.slot
         is_closed = wait_result.is_closed
         reader.release(0, _semantic=semantic)
+        pipe.wait_drained(_semantic=semantic)
 
         assert prod_slot.a.shape == [16]
         assert recv_slot.a.shape == [16]
@@ -523,11 +569,13 @@ class TestPipeFrontend:
             "writer_close",
             "reader_wait",
             "reader_release",
+            "drain",
         ]
         assert semantic.builder.pipe_ops[0] == ("writer_acquire", ["base"], "stage_0", "pred_False", 4, "cta", "a",
                                                 ["a"])
         assert semantic.builder.pipe_ops[3] == ("reader_wait", ["base"], "stage_0", "pred_False", 4, "cta", "a", ["a"],
                                                 "", ["a"])
+        assert semantic.builder.pipe_ops[5] == ("drain", ["base"], 4, "cta", "a", ["a"])
 
     def test_pipe_one_shot_keeps_frontend_contract(self):
         a, semantic = self._make_buffer([1, 16])
@@ -546,6 +594,8 @@ class TestPipeFrontend:
         assert isinstance(wait_result, tle.pipe_wait_result)
         with pytest.raises(ValueError, match="one_shot"):
             writer.close(0, _semantic=semantic)
+        with pytest.raises(ValueError, match="one_shot"):
+            pipe.wait_drained(_semantic=semantic)
 
 
 class TestTaskGridFrontend:

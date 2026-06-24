@@ -13,10 +13,12 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 try:
     from ..kernels import attention_decode, attention_ws, embedding, fused_add_rms_norm
     from ..kernels import head_rmsnorm_rope
+    from ..kernels import linear_fused_add_rms_norm_decode_mega
     from ..kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_packed_out, store_cache
 except ImportError:  # pragma: no cover - supports direct script execution from mega/
     from kernels import attention_decode, attention_ws, embedding, fused_add_rms_norm
     from kernels import head_rmsnorm_rope
+    from kernels import linear_fused_add_rms_norm_decode_mega
     from kernels import linear, lm_head, qkv_linear, rms_norm, silu_and_mul_packed_out, store_cache
 
 from .config import Qwen3TLEConfig
@@ -66,6 +68,7 @@ class Qwen3TLEEngine:
         dtype: torch.dtype,
         max_seq_len: int,
         attention_backend: str = "ws",
+        mega_post_attention_decode: bool = False,
     ) -> None:
         if dtype is not torch.bfloat16:
             raise ValueError("Qwen3TLEEngine currently supports bf16 only")
@@ -78,6 +81,7 @@ class Qwen3TLEEngine:
         self.dtype = dtype
         self.max_seq_len = max_seq_len
         self.attention_backend = attention_backend
+        self.mega_post_attention_decode = bool(mega_post_attention_decode)
         self.cos, self.sin = self._build_rotary_cache(max_seq_len)
         self.cache: KVCache | None = None
 
@@ -92,6 +96,7 @@ class Qwen3TLEEngine:
         trust_remote_code: bool = False,
         local_files_only: bool = False,
         attention_backend: str = "ws",
+        mega_post_attention_decode: bool = False,
     ) -> "Qwen3TLEEngine":
         torch_dtype = _parse_dtype(dtype)
         torch_device = torch.device(device)
@@ -122,6 +127,7 @@ class Qwen3TLEEngine:
             dtype=torch_dtype,
             max_seq_len=max_len,
             attention_backend=attention_backend,
+            mega_post_attention_decode=mega_post_attention_decode,
         )
 
     def _build_rotary_cache(self, max_seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -234,9 +240,18 @@ class Qwen3TLEEngine:
             sm_scale=1.0 / math.sqrt(self.config.head_dim),
         )
         attn_flat = attn.reshape(tokens, q_dim)
-        attn_out = self._linear(attn_flat, layer.o_proj)
-
-        hidden_flat, residual_flat = self._fused_add_rms_norm(attn_out, residual_flat, layer.post_norm_weight)
+        if self.mega_post_attention_decode and tokens == 1 and start_pos > 0:
+            hidden_flat, residual_flat = linear_fused_add_rms_norm_decode_mega(
+                attn_flat,
+                layer.o_proj.weight,
+                layer.o_proj.bias,
+                residual_flat,
+                layer.post_norm_weight,
+                eps=self.config.rms_norm_eps,
+            )
+        else:
+            attn_out = self._linear(attn_flat, layer.o_proj)
+            hidden_flat, residual_flat = self._fused_add_rms_norm(attn_out, residual_flat, layer.post_norm_weight)
         hidden_act = self._mlp_activation(hidden_flat, layer.gate_up_proj)
         out = self._linear(hidden_act, layer.down_proj)
         return out.view(batch_size, q_len, hidden), residual_flat.view(batch_size, q_len, hidden)

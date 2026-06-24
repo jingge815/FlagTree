@@ -118,4 +118,31 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tle.pipe.reader_release %a[%c0] {async_task_id = array<i32: 2>, capacity = 2 : i32, pipe_name = "broadcast", field_names = ["a"], reader_name = "right", scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
     tt.return
   }
+
+  // CHECK-LABEL: tt.func @lower_pipe_drain_to_named_barrier
+  tt.func @lower_pipe_drain_to_named_barrier(%a: !ttg.memdesc<2x16xf16, #shared, #smem, mutable>) {
+    %c0 = arith.constant 0 : i32
+    %c1 = arith.constant 1 : i32
+    %false = arith.constant false
+
+    // CHECK: %[[DRAIN:.*]] = ttg.local_alloc : () -> !ttg.memdesc<1xi64
+    // CHECK: ttng.init_barrier %[[DRAIN]], 256
+    // CHECK: gpu.barrier
+    tle.pipe.create %a {capacity = 2 : i32, pipe_name = "drain", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+
+    tle.pipe.writer_close %a[%c1, %false] {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "drain", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    // CHECK: ttng.arrive_barrier %[[DRAIN]], 128 {async_task_id = array<i32: 0>, participant_arrive = true, release_fence = true}
+    // CHECK: ttng.wait_barrier %[[DRAIN]], %{{.*}} {async_task_id = array<i32: 0>}
+    tle.pipe.drain %a {async_task_id = array<i32: 0>, capacity = 2 : i32, pipe_name = "drain", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+
+    %closed = tle.pipe.reader_wait %a[%c0, %false] {async_task_id = array<i32: 1>, capacity = 2 : i32, pipe_name = "drain", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    scf.if %closed {
+    }
+    tle.pipe.reader_release %a[%c0] {async_task_id = array<i32: 1>, capacity = 2 : i32, pipe_name = "drain", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    // CHECK: ttng.arrive_barrier %[[DRAIN]], 128 {async_task_id = array<i32: 1>, participant_arrive = true, release_fence = true}
+    // CHECK: ttng.wait_barrier %[[DRAIN]], %{{.*}} {async_task_id = array<i32: 1>}
+    tle.pipe.drain %a {async_task_id = array<i32: 1>, capacity = 2 : i32, pipe_name = "drain", field_names = ["a"], scope = "cta"} : !ttg.memdesc<2x16xf16, #shared, #smem, mutable>
+    // CHECK-NOT: tle.pipe
+    tt.return
+  }
 }

@@ -1,6 +1,7 @@
 #include "mlir/Analysis/SliceAnalysis.h"
 #ifdef __TLE__
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "tle/dialect/include/IR/Dialect.h"
 #endif
 #include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
@@ -77,6 +78,10 @@ static Value getUnderlyingMemDesc(Value value) {
     }
     if (auto reinterpret = value.getDefiningOp<MemDescReinterpretOp>()) {
       value = reinterpret.getSrc();
+      continue;
+    }
+    if (auto alias = value.getDefiningOp<triton::tle::MemDescAliasOp>()) {
+      value = alias.getSrc();
       continue;
     }
     return value;

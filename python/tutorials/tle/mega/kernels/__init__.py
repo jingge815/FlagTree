@@ -12,12 +12,14 @@ from .linear import (
     silu_and_mul_packed_out,
 )
 from .linear_rmsnorm import (
-    linear_rmsnorm_mega_scheduler,
-    linear_rmsnorm_mega_task_grid,
     linear_rmsnorm_reference,
     linear_rmsnorm_triton_baseline,
-    validate_linear_rmsnorm_mega_scheduler,
-    validate_linear_rmsnorm_mega_task_grid,
+)
+from .linear_fused_rmsnorm import (
+    linear_fused_add_rms_norm_decode_baseline,
+    linear_fused_add_rms_norm_decode_mega,
+    linear_fused_add_rms_norm_decode_reference,
+    validate_linear_fused_add_rms_norm_decode_mega,
 )
 from .norm import fused_add_rms_norm, rms_norm
 from .rotary_cache import apply_rotary_pos_emb, head_rmsnorm_rope, store_cache
@@ -31,9 +33,10 @@ __all__ = [
     "head_rmsnorm_rope",
     "linear",
     "linear_backend_name",
+    "linear_fused_add_rms_norm_decode_baseline",
+    "linear_fused_add_rms_norm_decode_mega",
+    "linear_fused_add_rms_norm_decode_reference",
     "lm_head",
-    "linear_rmsnorm_mega_scheduler",
-    "linear_rmsnorm_mega_task_grid",
     "linear_rmsnorm_reference",
     "linear_rmsnorm_triton_baseline",
     "qkv_linear",
@@ -42,6 +45,5 @@ __all__ = [
     "silu_and_mul_packed",
     "silu_and_mul_packed_out",
     "store_cache",
-    "validate_linear_rmsnorm_mega_scheduler",
-    "validate_linear_rmsnorm_mega_task_grid",
+    "validate_linear_fused_add_rms_norm_decode_mega",
 ]

@@ -242,8 +242,7 @@ static void threadValuesThroughWait(ttng::WarpGroupDotWaitOp wait,
   };
   for (int i = 0; i < origNumOperands; i++) {
     Value operand = wait.getResult(i);
-    if (!isa<ttg::MemDescType>(operand.getType()))
-      operand.replaceAllUsesWith(newWait.getResult(i));
+    operand.replaceAllUsesWith(newWait.getResult(i));
   }
   for (int i = origNumOperands; i < newOperands.size(); i++) {
     Value operand = newWait.getOperand(i);
@@ -663,12 +662,32 @@ static std::optional<unsigned>
 findPendingGroupForValue(Value value,
                          ArrayRef<PendingSharedWgmmaGroup> pendingGroups) {
   for (auto indexed : llvm::enumerate(pendingGroups)) {
+    for (Value pendingValue : indexed.value().values) {
+      if (valueDependsOn(value, pendingValue))
+        return indexed.index();
+    }
     for (ttng::WarpGroupDotOp dot : indexed.value().dots) {
       if (valueDependsOn(value, dot.getResult()))
         return indexed.index();
     }
   }
   return std::nullopt;
+}
+
+static SmallVector<Value, 4>
+getPendingGroupWaitValues(ArrayRef<PendingSharedWgmmaGroup> pendingGroups) {
+  SmallVector<Value, 4> values;
+  for (const PendingSharedWgmmaGroup &group : pendingGroups) {
+    if (!group.values.empty()) {
+      llvm::append_range(values, group.values);
+      continue;
+    }
+
+    assert(!group.dots.empty() &&
+           "pending WGMMA group must contain a value or at least one dot");
+    values.push_back(group.dots.back()->getResult(0));
+  }
+  return values;
 }
 
 static bool
@@ -719,11 +738,9 @@ insertWgmmaWaitBefore(Operation *op, unsigned lastCompletedGroup,
   SmallVector<Value, 4> waitOperands(forwardedValues.begin(),
                                      forwardedValues.end());
   if (waitOperands.empty()) {
-    for (unsigned i = 0; i <= lastCompletedGroup; ++i) {
-      assert(!pendingGroups[i].dots.empty() &&
-             "pending WGMMA group must contain at least one dot");
-      waitOperands.push_back(pendingGroups[i].dots.back().getResult());
-    }
+    waitOperands = getPendingGroupWaitValues(
+        ArrayRef<PendingSharedWgmmaGroup>(pendingGroups)
+            .take_front(lastCompletedGroup + 1));
   }
   ::threadValuesThroughWait(wait, waitOperands);
 
@@ -738,6 +755,12 @@ consumeExistingWait(ttng::WarpGroupDotWaitOp wait,
   unsigned completedCount =
       pendingGroups.size() -
       std::min<unsigned>(pendingGroups.size(), wait.getPendings());
+  if (completedCount != 0) {
+    SmallVector<Value, 4> waitOperands = getPendingGroupWaitValues(
+        ArrayRef<PendingSharedWgmmaGroup>(pendingGroups)
+            .take_front(completedCount));
+    ::threadValuesThroughWait(wait, waitOperands);
+  }
   pendingGroups.erase(pendingGroups.begin(),
                       pendingGroups.begin() + completedCount);
 }
@@ -811,12 +834,209 @@ recordPendingDot(ttng::WarpGroupDotOp dot,
     dot->setAttr(kTleWgmmaAccumulatorChainCAttr,
                  UnitAttr::get(dot.getContext()));
 
-  if (!canAppendToPendingGroup(dot, pendingGroups, analysis))
+  bool appendToCurrentGroup =
+      canAppendToPendingGroup(dot, pendingGroups, analysis);
+  if (!appendToCurrentGroup)
     pendingGroups.push_back(PendingSharedWgmmaGroup{});
 
   pendingGroups.back().dots.push_back(dot);
+  // Within one accumulator chain commit group, the tail dot is the value that
+  // materializes the whole group. Keeping earlier C-chain intermediates as wait
+  // operands would create extra IR uses and break the direct-C-use proof.
+  if (appendToCurrentGroup)
+    pendingGroups.back().values.clear();
+  pendingGroups.back().values.push_back(dot.getResult());
   llvm::append_range(pendingGroups.back().reads,
                      resources.getDotReadResources(dot));
+}
+
+static bool isForwardingUse(OpOperand &use, SmallVectorImpl<Value> &queue) {
+  Operation *user = use.getOwner();
+  if (isa<scf::YieldOp>(user))
+    return true;
+
+  if (isNoop(user)) {
+    if (user->getNumResults() != 1)
+      return false;
+    queue.push_back(user->getResult(0));
+    return true;
+  }
+
+  auto dot = dyn_cast<ttng::WarpGroupDotOp>(user);
+  return dot && use.getOperandNumber() == 2;
+}
+
+static bool hasMaterializingUseInLoop(Value value, scf::ForOp forOp) {
+  SmallVector<Value, 4> queue = {value};
+  llvm::SmallDenseSet<Value, 8> visited;
+
+  while (!queue.empty()) {
+    Value current = queue.pop_back_val();
+    if (!visited.insert(current).second)
+      continue;
+
+    for (OpOperand &use : current.getUses()) {
+      Operation *user = use.getOwner();
+      Operation *ancestor =
+          forOp->isAncestor(user)
+              ? forOp->getRegion(0).findAncestorOpInRegion(*user)
+              : nullptr;
+      if (!ancestor)
+        return true;
+
+      if (isForwardingUse(use, queue))
+        continue;
+
+      if (isa<ttng::WarpGroupDotWaitOp>(user))
+        return true;
+
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void collectDirectWgmmaSources(Value value,
+                                      SmallVectorImpl<ttng::WarpGroupDotOp> &dots,
+                                      llvm::SmallDenseSet<Value, 8> &visited) {
+  value = getWarpGroupDotWaitSource(value);
+  if (!visited.insert(value).second)
+    return;
+
+  if (auto dot = skipNoopDefs(value).getDefiningOp<ttng::WarpGroupDotOp>()) {
+    dots.push_back(dot);
+    return;
+  }
+
+  auto result = dyn_cast<OpResult>(value);
+  if (!result)
+    return;
+
+  if (auto ifOp = dyn_cast<scf::IfOp>(result.getOwner())) {
+    unsigned resultNo = result.getResultNumber();
+    if (resultNo < ifOp.thenYield().getNumOperands())
+      collectDirectWgmmaSources(ifOp.thenYield().getOperand(resultNo), dots,
+                                visited);
+    if (resultNo < ifOp.elseYield().getNumOperands())
+      collectDirectWgmmaSources(ifOp.elseYield().getOperand(resultNo), dots,
+                                visited);
+  }
+}
+
+static SmallVector<ttng::WarpGroupDotOp, 2>
+collectDirectWgmmaSources(Value value) {
+  SmallVector<ttng::WarpGroupDotOp, 2> dots;
+  llvm::SmallDenseSet<Value, 8> visited;
+  collectDirectWgmmaSources(value, dots, visited);
+  llvm::sort(dots, [](ttng::WarpGroupDotOp lhs, ttng::WarpGroupDotOp rhs) {
+    return lhs->isBeforeInBlock(rhs);
+  });
+  dots.erase(std::unique(dots.begin(), dots.end()), dots.end());
+  return dots;
+}
+
+static SmallVector<PendingSharedWgmmaGroup, 4>
+getLoopCarriedPendingGroups(scf::ForOp forOp,
+                            const TlePipeResourceAnalysis &resources) {
+  auto yield = dyn_cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  if (!yield)
+    return {};
+
+  struct Candidate {
+    ttng::WarpGroupDotOp dot;
+    BlockArgument iterArg;
+  };
+  SmallVector<Candidate, 4> candidates;
+
+  for (auto indexed : llvm::enumerate(yield.getOperands())) {
+    unsigned iterIdx = indexed.index();
+    if (iterIdx >= forOp.getNumRegionIterArgs())
+      continue;
+
+    BlockArgument iterArg = forOp.getRegionIterArg(iterIdx);
+    if (!hasMaterializingUseInLoop(iterArg, forOp))
+      continue;
+
+    SmallVector<ttng::WarpGroupDotOp, 2> dots =
+        collectDirectWgmmaSources(indexed.value());
+    if (dots.size() != 1)
+      continue;
+    if (dots.front()->getBlock() != forOp.getBody())
+      continue;
+
+    candidates.push_back(Candidate{dots.front(), iterArg});
+  }
+
+  llvm::sort(candidates, [](const Candidate &lhs, const Candidate &rhs) {
+    return lhs.dot->isBeforeInBlock(rhs.dot);
+  });
+
+  SmallVector<PendingSharedWgmmaGroup, 4> pendingGroups;
+  llvm::DenseMap<Operation *, unsigned> dotToGroup;
+  for (Candidate candidate : candidates) {
+    auto it = dotToGroup.find(candidate.dot.getOperation());
+    if (it == dotToGroup.end()) {
+      dotToGroup[candidate.dot.getOperation()] = pendingGroups.size();
+      PendingSharedWgmmaGroup group;
+      group.dots.push_back(candidate.dot);
+      llvm::append_range(group.reads,
+                         resources.getDotReadResources(candidate.dot));
+      pendingGroups.push_back(std::move(group));
+      it = dotToGroup.find(candidate.dot.getOperation());
+    }
+    pendingGroups[it->second].values.push_back(candidate.iterArg);
+  }
+
+  return pendingGroups;
+}
+
+static ttng::WarpGroupDotWaitOp insertWgmmaDepthWaitAfterLastPendingDot(
+    SmallVectorImpl<PendingSharedWgmmaGroup> &pendingGroups) {
+  // A loop-carried WGMMA future must remain an SSA value for the loop yield,
+  // but it must not be materialized there. A wait with pendings equal to the
+  // number of tracked groups only bounds the cross-iteration pipeline depth and
+  // threads the future values through the wait; the real materializing wait is
+  // inserted later at the first ordinary use or after the loop.
+  assert(!pendingGroups.empty() && "expected at least one pending group");
+  ttng::WarpGroupDotOp lastDot;
+  for (const PendingSharedWgmmaGroup &group : llvm::reverse(pendingGroups)) {
+    if (!group.dots.empty()) {
+      lastDot = group.dots.back();
+      break;
+    }
+  }
+  assert(lastDot && "loop-carried WGMMA groups need an in-loop dot anchor");
+
+  Operation *anchor = lastDot.getOperation();
+  if (Operation *next = anchor->getNextNode();
+      next && isa<ttng::WarpGroupDotCommitOp>(next))
+    anchor = next;
+
+  IRRewriter builder(anchor->getContext());
+  builder.setInsertionPointAfter(anchor);
+  auto wait = ttng::WarpGroupDotWaitOp::create(
+      builder, anchor->getLoc(), ArrayRef<Value>{}, pendingGroups.size());
+
+  SmallVector<Value, 4> waitOperands = getPendingGroupWaitValues(pendingGroups);
+  ::threadValuesThroughWait(wait, waitOperands);
+  return wait;
+}
+
+static bool
+allPendingGroupsCarriedByYield(scf::YieldOp yield,
+                               ArrayRef<PendingSharedWgmmaGroup> pendingGroups) {
+  if (pendingGroups.empty())
+    return true;
+
+  llvm::SmallDenseSet<unsigned, 8> carriedGroups;
+  for (Value operand : yield.getOperands()) {
+    std::optional<unsigned> index =
+        findPendingGroupForValue(operand, pendingGroups);
+    if (index)
+      carriedGroups.insert(*index);
+  }
+  return carriedGroups.size() == pendingGroups.size();
 }
 
 static void scheduleTleWgmmaWaitsInBlock(
@@ -859,6 +1079,11 @@ static void scheduleTleWgmmaWaitsInBlock(
         scheduleTleWgmmaWaitsInBlock(elseBlock, resources, analysis,
                                      elsePending);
 
+      // Branch-local futures are materialized at the branch yield by the
+      // recursive call above. Carrying a newly-created WGMMA group out of an
+      // scf.if is only safe with balanced pending state on all exits; until that
+      // is modeled explicitly, only incoming groups may remain pending after the
+      // join.
       pendingGroups.clear();
       for (PendingSharedWgmmaGroup &pending : incomingPending) {
         bool remainsPending = llvm::any_of(pending.dots, [&](auto dot) {
@@ -875,10 +1100,17 @@ static void scheduleTleWgmmaWaitsInBlock(
   Operation *terminator = block->getTerminator();
   if (!terminator)
     return;
-  if (deferLoopCarriedYield && isa<scf::YieldOp>(terminator)) {
-    if (!pendingGroups.empty())
-      insertWgmmaWaitBefore(terminator, pendingGroups.size() - 1,
-                            pendingGroups, /*forwardedValues=*/{});
+  if (deferLoopCarriedYield) {
+    if (auto yield = dyn_cast<scf::YieldOp>(terminator)) {
+      if (!pendingGroups.empty()) {
+        if (allPendingGroupsCarriedByYield(yield, pendingGroups))
+          insertWgmmaDepthWaitAfterLastPendingDot(pendingGroups);
+        else
+          insertWgmmaWaitBefore(terminator, pendingGroups.size() - 1,
+                                pendingGroups, /*forwardedValues=*/{});
+      }
+      return;
+    }
     return;
   }
   drainForMaterializedOperands(terminator, analysis, pendingGroups);
@@ -936,7 +1168,8 @@ markTleExplicitWgmmaCommitGroups(scf::ForOp forOp,
 void scheduleTleWgmmaAsyncLaunch(scf::ForOp forOp) {
   TlePipeResourceAnalysis resources;
   TleWgmmaScheduleAnalysis analysis(forOp, resources);
-  SmallVector<PendingSharedWgmmaGroup, 4> pendingGroups;
+  SmallVector<PendingSharedWgmmaGroup, 4> pendingGroups =
+      getLoopCarriedPendingGroups(forOp, resources);
 
   scheduleTleWgmmaWaitsInBlock(forOp.getBody(), resources, analysis,
                                pendingGroups,

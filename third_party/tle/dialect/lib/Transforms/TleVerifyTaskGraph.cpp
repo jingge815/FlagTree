@@ -9,6 +9,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/SmallSet.h"
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 
@@ -100,7 +101,22 @@ static LogicalResult verifyTaskCalleeAbi(TaskDeclareOp task,
   FunctionType graphType = cast<FunctionType>(graphFunc.getFunctionType());
   FunctionType calleeType = callee.getFunctionType();
   int64_t domainRank = task.getDomainShape().size();
-  int64_t expectedInputCount = domainRank + graphType.getNumInputs();
+  std::optional<int64_t> traceArgIndex;
+  if (auto attr =
+          graphFunc->getAttrOfType<IntegerAttr>("tle.scheduler_trace_arg_index")) {
+    int64_t index = attr.getInt();
+    if (index < 0 || index >= static_cast<int64_t>(graphType.getNumInputs()))
+      return task.emitOpError()
+             << "scheduler trace arg index is outside enclosing graph "
+                "function inputs";
+    if (!isa<triton::PointerType>(graphType.getInput(index)))
+      return task.emitOpError()
+             << "scheduler trace arg must be a pointer input";
+    traceArgIndex = index;
+  }
+  int64_t payloadInputCount =
+      graphType.getNumInputs() - (traceArgIndex.has_value() ? 1 : 0);
+  int64_t expectedInputCount = domainRank + payloadInputCount;
 
   if (calleeType.getNumResults() != 0)
     return task.emitOpError()
@@ -121,9 +137,16 @@ static LogicalResult verifyTaskCalleeAbi(TaskDeclareOp task,
              << "task callee @" << callee.getName()
              << " coordinate argument " << idx << " must be i32";
   }
-  for (auto [idx, typePair] : llvm::enumerate(llvm::zip(
-           graphType.getInputs(),
-           calleeType.getInputs().drop_front(domainRank)))) {
+  SmallVector<Type> payloadTypes;
+  payloadTypes.reserve(payloadInputCount);
+  for (auto [idx, type] : llvm::enumerate(graphType.getInputs())) {
+    if (traceArgIndex && static_cast<int64_t>(idx) == *traceArgIndex)
+      continue;
+    payloadTypes.push_back(type);
+  }
+  for (auto [idx, typePair] : llvm::enumerate(
+           llvm::zip(payloadTypes,
+                     calleeType.getInputs().drop_front(domainRank)))) {
     Type graphArgType = std::get<0>(typePair);
     Type calleeArgType = std::get<1>(typePair);
     if (graphArgType != calleeArgType)

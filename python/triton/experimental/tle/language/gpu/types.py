@@ -696,6 +696,13 @@ class pipe_value(tl.base_value):
         field_names = _validate_pipe_reader_fields(self, fields)
         return pipe_reader(self, reader_name=reader_name, field_names=field_names)
 
+    @tl.builtin
+    def wait_drained(self, _semantic=None):
+        if self.one_shot:
+            raise ValueError("tle.pipe one_shot pipes do not support wait_drained")
+        _semantic.builder.create_pipe_drain(self._field_handles(), self.capacity, self.scope, self._ir_name(),
+                                            self._field_names())
+
 
 class _pipe_endpoint_type(tl.base_type):
 

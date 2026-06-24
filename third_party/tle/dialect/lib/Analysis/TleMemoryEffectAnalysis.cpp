@@ -60,6 +60,10 @@ static Value getSharedMemDescRoot(Value value) {
       current = stripConvertLayouts(reinterpret.getSrc());
       continue;
     }
+    if (auto alias = current.getDefiningOp<MemDescAliasOp>()) {
+      current = stripConvertLayouts(alias.getSrc());
+      continue;
+    }
     if (auto trans = current.getDefiningOp<ttg::MemDescTransOp>()) {
       current = stripConvertLayouts(trans.getSrc());
       continue;

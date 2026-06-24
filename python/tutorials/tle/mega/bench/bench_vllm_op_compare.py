@@ -425,11 +425,11 @@ def _bench_attention_decode(
             op="attention.decode",
             tokens=1,
             shape=f"q=[1, {heads}, {head_dim}], kv=[{kv_len}, {kv_heads}, {head_dim}]",
-            ours_kernel="kernels.attention.attention_decode",
+            ours_kernel="kernels.attention.attention_decode.fa3_packgqa_ws",
             vllm_kernel="vllm_flash_attn.flash_attn_varlen_func(fa_version=3)",
             ours_ms=ours_ms,
             vllm_ms=vllm_ms,
-            note="ours uses the e2e-selected decode attention path; paged attention intentionally excluded",
+            note="ours uses the e2e-selected FA3-style PackGQA WS decode path; paged attention intentionally excluded",
         ))
 
 

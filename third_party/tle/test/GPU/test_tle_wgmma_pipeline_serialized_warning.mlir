@@ -1,8 +1,9 @@
 // RUN: triton-opt %s -split-input-file -tritongpu-assign-latencies -tritongpu-schedule-loops -tritongpu-pipeline -canonicalize | FileCheck %s
 
-// A dot cannot stay properly async only because its uses are after a wait in
-// the next loop iteration. That would leave the WGMMA pipeline stage open
-// across the loop backedge, which ptxas serializes.
+// Loop-carried WGMMA futures may cross the backedge only when the scheduler can
+// explicitly track their first materializing use and keep a final wait after the
+// loop. The first case below materializes the previous iteration's value after
+// a younger dot, so the carried dot is kept pending with a depth wait.
 #blocked = #ttg.blocked<{sizePerThread = [8, 1], threadsPerWarp = [8, 4], warpsPerCTA = [1, 4], order = [0, 1]}>
 #blocked1 = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [4, 8], warpsPerCTA = [4, 1], order = [1, 0]}>
 #mma = #ttg.nvidia_mma<{versionMajor = 3, versionMinor = 0, warpsPerCTA = [4, 1], instrShape = [16, 64, 16]}>
@@ -51,8 +52,10 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     // CHECK:            %[[DOT2:[^ ]+]] = ttng.warp_group_dot %{{.*}}, %{{.*}}, %{{.*}}
     // CHECK-NEXT:       ttng.warp_group_dot_commit
     // CHECK:            %[[WAIT2:.+]]:{{.*}} = ttng.warp_group_dot_wait %[[DOT2]]
-    // CHECK-SAME:         {pendings = 0 : i32}
+    // CHECK-SAME:         {pendings = 1 : i32}
     // CHECK:          scf.yield %[[WAIT2]]#0
+    // CHECK:          ttng.warp_group_dot_wait %[[LOOP]]#0
+    // CHECK-SAME:       {pendings = 0 : i32}
     %17:4 = scf.for %arg3 = %c0_i32 to %c8_i32 step %c1_i32 iter_args(%prev_dot2 = %cst_3, %arg5 = %16, %prev_dot1 = %cst_2, %prev_dot0 = %cst_2) -> (tensor<128x64xf32, #mma>, tensor<64x16x!tt.ptr<f16>, #blocked>, tensor<128x16xf32, #mma1>, tensor<128x16xf32, #mma1>)  : i32 {
       %dot0 = ttng.warp_group_dot %19, %20, %prev_dot1 : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x16xf16, #shared1, #smem> -> tensor<128x16xf32, #mma1>
       %dot1 = ttng.warp_group_dot %19, %20, %prev_dot1 : !ttg.memdesc<128x64xf16, #shared, #smem> * !ttg.memdesc<64x16xf16, #shared1, #smem> -> tensor<128x16xf32, #mma1>
@@ -76,8 +79,8 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
 #shared1 = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = true, elementBitWidth = 16}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
-// CHECK-LABEL: loop_carried_elementwise_acc_requires_wait_before_yield
-  tt.func @loop_carried_elementwise_acc_requires_wait_before_yield(
+// CHECK-LABEL: loop_carried_elementwise_acc_requires_wait_after_loop
+  tt.func @loop_carried_elementwise_acc_requires_wait_after_loop(
       %a: !ttg.memdesc<64x64xbf16, #shared, #smem>,
       %b: !ttg.memdesc<64x64xbf16, #shared1, #smem, mutable>,
       %out: tensor<64x64x!tt.ptr<f32>, #mma>) {
@@ -86,16 +89,20 @@ module attributes {"ttg.target" = "cuda:90", "ttg.num-ctas" = 1 : i32, "ttg.num-
     %c8 = arith.constant 8 : index
     %one = arith.constant dense<1.000000e+00> : tensor<64x64xf32, #mma>
     %zero = arith.constant dense<0.000000e+00> : tensor<64x64xf32, #mma>
+    // CHECK:          %[[RES:.+]] = scf.for
     %res = scf.for %iv = %c0 to %c8 step %c1 iter_args(%acc = %zero) -> (tensor<64x64xf32, #mma>) {
       %scaled = arith.mulf %acc, %one : tensor<64x64xf32, #mma>
       // CHECK:          %[[DOT:.+]] = ttng.warp_group_dot
       %dot = ttng.warp_group_dot %a, %b, %scaled {inputPrecision = 0 : i32} : !ttg.memdesc<64x64xbf16, #shared, #smem> * !ttg.memdesc<64x64xbf16, #shared1, #smem, mutable> -> tensor<64x64xf32, #mma>
       // CHECK-NEXT:     ttng.warp_group_dot_commit
       // CHECK-NEXT:     %[[WAIT:.+]]:{{.*}} = ttng.warp_group_dot_wait %[[DOT]]
-      // CHECK-SAME:       {pendings = 0 : i32}
+      // CHECK-SAME:       {pendings = 1 : i32}
       // CHECK-NEXT:     scf.yield %[[WAIT]]#0
       scf.yield %dot : tensor<64x64xf32, #mma>
     }
+    // CHECK-NEXT:     }
+    // CHECK-NEXT:     ttng.warp_group_dot_wait %[[RES]]
+    // CHECK-SAME:       {pendings = 0 : i32}
     tt.store %out, %res : tensor<64x64x!tt.ptr<f32>, #mma>
     tt.return
   }

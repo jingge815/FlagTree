@@ -1,4 +1,5 @@
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/GPU/IR/GPUDialect.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
@@ -14,9 +15,11 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Utility.h"
+#include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <optional>
 
@@ -24,6 +27,7 @@ namespace mlir::triton::tle {
 
 namespace tt = mlir::triton;
 namespace ttg = mlir::triton::gpu;
+namespace ttng = mlir::triton::nvidia_gpu;
 namespace ttnvws = mlir::triton::nvws;
 
 #define GEN_PASS_DEF_TRITONTLELOWERPIPETONVWS
@@ -50,7 +54,6 @@ struct PipeState {
   Value token;
   Value closeTags;
   ttg::MemDescType closeTagSlotType;
-  RankedTensorType closeTagTensorType;
   SmallVector<std::string> readerNames;
   bool oneShot;
   std::optional<int32_t> writerTaskId;
@@ -58,6 +61,7 @@ struct PipeState {
   std::optional<int32_t> writerFullCount;
   std::map<std::string, std::pair<int32_t, int32_t>> readerTasks;
   std::optional<PipeCommitTransport> dataTransport;
+  Value drainBarrier;
 };
 
 struct PipeDefinition {
@@ -102,12 +106,15 @@ static OperandRange getPipeFields(Operation *op) {
     return pipeOp.getFields();
   if (auto pipeOp = dyn_cast<PipeReaderWaitOp>(op))
     return pipeOp.getFields();
-  return cast<PipeReaderReleaseOp>(op).getFields();
+  if (auto pipeOp = dyn_cast<PipeReaderReleaseOp>(op))
+    return pipeOp.getFields();
+  return cast<PipeDrainOp>(op).getFields();
 }
 
 static bool isPipeLifecycleOp(Operation *op) {
   return isa<PipeCreateOp, PipeWriterAcquireOp, PipeWriterCommitOp,
-             PipeWriterCloseOp, PipeReaderWaitOp, PipeReaderReleaseOp>(op);
+             PipeWriterCloseOp, PipeReaderWaitOp, PipeReaderReleaseOp,
+             PipeDrainOp>(op);
 }
 
 static bool containsPipeLifecycleOp(tt::FuncOp func) {
@@ -225,6 +232,10 @@ static Value getMemDescRoot(Value value) {
     }
     if (auto subslice = current.getDefiningOp<ttg::MemDescSubsliceOp>()) {
       current = canonicalizePipeField(subslice.getSrc());
+      continue;
+    }
+    if (auto alias = current.getDefiningOp<MemDescAliasOp>()) {
+      current = canonicalizePipeField(alias.getSrc());
       continue;
     }
     break;
@@ -457,6 +468,51 @@ static LogicalResult recordReaderTask(PipeState &state, Operation *op,
   return success();
 }
 
+static SmallVector<std::string> getDeclaredReaderNames(PipeCreateOp op) {
+  SmallVector<std::string> readerNames;
+  if (auto readersAttr = op->getAttrOfType<ArrayAttr>("readers")) {
+    readerNames.reserve(readersAttr.size());
+    for (Attribute attr : readersAttr)
+      readerNames.push_back(cast<StringAttr>(attr).getValue().str());
+  }
+  return readerNames;
+}
+
+static bool hasDeclaredReader(ArrayRef<std::string> readerNames,
+                              StringRef readerName) {
+  return llvm::any_of(readerNames, [&](const std::string &declared) {
+    return StringRef(declared) == readerName;
+  });
+}
+
+static FailureOr<std::string>
+getPipeReaderNameForDefinition(ArrayRef<std::string> readerNames,
+                               Operation *op) {
+  std::string readerName;
+  if (auto attr = op->getAttrOfType<StringAttr>("reader_name"))
+    readerName = attr.getValue().str();
+
+  if (readerNames.empty()) {
+    if (!readerName.empty()) {
+      op->emitOpError("uses named reader ")
+          << readerName << " but pipe was created without readers";
+      return failure();
+    }
+    return readerName;
+  }
+
+  if (readerName.empty()) {
+    op->emitOpError("requires reader_name because pipe was created "
+                    "with explicit readers");
+    return failure();
+  }
+  if (!hasDeclaredReader(readerNames, readerName)) {
+    op->emitOpError("uses undeclared pipe reader ") << readerName;
+    return failure();
+  }
+  return readerName;
+}
+
 static StringRef getTransportName(PipeCommitTransport transport) {
   switch (transport) {
   case PipeCommitTransport::LocalStore:
@@ -531,6 +587,10 @@ getCommitFieldRootForStore(Value memdesc, PipeWriterCommitOp commit) {
     }
     if (auto subslice = current.getDefiningOp<ttg::MemDescSubsliceOp>()) {
       current = canonicalizePipeField(subslice.getSrc());
+      continue;
+    }
+    if (auto alias = current.getDefiningOp<MemDescAliasOp>()) {
+      current = canonicalizePipeField(alias.getSrc());
       continue;
     }
     break;
@@ -1163,6 +1223,195 @@ analyzePipeCommits(ArrayRef<Operation *> ops,
   return success();
 }
 
+struct PipeDrainBuildState {
+  SmallVector<std::string> readerNames;
+  bool oneShot = false;
+  std::optional<std::pair<int32_t, int32_t>> writerCloseTask;
+  std::map<std::string, std::pair<int32_t, int32_t>> readerReleaseTasks;
+  std::map<int32_t, int32_t> readyTasks;
+  std::map<int32_t, int32_t> drainTasks;
+  DenseSet<int32_t> drainedTasks;
+};
+
+static LogicalResult recordDrainReadyTask(PipeDrainBuildState &state,
+                                          Operation *op, int32_t taskId,
+                                          int32_t threadCount) {
+  auto it = state.readyTasks.find(taskId);
+  if (it != state.readyTasks.end() && it->second != threadCount)
+    return op->emitOpError("uses pipe drain participant task ")
+           << taskId << " with inconsistent thread counts " << it->second
+           << " and " << threadCount;
+  state.readyTasks[taskId] = threadCount;
+  return success();
+}
+
+static LogicalResult recordDrainArrival(PipeDrainBuildState &state,
+                                        Operation *op, int32_t taskId,
+                                        int32_t threadCount) {
+  if (state.oneShot)
+    return op->emitOpError("does not support wait_drained on one_shot pipe");
+  if (!state.readyTasks.count(taskId))
+    return op->emitOpError(
+        "requires a preceding pipe.writer_close or pipe.reader_release in the "
+        "same async task before wait_drained");
+  if (state.drainedTasks.contains(taskId))
+    return op->emitOpError("has duplicate wait_drained in async_task_id ")
+           << taskId;
+  state.drainedTasks.insert(taskId);
+  state.drainTasks[taskId] = threadCount;
+  return success();
+}
+
+static LogicalResult verifyNoUseAfterDrain(PipeDrainBuildState &state,
+                                           Operation *op, int32_t taskId) {
+  if (!state.drainedTasks.contains(taskId))
+    return success();
+  return op->emitOpError("uses pipe after wait_drained in async_task_id ")
+         << taskId;
+}
+
+static LogicalResult
+verifyRequiredDrainParticipant(PipeDrainBuildState &state, Operation *op,
+                               StringRef role,
+                               std::optional<std::pair<int32_t, int32_t>> task) {
+  if (!task)
+    return op->emitOpError("wait_drained requires ") << role
+                                                     << " to reach drain";
+  int32_t taskId = task->first;
+  auto it = state.drainTasks.find(taskId);
+  if (it == state.drainTasks.end())
+    return op->emitOpError("wait_drained requires ") << role
+                                                     << " async_task_id "
+                                                     << taskId
+                                                     << " to call drain";
+  if (it->second != task->second)
+    return op->emitOpError("wait_drained participant thread count mismatch "
+                           "for ")
+           << role;
+  return success();
+}
+
+static LogicalResult analyzePipeDrains(
+    ArrayRef<Operation *> ops, std::map<std::string, PipeDefinition> &pipes,
+    std::map<std::string, int32_t> &drainParticipantCounts) {
+  std::map<std::string, PipeDrainBuildState> states;
+
+  for (const auto &entry : pipes) {
+    PipeDrainBuildState state;
+    state.readerNames = getDeclaredReaderNames(entry.second.create);
+    state.oneShot = entry.second.oneShot;
+    states.emplace(entry.first, std::move(state));
+  }
+
+  for (Operation *op : ops) {
+    if (isa<PipeCreateOp>(op))
+      continue;
+
+    std::string key = getPipeKey(op);
+    auto defIt = pipes.find(key);
+    if (defIt == pipes.end())
+      return op->emitOpError("requires a preceding matching pipe.create");
+    PipeDrainBuildState &state = states[key];
+
+    auto defaultTask = [&]() -> int32_t {
+      if (isa<PipeWriterAcquireOp, PipeWriterCommitOp, PipeWriterCloseOp>(op))
+        return getEnclosingDefaultTaskId(op, /*writer=*/0);
+      if (isa<PipeDrainOp>(op))
+        return getEnclosingDefaultTaskId(op, /*nonWarpSpecializeDefault=*/0);
+      return getEnclosingDefaultTaskId(op, /*reader=*/1);
+    };
+    auto taskId = getSingleTaskId(op, defaultTask());
+    if (failed(taskId))
+      return failure();
+    auto threadCount = getTaskThreadCount(op);
+    if (failed(threadCount))
+      return failure();
+
+    if (auto drain = dyn_cast<PipeDrainOp>(op)) {
+      if (failed(recordDrainArrival(state, op, *taskId, *threadCount)))
+        return failure();
+      continue;
+    }
+
+    if (failed(verifyNoUseAfterDrain(state, op, *taskId)))
+      return failure();
+
+    if (auto close = dyn_cast<PipeWriterCloseOp>(op)) {
+      if (state.writerCloseTask &&
+          state.writerCloseTask->first != *taskId)
+        return close.emitOpError("uses writer async_task_id ")
+               << *taskId << " but pipe close already has writer "
+               << "async_task_id " << state.writerCloseTask->first;
+      state.writerCloseTask = std::make_pair(*taskId, *threadCount);
+      if (failed(recordDrainReadyTask(state, op, *taskId, *threadCount)))
+        return failure();
+      continue;
+    }
+
+    if (auto release = dyn_cast<PipeReaderReleaseOp>(op)) {
+      auto readerName =
+          getPipeReaderNameForDefinition(state.readerNames, release);
+      if (failed(readerName))
+        return failure();
+      auto it = state.readerReleaseTasks.find(*readerName);
+      if (it != state.readerReleaseTasks.end() &&
+          it->second.first != *taskId)
+        return release.emitOpError("uses reader ")
+               << *readerName << " async_task_id " << *taskId
+               << " but that reader already released from async_task_id "
+               << it->second.first;
+      state.readerReleaseTasks[*readerName] =
+          std::make_pair(*taskId, *threadCount);
+      if (failed(recordDrainReadyTask(state, op, *taskId, *threadCount)))
+        return failure();
+      continue;
+    }
+  }
+
+  for (auto &[key, state] : states) {
+    if (state.drainTasks.empty())
+      continue;
+
+    Operation *diagnosticOp = pipes[key].create.getOperation();
+    if (failed(verifyRequiredDrainParticipant(
+            state, diagnosticOp, "writer close", state.writerCloseTask)))
+      return failure();
+
+    if (state.readerNames.empty()) {
+      auto it = state.readerReleaseTasks.find("");
+      std::optional<std::pair<int32_t, int32_t>> defaultReader;
+      if (it != state.readerReleaseTasks.end())
+        defaultReader = it->second;
+      if (failed(verifyRequiredDrainParticipant(state, diagnosticOp,
+                                                "default reader release",
+                                                defaultReader)))
+        return failure();
+    } else {
+      for (const std::string &readerName : state.readerNames) {
+        auto it = state.readerReleaseTasks.find(readerName);
+        std::optional<std::pair<int32_t, int32_t>> readerTask;
+        if (it != state.readerReleaseTasks.end())
+          readerTask = it->second;
+        std::string role = (Twine("reader ") + readerName + " release").str();
+        if (failed(verifyRequiredDrainParticipant(state, diagnosticOp, role,
+                                                  readerTask)))
+          return failure();
+      }
+    }
+
+    int64_t participantCount = 0;
+    for (auto &[taskId, threads] : state.drainTasks)
+      participantCount += threads;
+    if (participantCount <= 0 ||
+        participantCount > std::numeric_limits<int32_t>::max())
+      return diagnosticOp->emitOpError(
+          "wait_drained participant count is out of range");
+    drainParticipantCounts[key] = static_cast<int32_t>(participantCount);
+  }
+
+  return success();
+}
+
 static void setTokenLoadType(Value token, ttnvws::TokenLoadType loadType) {
   auto createToken = cast<ttnvws::CreateTokenOp>(token.getDefiningOp());
   createToken->setAttr(
@@ -1194,7 +1443,22 @@ static RankedTensorType getCloseTagTensorType(Operation *op, OpBuilder &builder,
 static Value createCloseTagTensor(OpBuilder &builder, Location loc,
                                   RankedTensorType tensorType, bool value);
 
-static PipeState createPipeState(PipeCreateOp op) {
+static Value createDrainBarrier(OpBuilder &builder, Location loc,
+                                PipeCreateOp op, int32_t participantCount) {
+  MLIRContext *context = op->getContext();
+  auto sharedMemorySpace = ttg::SharedMemorySpaceAttr::get(context);
+  Attribute barrierEncoding = getCloseTagEncoding(context, 1);
+  auto barrierType =
+      ttg::MemDescType::get({1}, builder.getI64Type(), barrierEncoding,
+                            sharedMemorySpace, /*mutableMemory=*/true);
+  Value barrier = ttg::LocalAllocOp::create(builder, loc, barrierType);
+  ttng::InitBarrierOp::create(builder, loc, barrier, participantCount);
+  mlir::gpu::BarrierOp::create(builder, loc);
+  return barrier;
+}
+
+static PipeState createPipeState(PipeCreateOp op,
+                                 std::optional<int32_t> drainCount) {
   OpBuilder builder(op);
   Location loc = op.getLoc();
   MLIRContext *context = op->getContext();
@@ -1204,7 +1468,6 @@ static PipeState createPipeState(PipeCreateOp op) {
   auto sharedMemorySpace = ttg::SharedMemorySpaceAttr::get(context);
   Value closeTags;
   ttg::MemDescType closeTagSlotType;
-  RankedTensorType closeTagTensorType;
   if (!oneShot) {
     Attribute closeTagArrayEncoding = getCloseTagEncoding(context, 2);
     Attribute closeTagSlotEncoding = getCloseTagEncoding(context, 1);
@@ -1223,30 +1486,27 @@ static PipeState createPipeState(PipeCreateOp op) {
                              /*value=*/false);
     closeTags = ttg::LocalAllocOp::create(builder, loc, closeTagArrayType,
                                           initialCloseTags);
-    closeTagTensorType = getCloseTagTensorType(op, builder, {1});
   }
   Value token = ttnvws::CreateTokenOp::create(
       builder, loc, static_cast<uint32_t>(capacity),
       ttnvws::TokenLoadType::LocalStoreOp);
 
-  SmallVector<std::string> readerNames;
-  if (auto readersAttr = op->getAttrOfType<ArrayAttr>("readers")) {
-    readerNames.reserve(readersAttr.size());
-    for (Attribute attr : readersAttr)
-      readerNames.push_back(cast<StringAttr>(attr).getValue().str());
-  }
+  SmallVector<std::string> readerNames = getDeclaredReaderNames(op);
+  Value drainBarrier;
+  if (drainCount)
+    drainBarrier = createDrainBarrier(builder, loc, op, *drainCount);
 
   PipeState state{token,
                   closeTags,
                   closeTagSlotType,
-                  closeTagTensorType,
                   readerNames,
                   oneShot,
                   /*writerTaskId=*/std::nullopt,
                   /*writerThreadCount=*/std::nullopt,
                   /*writerFullCount=*/std::nullopt,
                   /*readerTasks=*/{},
-                  /*dataTransport=*/std::nullopt};
+                  /*dataTransport=*/std::nullopt,
+                  drainBarrier};
   op.erase();
   return state;
 }
@@ -1269,8 +1529,9 @@ static void storeCloseTag(OpBuilder &builder, Location loc,
                           Operation *source, int32_t taskId) {
   Value closeTags = getWarpSpecializeCaptureForUse(source, state.closeTags);
   Value slot = createCloseTagSlot(builder, loc, state, closeTags, stage);
+  RankedTensorType tensorType = getCloseTagTensorType(source, builder, {1});
   Value tag =
-      createCloseTagTensor(builder, loc, state.closeTagTensorType, value);
+      createCloseTagTensor(builder, loc, tensorType, value);
   auto store = ttg::LocalStoreOp::create(builder, loc, tag, slot);
   setRoleTaskId(source, slot.getDefiningOp(), taskId);
   setRoleTaskId(source, tag.getDefiningOp(), taskId);
@@ -1282,8 +1543,9 @@ static Value loadCloseTag(OpBuilder &builder, Location loc,
                           Operation *source, int32_t taskId) {
   Value closeTags = getWarpSpecializeCaptureForUse(source, state.closeTags);
   Value slot = createCloseTagSlot(builder, loc, state, closeTags, stage);
+  RankedTensorType tensorType = getCloseTagTensorType(source, builder, {1});
   Value tagTensor =
-      ttg::LocalLoadOp::create(builder, loc, state.closeTagTensorType, slot);
+      ttg::LocalLoadOp::create(builder, loc, tensorType, slot);
   Value tagI32 =
       tt::UnsplatOp::create(builder, loc, builder.getI32Type(), tagTensor);
   Value zero = arith::ConstantIntOp::create(builder, loc, 0, 32);
@@ -1323,12 +1585,22 @@ public:
       signalPassFailure();
       return;
     }
+    std::map<std::string, int32_t> drainParticipantCounts;
+    if (failed(analyzePipeDrains(ops, pipeDefinitions,
+                                 drainParticipantCounts))) {
+      signalPassFailure();
+      return;
+    }
 
     std::map<std::string, PipeState> pipes;
     for (Operation *op : ops) {
       std::string key = getPipeKey(op);
       if (auto create = dyn_cast<PipeCreateOp>(op)) {
-        pipes.emplace(key, createPipeState(create));
+        std::optional<int32_t> drainCount;
+        auto drainIt = drainParticipantCounts.find(key);
+        if (drainIt != drainParticipantCounts.end())
+          drainCount = drainIt->second;
+        pipes.emplace(key, createPipeState(create, drainCount));
         continue;
       }
 
@@ -1548,6 +1820,39 @@ public:
           wait.getIsClosed().replaceAllUsesWith(isClosed);
         }
         wait.erase();
+        continue;
+      }
+
+      if (auto drain = dyn_cast<PipeDrainOp>(op)) {
+        if (!state.drainBarrier) {
+          drain.emitOpError("is missing precomputed drain barrier");
+          signalPassFailure();
+          return;
+        }
+        auto taskId = getSingleTaskId(
+            op, getEnclosingDefaultTaskId(op,
+                                          /*nonWarpSpecializeDefault=*/0));
+        if (failed(taskId)) {
+          signalPassFailure();
+          return;
+        }
+        auto threadCount = getTaskThreadCount(op);
+        if (failed(threadCount)) {
+          signalPassFailure();
+          return;
+        }
+        Value barrier = getWarpSpecializeCaptureForUse(op, state.drainBarrier);
+        auto arrive =
+            ttng::ArriveBarrierOp::create(builder, loc, barrier, *threadCount);
+        arrive.setParticipantArrive(true);
+        arrive.setReleaseFence(true);
+        setRoleTaskId(op, arrive.getOperation(), *taskId);
+        Value phase = arith::ConstantIntOp::create(builder, loc, 0, 32);
+        setRoleTaskId(op, phase.getDefiningOp(), *taskId);
+        auto wait =
+            ttng::WaitBarrierOp::create(builder, loc, barrier, phase);
+        setRoleTaskId(op, wait.getOperation(), *taskId);
+        drain.erase();
         continue;
       }
 
