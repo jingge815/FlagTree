@@ -62,7 +62,11 @@ FlagTree extension components are currently available on some backends:
 
 ## TLE (Triton Language Extensions)
 
-Triton provides strong productivity for kernel development, but heterogeneous AI chips and deeper performance tuning scenarios need more explicit control over distributed execution, memory access patterns, and hardware-specific primitives. TLE extends Triton in a layered way to bridge this gap while keeping compatibility with existing Triton workflows.
+If you want to use TLE on the NVIDIA backend, please use the triton_v3.6.x branch. It is not currently supported on the main branch (Triton 3.0/3.1).
+For other backends, please refer to the table above.
+
+Triton provides strong productivity for kernel development, but heterogeneous AI chips and deeper performance tuning scenarios need more explicit control over distributed execution, memory access patterns, and hardware-specific primitives.
+TLE extends Triton in a layered way to bridge this gap while keeping compatibility with existing Triton workflows.
 
 Key advantages of TLE:
 
@@ -86,6 +90,7 @@ The following uses the mm operator under some shapes called in the Qwen model as
 
 ## Latest News
 
+* 2026/06/26 Upgraded the [metax](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/metax/) backend to Triton 3.6 and added CI/CD.
 * 2026/06/10 Added the [rpu](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/rpu/) backend integration (based on Triton 3.6) and added CI/CD.
 * 2026/06/08 Upgraded the [ascend](https://github.com/flagos-ai/FlagTree/tree/triton_v3.5.x/third_party/ascend/) backend to Triton 3.5 and added CI/CD.
 * 2026/06/03 Added the ARM64 [cpu](https://github.com/flagos-ai/FlagTree/tree/triton_v3.3.x/third_party/cpu/) backend integration (based on Triton 3.3).
@@ -181,6 +186,7 @@ RES="--index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simpl
 |mthreads  |python3.10 -m pip install flagtree===0.5.1+mthreads3.2 $RES     |3.2|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |mthreads  |python3.10 -m pip install flagtree===0.5.1+mthreads3.1 $RES     |3.1|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |xpu       |python3.10 -m pip install flagtree===0.5.1+xpu3.0 $RES          |3.0|GLIBC_2.31<br>GLIBCXX_3.4.28<br>CXXABI_1.3.12|
+|metax     |python3.12 -m pip install flagtree===0.6.0rc1+metax3.6 $RES     |3.6|GLIBC_2.39<br>GLIBCXX_3.4.33<br>CXXABI_1.3.15|
 |metax     |python3.12 -m pip install flagtree===0.5.1+metax3.0 $RES        |3.0|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |hcu       |python3.10 -m pip install flagtree===0.6.0rc1+hcu3.6 $RES       |3.6|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |hcu       |python3.10 -m pip install flagtree===0.5.1+hcu3.1 $RES          |3.1|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|

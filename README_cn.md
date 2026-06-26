@@ -62,7 +62,11 @@ FlagTree 的扩展组件当前在部分后端可用：
 
 ## TLE（Triton Language Extensions）简介
 
-Triton 在算子开发效率方面表现突出，但在多元 AI 芯片适配和更深层性能调优场景下，往往需要对分布式执行、内存访问模式和硬件相关原语提供更显式的控制。TLE 以分层方式扩展 Triton，在保持现有 Triton 工作流兼容性的同时补齐这部分能力。
+如果要在 nvidia 后端使用 TLE 语言扩展，请使用 triton_v3.6.x 分支，暂时不在 main 分支（Triton 3.0/3.1）支持。
+其他后端的 TLE 支持分支详见上面的表格。
+
+Triton 在算子开发效率方面表现突出，但在多元 AI 芯片适配和更深层性能调优场景下，往往需要对分布式执行、内存访问模式和硬件相关原语提供更显式的控制。
+TLE 以分层方式扩展 Triton，在保持现有 Triton 工作流兼容性的同时补齐这部分能力。
 
 TLE 的主要优势包括：
 
@@ -86,13 +90,14 @@ TLE 的主要优势包括：
 
 ## 新特性
 
+* 2026/06/26 [metax](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/metax/) 后端升级到 Triton 3.6，加入 CI/CD。
 * 2026/06/10 新增接入 [rpu](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/rpu/) 后端（对应 Triton 3.6），加入 CI/CD。
 * 2026/06/08 [ascend](https://github.com/flagos-ai/FlagTree/tree/triton_v3.5.x/third_party/ascend/) 后端升级到 Triton 3.5，加入 CI/CD。
 * 2026/06/03 新增接入 ARM64 [cpu](https://github.com/flagos-ai/FlagTree/tree/triton_v3.3.x/third_party/cpu/) 后端（对应 Triton 3.3）。
 * 2026/06/01 新增接入 [damoacademy](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/thrive/) 后端（对应 Triton 3.6），加入 CI/CD。
 * 2026/05/12 [mthreads](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/mthreads/) 后端升级到 Triton 3.6，加入 CI/CD。
 * 2026/05/07 [hcu](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/hcu/) 后端升级到 Triton 3.6，加入 CI/CD。
-* 2026/04/23 [mthreads](https://github.com/flagos-ai/FlagTree/tree/triton_v3.2.x/third_party/mthreads/) 后端升级到 Triton 3.2，加入 CI/CD。
+* 2026/04/24 [mthreads](https://github.com/flagos-ai/FlagTree/tree/triton_v3.2.x/third_party/mthreads/) 后端升级到 Triton 3.2，加入 CI/CD。
 * 2026/04/17 [enflame](https://github.com/flagos-ai/FlagTree/tree/triton_v3.6.x/third_party/enflame/) 后端升级到 Triton 3.6，加入 CI/CD。
 * 2026/03/13 [enflame](https://github.com/flagos-ai/FlagTree/tree/triton_v3.5.x/third_party/enflame/) 后端升级到 Triton 3.5，加入 CI/CD。
 * 2026/01/23 新增接入 [sunrise](https://github.com/flagos-ai/FlagTree/tree/triton_v3.4.x/third_party/sunrise/) 后端（对应 Triton 3.4），加入 CI/CD。
@@ -181,6 +186,7 @@ RES="--index-url=https://resource.flagos.net/repository/flagos-pypi-hosted/simpl
 |mthreads  |python3.10 -m pip install flagtree===0.5.1+mthreads3.2 $RES     |3.2|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |mthreads  |python3.10 -m pip install flagtree===0.5.1+mthreads3.1 $RES     |3.1|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |xpu       |python3.10 -m pip install flagtree===0.5.1+xpu3.0 $RES          |3.0|GLIBC_2.31<br>GLIBCXX_3.4.28<br>CXXABI_1.3.12|
+|metax     |python3.12 -m pip install flagtree===0.6.0rc1+metax3.6 $RES     |3.6|GLIBC_2.39<br>GLIBCXX_3.4.33<br>CXXABI_1.3.15|
 |metax     |python3.12 -m pip install flagtree===0.5.1+metax3.0 $RES        |3.0|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |hcu       |python3.10 -m pip install flagtree===0.6.0rc1+hcu3.6 $RES       |3.6|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
 |hcu       |python3.10 -m pip install flagtree===0.5.1+hcu3.1 $RES          |3.1|GLIBC_2.35<br>GLIBCXX_3.4.30<br>CXXABI_1.3.13|
