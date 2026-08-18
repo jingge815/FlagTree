@@ -37,6 +37,7 @@
 #include "triton/Dialect/TritonInstrument/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonNvidiaGPU/Transforms/TMAUtilities.h"
+#include "triton/Dialect/TritonPIM/IR/Dialect.h"
 #include "triton/Tools/Sys/GetEnv.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FileSystem.h"
@@ -360,6 +361,7 @@ void init_triton_ir(py::module &&m) {
   m.def("load_dialects", [](MLIRContext &context) {
     DialectRegistry registry;
     registry.insert<TritonDialect, ::mlir::triton::gpu::TritonGPUDialect,
+                    ::mlir::triton::pim::TritonPIMDialect,
                     ::mlir::triton::instrument::TritonInstrumentDialect,
                     math::MathDialect, arith::ArithDialect, scf::SCFDialect,
                     ::mlir::gpu::GPUDialect, cf::ControlFlowDialect,
@@ -647,6 +649,10 @@ void init_triton_ir(py::module &&m) {
              self.print(os, printingFlags);
              return str;
            })
+      // Deep-copies the module so a pass pipeline can be run on it without
+      // disturbing the original. Used to compile a kernel for a second target
+      // alongside the primary one.
+      .def("clone", [](ModuleOp &self) -> ModuleOp { return self.clone(); })
       .def("push_back",
            [](ModuleOp &self, FuncOp &funcOp) -> void {
              self.push_back(funcOp);

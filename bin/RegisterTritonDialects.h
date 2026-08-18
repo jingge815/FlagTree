@@ -36,6 +36,8 @@
 #include "nvidia/include/TritonNVIDIAGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
+#include "triton/Conversion/TritonToTritonPIM/Passes.h"
+#include "triton/Dialect/TritonPIM/Transforms/Passes.h"
 #include "triton/Target/LLVMIR/Passes.h"
 
 #include "mlir/Dialect/LLVMIR/NVVMDialect.h"
@@ -77,6 +79,8 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
   mlir::test::registerTestAMDGPUMembarPass();
   mlir::test::registerTestTritonAMDGPURangeAnalysis();
   mlir::triton::registerConvertTritonToTritonGPUPass();
+  mlir::triton::registerConvertTritonToTritonPIMPass();
+  mlir::triton::pim::registerTritonPIMPasses();
   mlir::triton::registerRelayoutTritonGPUPass();
   mlir::triton::gpu::registerAllocateSharedMemoryPass();
   mlir::triton::gpu::registerTritonGPUAllocateWarpGroups();
@@ -129,6 +133,7 @@ inline void registerTritonDialects(mlir::DialectRegistry &registry) {
       mlir::triton::TritonDialect, mlir::cf::ControlFlowDialect,
       mlir::triton::nvidia_gpu::TritonNvidiaGPUDialect,
       mlir::triton::gpu::TritonGPUDialect,
+      mlir::triton::pim::TritonPIMDialect,
       mlir::triton::instrument::TritonInstrumentDialect,
       mlir::math::MathDialect, mlir::arith::ArithDialect, mlir::scf::SCFDialect,
       mlir::gpu::GPUDialect, mlir::LLVM::LLVMDialect, mlir::NVVM::NVVMDialect,

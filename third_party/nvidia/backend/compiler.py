@@ -1,4 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
+from triton.backends import pim_sidecar
 from triton._C.libtriton import ir, passes, llvm, nvidia
 from triton._C.libtriton import tle
 from triton import knobs
@@ -257,6 +258,11 @@ class CUDABackend(BaseBackend):
         passes.common.add_symbol_dce(pm)
         passes.ttir.add_loop_unroll(pm)
         pm.run(mod)
+        # Optionally emit PIM IR from this same TTIR. It branches off here rather
+        # than being a stage of its own, because the stage loop is linear and the
+        # GPU path must keep consuming the module returned below unchanged.
+        if pim_sidecar.is_enabled():
+            pim_sidecar.emit_pim_ir(mod, metadata)
         return mod
 
     @staticmethod

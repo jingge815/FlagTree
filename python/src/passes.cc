@@ -7,6 +7,8 @@
 #include "triton/Analysis/Membar.h"
 #include "triton/Conversion/TritonGPUToLLVM/Passes.h"
 #include "triton/Conversion/TritonToTritonGPU/Passes.h"
+#include "triton/Conversion/TritonToTritonPIM/Passes.h"
+#include "triton/Dialect/TritonPIM/Transforms/Passes.h"
 #include "triton/Dialect/Gluon/Transforms/Passes.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
@@ -119,12 +121,29 @@ void init_gluon_passes(py::module &&m) {
   ADD_PASS_WRAPPER_0("add_inliner", gluon::createGluonInline);
 }
 
+void init_triton_passes_pim(py::module &&m) {
+  using namespace mlir::triton;
+  // Five options, one more than ADD_PASS_OPTION_WRAPPER_4 handles, so this one
+  // is spelled out.
+  m.def("add_convert_to_pim",
+        [](mlir::PassManager &pm, const std::string &target, int numDpus,
+           int numTasklets, int wramBytes, bool enableSourceRemat) {
+          pm.addPass(createConvertTritonToTritonPIM(
+              {target, numDpus, numTasklets, wramBytes, enableSourceRemat}));
+        },
+        py::arg("pm"), py::arg("target"), py::arg("num_dpus") = 1,
+        py::arg("num_tasklets") = 16, py::arg("wram_bytes") = 65536,
+        py::arg("enable_source_remat") = false);
+  ADD_PASS_WRAPPER_0("add_explicit_dma", pim::createTritonPIMExplicitDMA);
+}
+
 void init_triton_passes(py::module &&m) {
   init_triton_analysis(m.def_submodule("analysis"));
   init_triton_passes_common(m.def_submodule("common"));
   init_triton_passes_convert(m.def_submodule("convert"));
   init_triton_passes_ttir(m.def_submodule("ttir"));
   init_triton_passes_ttgpuir(m.def_submodule("ttgpuir"));
+  init_triton_passes_pim(m.def_submodule("pim"));
   init_triton_passes_llvmir(m.def_submodule("llvmir"));
   init_gluon_passes(m.def_submodule("gluon"));
 }

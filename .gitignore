@@ -9,7 +9,7 @@ llvm-project-*/
 # Triton Python module builds
 python/build/
 python/dist/
-python/triton*.egg-info/
+python/*.egg-info/
 python/triton_kernels/triton*.egg-info/
 
 python/triton/_C/*.pyd
@@ -26,6 +26,7 @@ python/triton/backends/*
 !python/triton/backends/__init__.py
 !python/triton/backends/compiler.py
 !python/triton/backends/driver.py
+!python/triton/backends/pim_sidecar.py
 
 # Language extras
 python/triton/language/extra
