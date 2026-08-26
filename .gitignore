@@ -5,6 +5,7 @@ build-*/
 llvm-project/
 llvm-project-*/
 .llvm-project/
+third_party/flir/
 
 # Triton Python module builds
 python/build/

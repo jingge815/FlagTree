@@ -1,5 +1,6 @@
 add_triton_library(TritonPIMTransforms
   ExplicitDMA.cpp
+  LowerPIMSingleTasklet.cpp
 
   DEPENDS
   TritonPIMTransformsIncGen
@@ -8,6 +9,9 @@ add_triton_library(TritonPIMTransforms
   MLIRIR
   MLIRPass
   MLIRTransforms
+  MLIRFuncDialect
+  MLIREmitCDialect
+  MLIRSCFDialect
   TritonIR
   TritonPIMIR
 )

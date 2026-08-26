@@ -3,6 +3,54 @@
 
 include "mlir/Pass/PassBase.td"
 
+def TritonPIMLowerSingleTasklet : Pass<"pim-lower-single-tasklet", "mlir::ModuleOp"> {
+  let summary = "Lower a single-DPU, single-tasklet PIM kernel to EmitC";
+
+  let description = [{
+    Bridges the flagos-pim-compiler graph compiler to a numpy-executable
+    artifact: lowers the pim-explicit-dma output (`pim.wram_alloc` /
+    `pim.dma_load` / `pim.barrier` / `pim.wram_load` / `tt.dot` /
+    `pim.wram_store` / `pim.dma_store`) into `emitc.*` ops that
+    `-convert-func-to-emitc` and `mlir-translate --mlir-to-cpp` can turn into
+    plain C.
+
+    Scoped deliberately narrowly: `pim.num-tasklets` must be 1 and every shape
+    involved must be static. Under that restriction the two-level WRAM staging
+    a real PIM device needs has no numeric effect on a single tasklet reading
+    directly-addressable memory, so this pass elides it rather than modeling a
+    WRAM buffer that nothing downstream needs: `pim.wram_alloc` disappears,
+    `pim.dma_load`/`pim.wram_load` collapse to the original MRAM pointer
+    (recovered from `base_arg`), `pim.barrier` is dropped, and the mirror image
+    happens for stores. `pim.tasklet_id`/`pim.dpu_id` become the constant 0.
+
+    `tt.dot` has no lowering anywhere in Triton or FlagTree below the tensor
+    level -- every existing path either keeps its layout encoding for a tensor
+    core or (on PIM) leaves it untouched. This pass is what actually expands
+    it, into a triple-nested `emitc.for` reduction over `emitc.subscript`/
+    `emitc.load`/`emitc.assign`.
+
+    Function arguments are rewritten from `!tt.ptr<T>` to `!emitc.ptr<T>`
+    one-for-one -- deliberately not a single MRAM base plus per-argument byte
+    offsets, so the emitted C carries no address arithmetic; the caller
+    (`opcompiler_bridge/driver.py`) is expected to pass each tensor argument's
+    already-offset pointer directly (e.g. `ctypes.data_as`). `tt.func` /
+    `tt.return` are rewritten to `func.func`/`func.return` in the same pass,
+    since `-convert-func-to-emitc` only recognizes the latter.
+
+    A kernel outside this pass's scope (multiple tasklets, or a DMA transfer
+    `pim-explicit-dma` could not prove strided) fails the pass rather than
+    silently emitting something wrong.
+  }];
+
+  let dependentDialects = [
+    "mlir::emitc::EmitCDialect",
+    "mlir::func::FuncDialect",
+    "mlir::scf::SCFDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::pim::TritonPIMDialect"
+  ];
+}
+
 def TritonPIMExplicitDMA : Pass<"pim-explicit-dma", "mlir::ModuleOp"> {
   let summary = "Lower tt.load/tt.store into explicit WRAM staging plus DMA";
 
