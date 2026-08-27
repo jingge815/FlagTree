@@ -1,15 +1,25 @@
 //===----------------------------------------------------------------------===//
 //
 // Bridges the flagos-pim-compiler graph compiler to a numpy-executable
-// artifact. Lowers a single-DPU, single-tasklet `pim-explicit-dma` output
-// into `emitc.*` ops that `-convert-func-to-emitc` and
-// `mlir-translate --mlir-to-cpp` turn into plain, ctypes-callable C.
+// artifact. Lowers a single-DPU `pim-explicit-dma` output, for any
+// `pim.num-tasklets >= 1`, into `emitc.*` ops that `-convert-func-to-emitc`
+// and `mlir-translate --mlir-to-cpp` turn into plain, ctypes-callable C.
 //
-// See TritonPIMLowerSingleTasklet in Passes.td for the rationale. The short
-// version: with one tasklet addressing memory directly, the two-level WRAM
-// staging a real PIM device needs has no numeric effect, so it is elided --
-// and eliding it is also what lets a *tiled* kernel collapse back to a single
-// flat reduction (see "Tiling" below). `tt.dot` is expanded here because
+// See TritonPIMLowerToEmitC in Passes.td for the rationale. The short
+// version: the M dimension of a `tt.dot` is split `num-tasklets` ways (a
+// static split, unrolled at pass-compile time -- M and num-tasklets are both
+// compile-time constants, there is no runtime `tid` value). `w` is
+// snapshotted once, shared read-only across all blocks; each block snapshots
+// only its own row range of `a` before writing that same row range of `out`
+// -- self-contained per block, which is what keeps the existing
+// `out`-aliases-`a` safety property (see snapshotToLocal's comment) intact
+// when M is split. The blocks execute strictly in program order --
+// sequential because that is the concurrency model flagos-pim-compiler's
+// NumPy backend uses (deterministic in-order tasklet simulation, not real
+// threads, so results stay bit-reproducible and a hazard checker on the
+// NumPy side can still catch a wrong split). `num-tasklets == 1` is simply
+// the degenerate case of a single block covering the whole M range -- there
+// is no separate single-tasklet path. `tt.dot` is expanded here because
 // nothing else in Triton or FlagTree lowers it below the tensor level.
 //
 //===----------------------------------------------------------------------===//
@@ -55,10 +65,12 @@
 //         acc = tt.dot(x[:, k0:...], w[n0:..., k0:...].T, acc)
 //       out[:, n0:...] = acc
 //
-// Both loops exist only to bound tile footprints. Since this pass elides WRAM
-// staging and emits scalar loops over directly-addressable memory, neither
-// bound is meaningful here: the tiling only shifts *which slice* each
-// iteration reads. So rather than mirroring the nest, this pass collapses it.
+// Both loops exist only to bound the front-end's own tile footprints (Triton
+// tensor-size and shared-memory limits); they say nothing about how the DPU
+// should split work across tasklets. So rather than mirroring the nest, this
+// pass first collapses it back to the full, untiled M/K/N (recovering the
+// bounds the front-end had to give up), and only then applies the
+// tasklet-level M-split described above.
 //
 // The rule that makes the collapse general: a loop induction variable appears
 // in the address with some coefficient; when that coefficient equals a tile
@@ -83,6 +95,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <algorithm>
+
 #include "triton/Dialect/TritonPIM/Transforms/Passes.h"
 
 #include "mlir/Dialect/EmitC/IR/EmitC.h"
@@ -97,7 +111,7 @@
 #include "llvm/ADT/SmallVector.h"
 
 namespace mlir::triton::pim {
-#define GEN_PASS_DEF_TRITONPIMLOWERSINGLETASKLET
+#define GEN_PASS_DEF_TRITONPIMLOWERTOEMITC
 #include "triton/Dialect/TritonPIM/Transforms/Passes.h.inc"
 } // namespace mlir::triton::pim
 
@@ -181,7 +195,7 @@ static Type storageTypeFor(OpBuilder &b, Type elemTy) {
 static LogicalResult checkElementType(Operation *op, Type elemTy) {
   if (elemTy.isF32() || elemTy.isF16())
     return success();
-  return op->emitError() << "pim-lower-single-tasklet only handles f16/f32 "
+  return op->emitError() << "pim-lower-to-emitc only handles f16/f32 "
                             "elements, got "
                          << elemTy;
 }
@@ -439,7 +453,7 @@ makeView(Operation *op, Value ptr, int64_t tileRows, int64_t tileCols,
       if (l.iv == term.iv)
         trip = l.tripCount;
     if (trip == 0)
-      return op->emitError() << "pim-lower-single-tasklet: address depends on "
+      return op->emitError() << "pim-lower-to-emitc: address depends on "
                                 "a value that is not an enclosing tiled loop's "
                                 "induction variable";
     // Which axis the loop slides comes from the IR (the `expand_dims` that
@@ -459,7 +473,7 @@ makeView(Operation *op, Value ptr, int64_t tileRows, int64_t tileCols,
       break;
     case Axis::Unassigned:
       return op->emitError()
-            << "pim-lower-single-tasklet: a tiled loop's induction variable "
+            << "pim-lower-to-emitc: a tiled loop's induction variable "
                "reaches the address without passing through an expand_dims, "
                "so which axis it slides is unknown";
     }
@@ -483,7 +497,7 @@ static FailureOr<Value> resolveBaseArg(Operation *dmaOp, IntegerAttr baseArg,
                                        func::FuncOp newFunc) {
   if (!baseArg)
     return dmaOp->emitError()
-          << "pim-lower-single-tasklet requires a proven DMA address pattern "
+          << "pim-lower-to-emitc requires a proven DMA address pattern "
              "(missing base_arg); pim-explicit-dma could not express this "
              "transfer as a strided DMA";
   int64_t idx = baseArg.getInt();
@@ -495,7 +509,7 @@ static FailureOr<Value> resolveBaseArg(Operation *dmaOp, IntegerAttr baseArg,
 static FailureOr<std::pair<int64_t, int64_t>> get2DShape(Operation *op,
                                                          ArrayRef<int64_t> s) {
   if (s.size() != 2 || ShapedType::isDynamicShape(s))
-    return op->emitError() << "pim-lower-single-tasklet requires statically "
+    return op->emitError() << "pim-lower-to-emitc requires statically "
                               "shaped 2-D buffers, got shape "
                            << s;
   return std::make_pair(s[0], s[1]);
@@ -516,25 +530,33 @@ static std::optional<int64_t> tripCountOf(scf::ForOp forOp) {
 // The pass
 //===----------------------------------------------------------------------===//
 
-struct TritonPIMLowerSingleTaskletPass
-    : public mlir::triton::pim::impl::TritonPIMLowerSingleTaskletBase<
-          TritonPIMLowerSingleTaskletPass> {
-  using mlir::triton::pim::impl::TritonPIMLowerSingleTaskletBase<
-      TritonPIMLowerSingleTaskletPass>::TritonPIMLowerSingleTaskletBase;
+struct TritonPIMLowerToEmitCPass
+    : public mlir::triton::pim::impl::TritonPIMLowerToEmitCBase<
+          TritonPIMLowerToEmitCPass> {
+  using mlir::triton::pim::impl::TritonPIMLowerToEmitCBase<
+      TritonPIMLowerToEmitCPass>::TritonPIMLowerToEmitCBase;
 
   // Set when any function argument is f16, so the conversion helpers get
   // emitted once ahead of the kernel.
   bool needsF16Helpers = false;
 
+  // Degree to which `tt.dot`'s M dimension is split across tasklets. Missing
+  // attribute defaults to 1 (single block, the degenerate case -- no separate
+  // single-tasklet path). Read once in runOnOperation and used by
+  // emitDotLoops for every `tt.dot` in the module.
+  int64_t numTasklets = 1;
+
   void runOnOperation() override {
     ModuleOp mod = getOperation();
 
-    if (auto nt = mod->getAttrOfType<IntegerAttr>(AttrNumTaskletsName))
-      if (nt.getInt() != 1) {
-        mod.emitError() << "pim-lower-single-tasklet requires "
-                        << AttrNumTaskletsName << " == 1, got " << nt.getInt();
+    if (auto nt = mod->getAttrOfType<IntegerAttr>(AttrNumTaskletsName)) {
+      if (nt.getInt() < 1) {
+        mod.emitError() << "pim-lower-to-emitc requires " << AttrNumTaskletsName
+                        << " >= 1, got " << nt.getInt();
         return signalPassFailure();
       }
+      numTasklets = nt.getInt();
+    }
 
     SmallVector<triton::FuncOp> funcs;
     mod.walk([&](triton::FuncOp f) { funcs.push_back(f); });
@@ -553,7 +575,7 @@ struct TritonPIMLowerSingleTaskletPass
       auto ptrTy = dyn_cast<triton::PointerType>(argTy);
       if (!ptrTy)
         return oldFunc.emitError()
-              << "pim-lower-single-tasklet only handles !tt.ptr<...> function "
+              << "pim-lower-to-emitc only handles !tt.ptr<...> function "
                  "arguments, got "
               << argTy;
       if (failed(checkElementType(oldFunc, ptrTy.getPointeeType())))
@@ -596,7 +618,7 @@ struct TritonPIMLowerSingleTaskletPass
         auto trip = tripCountOf(forOp);
         if (!trip)
           return forOp.emitError()
-                << "pim-lower-single-tasklet only handles tiling loops with "
+                << "pim-lower-to-emitc only handles tiling loops with "
                    "static bounds starting at 0 and an evenly dividing step "
                    "(a partial tile would need masking, which pim-explicit-dma "
                    "cannot prove as a strided DMA)";
@@ -628,7 +650,11 @@ struct TritonPIMLowerSingleTaskletPass
                         ArrayRef<LoopInfo> loops) {
     Location loc = op->getLoc();
 
-    // Elided: with WRAM staging gone these carry no numeric effect.
+    // pim-explicit-dma's own WRAM staging (sized for the whole, untiled
+    // operand -- it runs before this pass's M-split) is elided here: this
+    // pass does its own staging in emitDotLoops/snapshotToLocal, split per
+    // tasklet block rather than once for the whole operand, so the original
+    // wram_alloc/barrier ops carry no numeric effect on top of that.
     if (isa<WRAMAllocOp>(op) || isa<BarrierOp>(op))
       return success();
 
@@ -644,9 +670,9 @@ struct TritonPIMLowerSingleTaskletPass
       auto off = analysis.analyzePtr(dmaLoad.getPtr());
       if (!off)
         return dmaLoad.emitError()
-              << "pim-lower-single-tasklet could not reduce this transfer's "
+              << "pim-lower-to-emitc could not reduce this transfer's "
                  "address computation to an affine form (see the offset "
-                 "analysis in LowerPIMSingleTasklet.cpp)";
+                 "analysis in LowerPIMToEmitC.cpp)";
       auto view = makeView(dmaLoad, *base, shape->first, shape->second,
                            dmaLoad.getResult().getType().getElementType(), *off,
                            loops);
@@ -665,7 +691,7 @@ struct TritonPIMLowerSingleTaskletPass
             break;
           }
       if (!buf)
-        return wramLoad.emitError() << "pim-lower-single-tasklet could not "
+        return wramLoad.emitError() << "pim-lower-to-emitc could not "
                                        "trace wram_load back to a dma_load";
       state.record(wramLoad.getResult(), *buf);
       return success();
@@ -679,7 +705,7 @@ struct TritonPIMLowerSingleTaskletPass
         return success();
       ArrayRef<int32_t> order = trans.getOrder();
       if (order.size() != 2 || order[0] != 1 || order[1] != 0)
-        return trans.emitError() << "pim-lower-single-tasklet only handles a "
+        return trans.emitError() << "pim-lower-to-emitc only handles a "
                                     "2-D transpose (order = [1, 0])";
       BufferView dst = *src;
       dst.transposed = !dst.transposed;
@@ -708,7 +734,7 @@ struct TritonPIMLowerSingleTaskletPass
       const BufferView *a = state.tryLookup(dot.getA());
       const BufferView *w = state.tryLookup(dot.getB());
       if (!a || !w)
-        return dot.emitError() << "pim-lower-single-tasklet could not resolve "
+        return dot.emitError() << "pim-lower-to-emitc could not resolve "
                                   "tt.dot's operands to MRAM buffers";
       if (failed(checkElementType(
               dot,
@@ -718,7 +744,7 @@ struct TritonPIMLowerSingleTaskletPass
       int64_t M = a->logicalRows(), K = a->logicalCols(), N = w->logicalCols();
       if (w->logicalRows() != K)
         return dot.emitError()
-              << "pim-lower-single-tasklet: tt.dot operands disagree on the K "
+              << "pim-lower-to-emitc: tt.dot operands disagree on the K "
                  "dimension (" << K << " vs " << w->logicalRows() << ")";
 
       // The accumulator seed. `tt.dot`'s C operand is either a splat constant
@@ -738,7 +764,7 @@ struct TritonPIMLowerSingleTaskletPass
         if (auto splat = dyn_cast<SplatElementsAttr>(cst.getValue()))
           seed = splat.getSplatValue<APFloat>();
       if (!seed)
-        return dot.emitError() << "pim-lower-single-tasklet only handles a "
+        return dot.emitError() << "pim-lower-to-emitc only handles a "
                                   "splat-constant tt.dot accumulator seed";
 
       auto out = resolveDotOutput(dot, newFunc, loops);
@@ -821,8 +847,18 @@ struct TritonPIMLowerSingleTaskletPass
   // reliably segfaults there even though the same allocation is fine on the
   // main thread. Reproduced directly: an 8MiB `volatile float buf[...]` in a
   // C function called from a `ThreadPoolExecutor` worker crashes every time.
+  //
+  // Snapshots MRAM rows `[rowStart, rowStart+rowCount)` of `src` (all
+  // columns) into a fresh heap buffer, addressed by *absolute* row index --
+  // `local.constant` is offset by `-rowStart*cols` so that passing the same
+  // absolute row value used elsewhere (e.g. to index `out`, which spans the
+  // full M range) lands at the right place inside this smaller buffer.
+  // `rowStart=0, rowCount=src.logicalRows()` reproduces the old
+  // whole-operand snapshot exactly (constant stays 0); a tasklet block calls
+  // this with just its own row range (see emitDotLoops below).
   static BufferView snapshotToLocal(OpBuilder &b, Location loc,
-                                    const BufferView &src) {
+                                    const BufferView &src, int64_t rowStart,
+                                    int64_t rowCount) {
     // Always copy in *logical* (post-transpose) row-major order: the local
     // buffer becomes an untransposed view, so the copy loop's own (row, col)
     // matches loadElem(src, row, col) via elementOffset -- which already
@@ -832,31 +868,33 @@ struct TritonPIMLowerSingleTaskletPass
     // walked out of bounds on `w` after a tt.trans and corrupted the heap
     // (found as a segfault, not a wrong-answer -- see the mismatch between
     // rows=N,cols=K passed in vs. src.logicalRows()==K,logicalCols()==N).
-    int64_t rows = src.logicalRows(), cols = src.logicalCols();
+    int64_t cols = src.logicalCols();
     auto f32 = b.getF32Type();
     auto i32 = b.getI32Type();
     auto i64 = b.getI64Type();
     auto ptrTy = emitc::PointerType::get(f32);
     Value nbytes = b.create<emitc::ConstantOp>(
-        loc, i64, b.getI64IntegerAttr(rows * cols * 4));
+        loc, i64, b.getI64IntegerAttr(rowCount * cols * 4));
     Value buf =
         b.create<emitc::CallOpaqueOp>(loc, TypeRange{ptrTy}, "malloc",
                                       ValueRange{nbytes})
             .getResult(0);
     BufferView local;
     local.ptr = buf;
-    local.rows = rows;
+    local.rows = rowCount;
     local.cols = cols;
     local.rowStride = cols;
     local.colStride = 1;
+    local.constant = -rowStart * cols;
     local.elemTy = f32; // already converted to f32 during the copy below
 
     auto cst = [&](int64_t v) -> Value {
       return b.create<emitc::ConstantOp>(loc, i32, b.getI32IntegerAttr(v));
     };
-    Value c0 = cst(0), c1 = cst(1), cRows = cst(rows), cCols = cst(cols);
+    Value c0 = cst(0), c1 = cst(1), cCols = cst(cols);
+    Value cRowStart = cst(rowStart), cRowEnd = cst(rowStart + rowCount);
     b.create<emitc::ForOp>(
-        loc, c0, cRows, c1, [&](OpBuilder &rb, Location loc, Value r) {
+        loc, cRowStart, cRowEnd, c1, [&](OpBuilder &rb, Location loc, Value r) {
           rb.create<emitc::ForOp>(
               loc, c0, cCols, c1, [&](OpBuilder &cb, Location loc, Value c) {
                 Value v = loadElem(cb, loc, src, r, c);
@@ -871,6 +909,13 @@ struct TritonPIMLowerSingleTaskletPass
     return local;
   }
 
+  // Emits `numTasklets` sequential, statically-bounded blocks splitting the M
+  // dimension -- see the pass-level rationale in Passes.td. `w` has no
+  // aliasing risk with `out` (never written), so it is snapshotted once,
+  // shared read-only by every block; each block snapshots only its own row
+  // range of `a` before writing that same row range of `out`, which is what
+  // keeps the out-aliases-a safety property (see snapshotToLocal's comment)
+  // intact when M is split.
   void emitDotLoops(OpBuilder &b, Location loc, const BufferView &aMram,
                     const BufferView &wMram, const BufferView &out,
                     int64_t M, int64_t K, int64_t N, APFloat seed) {
@@ -879,12 +924,10 @@ struct TritonPIMLowerSingleTaskletPass
     auto cst = [&](int64_t v) -> Value {
       return b.create<emitc::ConstantOp>(loc, i32, b.getI32IntegerAttr(v));
     };
-    Value c0 = cst(0), c1 = cst(1), cM = cst(M), cN = cst(N), cK = cst(K);
+    Value c0 = cst(0), c1 = cst(1), cN = cst(N), cK = cst(K);
 
-    // Snapshot both operands before touching `out`: see snapshotToLocal's
-    // comment for why reading MRAM live is unsafe here.
-    BufferView a = snapshotToLocal(b, loc, aMram);
-    BufferView w = snapshotToLocal(b, loc, wMram);
+    BufferView w = snapshotToLocal(b, loc, wMram, /*rowStart=*/0,
+                                   /*rowCount=*/wMram.logicalRows());
 
     auto loadAt = [&](OpBuilder &lb, const BufferView &buf, Value row,
                       Value col) -> Value {
@@ -907,37 +950,54 @@ struct TritonPIMLowerSingleTaskletPass
       sb.create<emitc::AssignOp>(loc, lv, toStore);
     };
 
-    b.create<emitc::ForOp>(
-        loc, c0, cM, c1, [&](OpBuilder &mb, Location loc, Value m) {
-          mb.create<emitc::ForOp>(
-              loc, c0, cN, c1, [&](OpBuilder &nb, Location loc, Value n) {
-                Value acc = nb.create<emitc::VariableOp>(
-                    loc, emitc::LValueType::get(f32),
-                    emitc::OpaqueAttr::get(nb.getContext(), ""));
-                nb.create<emitc::AssignOp>(
-                    loc, acc,
-                    nb.create<emitc::ConstantOp>(loc, f32,
-                                                 nb.getFloatAttr(f32, seed)));
-                nb.create<emitc::ForOp>(
-                    loc, c0, cK, c1,
-                    [&](OpBuilder &kb, Location loc, Value k) {
-                      Value av = loadAt(kb, a, m, k);
-                      Value bv = loadAt(kb, w, k, n);
-                      Value prod = kb.create<emitc::MulOp>(loc, f32, av, bv);
-                      Value cur = kb.create<emitc::LoadOp>(loc, f32, acc);
-                      kb.create<emitc::AssignOp>(
-                          loc, acc,
-                          kb.create<emitc::AddOp>(loc, f32, cur, prod));
-                      kb.create<emitc::YieldOp>(loc);
-                    });
-                storeAt(nb, out, m, n,
-                        nb.create<emitc::LoadOp>(loc, f32, acc));
-                nb.create<emitc::YieldOp>(loc);
-              });
-          mb.create<emitc::YieldOp>(loc);
-        });
+    // Static split, unrolled here: M and numTasklets are both compile-time
+    // constants, so there is no runtime `tid` value anywhere in the emitted
+    // C. Mirrors runtime/kernels.py::tasklet_linear_kernel's
+    // `rows_per_tasklet = ceil(m / num_tasklets)` exactly, including the
+    // trailing-tasklet-does-nothing case when numTasklets > M.
+    int64_t rowsPerTasklet = (M + numTasklets - 1) / numTasklets;
+    for (int64_t tid = 0; tid < numTasklets; ++tid) {
+      int64_t rowStart = tid * rowsPerTasklet;
+      if (rowStart >= M)
+        break;
+      int64_t rowCount = std::min(rowsPerTasklet, M - rowStart);
 
-    b.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "free", ValueRange{a.ptr});
+      BufferView a = snapshotToLocal(b, loc, aMram, rowStart, rowCount);
+
+      Value cRowStart = cst(rowStart), cRowEnd = cst(rowStart + rowCount);
+      b.create<emitc::ForOp>(
+          loc, cRowStart, cRowEnd, c1, [&](OpBuilder &mb, Location loc, Value m) {
+            mb.create<emitc::ForOp>(
+                loc, c0, cN, c1, [&](OpBuilder &nb, Location loc, Value n) {
+                  Value acc = nb.create<emitc::VariableOp>(
+                      loc, emitc::LValueType::get(f32),
+                      emitc::OpaqueAttr::get(nb.getContext(), ""));
+                  nb.create<emitc::AssignOp>(
+                      loc, acc,
+                      nb.create<emitc::ConstantOp>(loc, f32,
+                                                   nb.getFloatAttr(f32, seed)));
+                  nb.create<emitc::ForOp>(
+                      loc, c0, cK, c1,
+                      [&](OpBuilder &kb, Location loc, Value k) {
+                        Value av = loadAt(kb, a, m, k);
+                        Value bv = loadAt(kb, w, k, n);
+                        Value prod = kb.create<emitc::MulOp>(loc, f32, av, bv);
+                        Value cur = kb.create<emitc::LoadOp>(loc, f32, acc);
+                        kb.create<emitc::AssignOp>(
+                            loc, acc,
+                            kb.create<emitc::AddOp>(loc, f32, cur, prod));
+                        kb.create<emitc::YieldOp>(loc);
+                      });
+                  storeAt(nb, out, m, n,
+                          nb.create<emitc::LoadOp>(loc, f32, acc));
+                  nb.create<emitc::YieldOp>(loc);
+                });
+            mb.create<emitc::YieldOp>(loc);
+          });
+
+      b.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "free", ValueRange{a.ptr});
+    }
+
     b.create<emitc::CallOpaqueOp>(loc, TypeRange{}, "free", ValueRange{w.ptr});
   }
 
@@ -988,7 +1048,7 @@ struct TritonPIMLowerSingleTaskletPass
           auto off = analysis.analyzePtr(dmaStore.getPtr());
           if (!off)
             return dmaStore.emitError()
-                  << "pim-lower-single-tasklet could not reduce the output "
+                  << "pim-lower-to-emitc could not reduce the output "
                      "transfer's address computation to an affine form";
           return makeView(dmaStore, *base, shape->first, shape->second,
                           dmaStore.getMemDescType().getElementType(), *off,
@@ -997,7 +1057,7 @@ struct TritonPIMLowerSingleTaskletPass
       }
     }
     return dot.emitError()
-          << "pim-lower-single-tasklet could not resolve tt.dot's output "
+          << "pim-lower-to-emitc could not resolve tt.dot's output "
              "storage (expected wram_store -> dma_store -> base_arg)";
   }
 };

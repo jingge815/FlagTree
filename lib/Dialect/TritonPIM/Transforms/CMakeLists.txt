@@ -1,6 +1,6 @@
 add_triton_library(TritonPIMTransforms
   ExplicitDMA.cpp
-  LowerPIMSingleTasklet.cpp
+  LowerPIMToEmitC.cpp
 
   DEPENDS
   TritonPIMTransformsIncGen

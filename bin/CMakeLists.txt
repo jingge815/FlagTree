@@ -18,7 +18,7 @@ target_link_libraries(triton-opt PRIVATE
   MLIRRegisterAllPasses
   MLIRTransforms
   # EmitC: pim-mlir -> C lowering (flagos-pim-compiler opcompiler_bridge).
-  # LowerPIMSingleTasklet emits emitc.* ops directly (no scf/arith/memref), so
+  # LowerPIMToEmitC emits emitc.* ops directly (no scf/arith/memref), so
   # only the func -> emitc conversion is needed downstream.
   MLIREmitCDialect
   MLIRFuncToEmitC
