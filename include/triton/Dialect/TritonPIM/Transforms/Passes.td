@@ -98,13 +98,27 @@ def TritonPIMExplicitDMA : Pass<"pim-explicit-dma", "mlir::ModuleOp"> {
     expressible as a strided DMA, for a later, stronger analysis to revisit.
 
     Finally it sums the WRAM claimed by the allocations into the
-    `pim.wram-bytes-used` module attribute, and warns if that exceeds the
-    `pim.wram-bytes` budget. Note that it does not re-tile to fit the budget;
-    that would mean restructuring loops and is left to a separate pass.
+    `pim.wram-bytes-used` module attribute, and fails if that exceeds the
+    `pim.wram-bytes` budget.
   }];
 
   let dependentDialects = [
     "mlir::arith::ArithDialect",
+    "mlir::triton::TritonDialect",
+    "mlir::triton::pim::TritonPIMDialect"
+  ];
+}
+
+def TritonPIMTileToBudget : Pass<"pim-tile-to-budget", "mlir::ModuleOp"> {
+  let summary = "Infer PIM tile dimensions that fit the WRAM budget";
+
+  let description = [{
+    Prepares budget-aware PIM tiling. This pass validates the linear PIM IR
+    tile against the module's hardware contract and writes `pim.tile-*`
+    attributes for downstream lowering and cost extraction.
+  }];
+
+  let dependentDialects = [
     "mlir::triton::TritonDialect",
     "mlir::triton::pim::TritonPIMDialect"
   ];

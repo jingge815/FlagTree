@@ -1,6 +1,7 @@
 add_triton_library(TritonPIMTransforms
   ExplicitDMA.cpp
   LowerPIMToEmitC.cpp
+  TileToBudget.cpp
 
   DEPENDS
   TritonPIMTransformsIncGen

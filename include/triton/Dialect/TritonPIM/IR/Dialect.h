@@ -29,11 +29,19 @@ constexpr static char AttrNumDpusName[] = "pim.num-dpus";
 constexpr static char AttrNumTaskletsName[] = "pim.num-tasklets";
 // WRAM budget per DPU, in bytes.
 constexpr static char AttrWramBytesName[] = "pim.wram-bytes";
+// MRAM budget per DPU, in bytes.
+constexpr static char AttrMramBytesName[] = "pim.mram-bytes";
+// DMA alignment requirement, in bytes.
+constexpr static char AttrDmaAlignName[] = "pim.dma-align";
 // Target string, e.g. "pim:v1".
 constexpr static char AttrTargetName[] = "pim.target";
 // WRAM actually claimed by this kernel's `pim.wram_alloc`s, in bytes. Written
 // by `pim-explicit-dma`.
 constexpr static char AttrWramBytesUsedName[] = "pim.wram-bytes-used";
+constexpr static char AttrTileMName[] = "pim.tile-m";
+constexpr static char AttrTileNName[] = "pim.tile-n";
+constexpr static char AttrTileKName[] = "pim.tile-k";
+constexpr static char AttrTileWramBytesName[] = "pim.tile-wram-bytes";
 
 //===----------------------------------------------------------------------===//
 // Memory resources
@@ -58,7 +66,11 @@ int lookupNumTasklets(Operation *op);
 int lookupNumDpus(Operation *op);
 // WRAM budget in bytes in scope for `op`. Returns nullopt when unset, so
 // callers can tell "no budget declared" from "budget of zero".
-std::optional<int> maybeLookupWramBytes(Operation *op);
+std::optional<int64_t> maybeLookupWramBytes(Operation *op);
+// MRAM budget in bytes in scope for `op`. Returns nullopt when unset.
+std::optional<int64_t> maybeLookupMramBytes(Operation *op);
+// DMA alignment in bytes in scope for `op`. Returns nullopt when unset.
+std::optional<int64_t> maybeLookupDmaAlign(Operation *op);
 
 // Defaults, matching the pass options of `convert-triton-to-pim`. 16 tasklets
 // is the UPMEM convention; 64 KiB is an upper bound on the WRAM of a single
@@ -67,6 +79,8 @@ std::optional<int> maybeLookupWramBytes(Operation *op);
 constexpr static int kDefaultNumTasklets = 16;
 constexpr static int kDefaultNumDpus = 1;
 constexpr static int kDefaultWramBytes = 65536;
+constexpr static int64_t kDefaultMramBytes = 4LL * 1024 * 1024 * 1024;
+constexpr static int kDefaultDmaAlign = 8;
 
 //===----------------------------------------------------------------------===//
 // Layout helpers

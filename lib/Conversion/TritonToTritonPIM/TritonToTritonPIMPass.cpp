@@ -583,6 +583,18 @@ public:
       mlir::emitError(getOperation().getLoc(), "'num-dpus' must be positive");
       return signalPassFailure();
     }
+    if (wramBytes <= 0) {
+      mlir::emitError(getOperation().getLoc(), "'wram-bytes' must be positive");
+      return signalPassFailure();
+    }
+    if (mramBytes <= 0) {
+      mlir::emitError(getOperation().getLoc(), "'mram-bytes' must be positive");
+      return signalPassFailure();
+    }
+    if (dmaAlign <= 0) {
+      mlir::emitError(getOperation().getLoc(), "'dma-align' must be positive");
+      return signalPassFailure();
+    }
 
     MLIRContext *context = &getContext();
     ModuleOp mod = getOperation();
@@ -593,6 +605,8 @@ public:
     mod->setAttr(AttrNumDpusName, b.getI32IntegerAttr(numDpus));
     mod->setAttr(AttrNumTaskletsName, b.getI32IntegerAttr(numTasklets));
     mod->setAttr(AttrWramBytesName, b.getI32IntegerAttr(wramBytes));
+    mod->setAttr(AttrMramBytesName, b.getI64IntegerAttr(mramBytes));
+    mod->setAttr(AttrDmaAlignName, b.getI32IntegerAttr(dmaAlign));
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
     TritonPIMTypeConverter typeConverter(context, numTasklets, numDpus,

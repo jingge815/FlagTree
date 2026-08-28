@@ -1,12 +1,14 @@
-// RUN: triton-opt %s -split-input-file -convert-triton-to-pim='target=pim:v1 num-tasklets=16 wram-bytes=65536' | FileCheck %s
+// RUN: triton-opt %s -split-input-file -convert-triton-to-pim='target=pim:v1 num-tasklets=16 wram-bytes=65536 mram-bytes=1048576 dma-align=1024' | FileCheck %s
 
 // The hardware description lands on the module, mirroring ttg.num-warps and
 // friends. Downstream passes and the GeneSim cost model read it from here.
 // CHECK: module attributes {
-// CHECK-SAME: "pim.num-dpus" = 1 : i32
-// CHECK-SAME: "pim.num-tasklets" = 16 : i32
-// CHECK-SAME: pim.target = "pim:v1"
-// CHECK-SAME: "pim.wram-bytes" = 65536 : i32
+// CHECK-DAG: "pim.num-dpus" = 1 : i32
+// CHECK-DAG: "pim.num-tasklets" = 16 : i32
+// CHECK-DAG: pim.target = "pim:v1"
+// CHECK-DAG: "pim.wram-bytes" = 65536 : i32
+// CHECK-DAG: "pim.mram-bytes" = 1048576 : i64
+// CHECK-DAG: "pim.dma-align" = 1024 : i32
 // CHECK-LABEL: @elementwise
 module {
   tt.func public @elementwise(%a_ptr: !tt.ptr<f32>, %b_ptr: !tt.ptr<f32>,

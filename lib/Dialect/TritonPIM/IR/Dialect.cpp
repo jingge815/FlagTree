@@ -449,8 +449,14 @@ LogicalResult TritonPIMDialect::verifyOperationAttribute(Operation *op,
   if (llvm::is_contained({StringRef(AttrNumDpusName),
                           StringRef(AttrNumTaskletsName),
                           StringRef(AttrWramBytesName),
+                          StringRef(AttrMramBytesName),
+                          StringRef(AttrDmaAlignName),
                           StringRef(AttrTargetName),
-                          StringRef(AttrWramBytesUsedName)},
+                          StringRef(AttrWramBytesUsedName),
+                          StringRef(AttrTileMName),
+                          StringRef(AttrTileNName),
+                          StringRef(AttrTileKName),
+                          StringRef(AttrTileWramBytesName)},
                          attr.getName().strref()) &&
       !isa<ModuleOp>(op)) {
     return op->emitOpError("has unexpected attribute ")
@@ -464,9 +470,15 @@ LogicalResult TritonPIMDialect::verifyOperationAttribute(Operation *op,
 // Hierarchy lookups
 //===----------------------------------------------------------------------===//
 
-// Reads an i32 module attribute from the module enclosing `op`.
-static std::optional<int> lookupModuleIntAttr(Operation *op, StringRef name) {
-  auto mod = op->getParentOfType<ModuleOp>();
+// Reads an integer module attribute from `op` itself (when `op` is the
+// module) or from the module enclosing `op`. `getParentOfType` only walks
+// strictly above `op`, so passes that call this with the `ModuleOp` they are
+// running on (e.g. `getOperation()` in a module pass) need the op-itself case
+// too, or the lookup always misses.
+static std::optional<int64_t> lookupModuleIntAttr(Operation *op,
+                                                  StringRef name) {
+  auto mod = isa<ModuleOp>(op) ? cast<ModuleOp>(op)
+                                : op->getParentOfType<ModuleOp>();
   if (!mod)
     return std::nullopt;
   if (auto attr = mod->getAttrOfType<IntegerAttr>(name))
@@ -483,8 +495,16 @@ int mlir::triton::pim::lookupNumDpus(Operation *op) {
   return lookupModuleIntAttr(op, AttrNumDpusName).value_or(kDefaultNumDpus);
 }
 
-std::optional<int> mlir::triton::pim::maybeLookupWramBytes(Operation *op) {
+std::optional<int64_t> mlir::triton::pim::maybeLookupWramBytes(Operation *op) {
   return lookupModuleIntAttr(op, AttrWramBytesName);
+}
+
+std::optional<int64_t> mlir::triton::pim::maybeLookupMramBytes(Operation *op) {
+  return lookupModuleIntAttr(op, AttrMramBytesName);
+}
+
+std::optional<int64_t> mlir::triton::pim::maybeLookupDmaAlign(Operation *op) {
+  return lookupModuleIntAttr(op, AttrDmaAlignName);
 }
 
 //===----------------------------------------------------------------------===//

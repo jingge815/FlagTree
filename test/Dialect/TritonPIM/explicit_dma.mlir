@@ -1,9 +1,11 @@
 // RUN: triton-opt %s -split-input-file -convert-triton-to-pim='target=pim:v1 num-tasklets=16 wram-bytes=65536' -pim-explicit-dma | FileCheck %s
+// RUN: not triton-opt %s -split-input-file -convert-triton-to-pim='target=pim:v1 num-tasklets=16 wram-bytes=128' -pim-explicit-dma 2>&1 | FileCheck %s --check-prefix=OVER
 
 // A load becomes: allocate a WRAM buffer, DMA into it, barrier, then read it.
 // The barrier is not optional -- the transfer is asynchronous with respect to
 // the tasklets that consume the data.
 // CHECK-LABEL: @single_load
+// OVER: error: WRAM staging buffers total
 // CHECK: %[[BUF:.*]] = pim.wram_alloc : !pim.memdesc<64xf32, #pim.wram>
 // CHECK: pim.dma_load %{{.*}} -> %[[BUF]]
 // CHECK: pim.barrier

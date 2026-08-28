@@ -67,10 +67,9 @@
 //
 // Both loops exist only to bound the front-end's own tile footprints (Triton
 // tensor-size and shared-memory limits); they say nothing about how the DPU
-// should split work across tasklets. So rather than mirroring the nest, this
-// pass first collapses it back to the full, untiled M/K/N (recovering the
-// bounds the front-end had to give up), and only then applies the
-// tasklet-level M-split described above.
+// should split work across tasklets. `pim-tile-to-budget` owns the budget
+// contract for those tiles; this pass consumes the already-valid tile structure
+// and lowers it into C, then applies the tasklet-level M-split described above.
 //
 // The rule that makes the collapse general: a loop induction variable appears
 // in the address with some coefficient; when that coefficient equals a tile

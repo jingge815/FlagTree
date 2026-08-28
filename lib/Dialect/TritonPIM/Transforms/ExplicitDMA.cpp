@@ -416,11 +416,13 @@ struct TritonPIMExplicitDMAPass
                  b.getI32IntegerAttr(static_cast<int32_t>(used)));
 
     if (auto budget = maybeLookupWramBytes(mod)) {
-      if (used > *budget)
-        mod.emitWarning() << "WRAM staging buffers total " << used
-                          << " bytes, over the " << *budget
-                          << " byte budget; the tiles need to be split";
-      else if (!exact)
+      if (used > *budget) {
+        mod.emitError() << "WRAM staging buffers total " << used
+                        << " bytes, over the " << *budget
+                        << " byte budget; the tiles need to be split";
+        return signalPassFailure();
+      }
+      if (!exact)
         mod.emitWarning() << "some WRAM allocations have no statically known "
                              "size; the reported total of "
                           << used << " bytes is a lower bound";

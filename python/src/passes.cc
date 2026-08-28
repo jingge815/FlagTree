@@ -123,18 +123,23 @@ void init_gluon_passes(py::module &&m) {
 
 void init_triton_passes_pim(py::module &&m) {
   using namespace mlir::triton;
-  // Five options, one more than ADD_PASS_OPTION_WRAPPER_4 handles, so this one
+  // Seven options, more than ADD_PASS_OPTION_WRAPPER_4 handles, so this one
   // is spelled out.
   m.def("add_convert_to_pim",
         [](mlir::PassManager &pm, const std::string &target, int numDpus,
-           int numTasklets, int wramBytes, bool enableSourceRemat) {
+           int numTasklets, int wramBytes, int64_t mramBytes, int dmaAlign,
+           bool enableSourceRemat) {
           pm.addPass(createConvertTritonToTritonPIM(
-              {target, numDpus, numTasklets, wramBytes, enableSourceRemat}));
+              {target, numDpus, numTasklets, wramBytes, mramBytes, dmaAlign,
+               enableSourceRemat}));
         },
         py::arg("pm"), py::arg("target"), py::arg("num_dpus") = 1,
         py::arg("num_tasklets") = 16, py::arg("wram_bytes") = 65536,
+        py::arg("mram_bytes") = 4294967296LL, py::arg("dma_align") = 8,
         py::arg("enable_source_remat") = false);
   ADD_PASS_WRAPPER_0("add_explicit_dma", pim::createTritonPIMExplicitDMA);
+  ADD_PASS_WRAPPER_0("add_tile_to_budget",
+                     pim::createTritonPIMTileToBudget);
 }
 
 void init_triton_passes(py::module &&m) {

@@ -24,7 +24,8 @@ def ConvertTritonToTritonPIM : Pass<"convert-triton-to-pim", "mlir::ModuleOp"> {
       layout assignment separate from memory lowering.
 
       The hardware parameters are recorded on the module as `pim.num-dpus`,
-      `pim.num-tasklets`, `pim.wram-bytes` and `pim.target`.
+      `pim.num-tasklets`, `pim.wram-bytes`, `pim.mram-bytes`,
+      `pim.dma-align` and `pim.target`.
     }];
 
     let dependentDialects = ["mlir::arith::ArithDialect",
@@ -46,6 +47,12 @@ def ConvertTritonToTritonPIM : Pass<"convert-triton-to-pim", "mlir::ModuleOp"> {
       Option<"wramBytes", "wram-bytes",
              "int32_t", /*default*/"65536",
              "WRAM budget per DPU, in bytes">,
+      Option<"mramBytes", "mram-bytes",
+             "int64_t", /*default*/"4294967296",
+             "MRAM budget per DPU, in bytes">,
+      Option<"dmaAlign", "dma-align",
+             "int32_t", /*default*/"8",
+             "DMA alignment requirement, in bytes">,
       Option<"enableSourceRemat", "enable-source-remat",
              "bool", /*default*/"false",
              "enable trivial source rematerialization">,
