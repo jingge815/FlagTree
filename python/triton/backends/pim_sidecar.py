@@ -13,6 +13,8 @@ per-run:
     FLAGTREE_PIM_NUM_DPUS       (default 1)
     FLAGTREE_PIM_NUM_TASKLETS   (default 16)
     FLAGTREE_PIM_WRAM_BYTES     (default 65536)
+    FLAGTREE_PIM_MRAM_BYTES     (default 8589934592, 8GiB)
+    FLAGTREE_PIM_DMA_ALIGN      (default 8)
     FLAGTREE_PIM_TARGET         (default "pim:v1")
 """
 
@@ -22,6 +24,8 @@ DEFAULT_TARGET = "pim:v1"
 DEFAULT_NUM_DPUS = 1
 DEFAULT_NUM_TASKLETS = 16
 DEFAULT_WRAM_BYTES = 65536
+DEFAULT_MRAM_BYTES = 8 * 2**30
+DEFAULT_DMA_ALIGN = 8
 
 
 def is_enabled() -> bool:
@@ -44,6 +48,8 @@ def pim_options() -> dict:
         "num_dpus": _env_int("FLAGTREE_PIM_NUM_DPUS", DEFAULT_NUM_DPUS),
         "num_tasklets": _env_int("FLAGTREE_PIM_NUM_TASKLETS", DEFAULT_NUM_TASKLETS),
         "wram_bytes": _env_int("FLAGTREE_PIM_WRAM_BYTES", DEFAULT_WRAM_BYTES),
+        "mram_bytes": _env_int("FLAGTREE_PIM_MRAM_BYTES", DEFAULT_MRAM_BYTES),
+        "dma_align": _env_int("FLAGTREE_PIM_DMA_ALIGN", DEFAULT_DMA_ALIGN),
     }
 
 
@@ -60,14 +66,30 @@ def make_pimir(ttir_mod):
     mod.context = context
     pm = ir.pass_manager(context)
     pm.enable_debug()
+    # mram_bytes/dma_align 必须按关键字传：旧的 5 参数位置调用会把 `False`
+    # 落进 mram_bytes 形参位（等价于 mram_bytes=0），add_tile_to_budget 拿它
+    # 比较 tile footprint 时会让任何张量都判定超预算。
     passes.pim.add_convert_to_pim(
         pm,
         opts["target"],
-        opts["num_dpus"],
-        opts["num_tasklets"],
-        opts["wram_bytes"],
-        False,
+        num_dpus=opts["num_dpus"],
+        num_tasklets=opts["num_tasklets"],
+        wram_bytes=opts["wram_bytes"],
+        mram_bytes=opts["mram_bytes"],
+        dma_align=opts["dma_align"],
+        enable_source_remat=False,
     )
+    # pim-tile-to-budget 必须排在 pim-explicit-dma 之前：前者负责把超出 WRAM
+    # 预算的 tile 切小，后者按最终 tile 建 WRAM staging buffer 并在超预算时
+    # signalPassFailure()。反过来排的话 explicit-dma 先按未切分的大 tile 建
+    # buffer 就直接失败，tile 切分根本没机会跑（lit 测试
+    # tile_to_budget_m_split.mlir / tile_to_budget_small_wram.mlir 用的都是
+    # `-pim-tile-to-budget -pim-explicit-dma` 这个顺序）。
+    #
+    # 且该 pass 硬性要求至少一个 tt.dot（"requires at least one tt.dot"），
+    # 对纯逐元素 kernel 跑它只会报错，故按 IR 里有没有 tt.dot 判断。
+    if "tt.dot" in str(ttir_mod):
+        passes.pim.add_tile_to_budget(pm)
     passes.pim.add_explicit_dma(pm)
     pm.run(mod)
     return mod

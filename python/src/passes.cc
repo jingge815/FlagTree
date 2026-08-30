@@ -138,8 +138,18 @@ void init_triton_passes_pim(py::module &&m) {
         py::arg("mram_bytes") = 4294967296LL, py::arg("dma_align") = 8,
         py::arg("enable_source_remat") = false);
   ADD_PASS_WRAPPER_0("add_explicit_dma", pim::createTritonPIMExplicitDMA);
-  ADD_PASS_WRAPPER_0("add_tile_to_budget",
-                     pim::createTritonPIMTileToBudget);
+  // full_m/full_n/full_k default to -1 ("not supplied", fall back to
+  // structural IR inference) -- see TileToBudget.cpp's inferFullShape for
+  // why a caller with the real launch-site M/N/K (e.g. genesim_bridge,
+  // which captures them from the FlagGems kernel launch) needs to be able
+  // to override the fallback per-dimension.
+  m.def("add_tile_to_budget",
+        [](mlir::PassManager &pm, int64_t fullM, int64_t fullN,
+           int64_t fullK) {
+          pm.addPass(pim::createTritonPIMTileToBudget({fullM, fullN, fullK}));
+        },
+        py::arg("pm"), py::arg("full_m") = -1, py::arg("full_n") = -1,
+        py::arg("full_k") = -1);
 }
 
 void init_triton_passes(py::module &&m) {

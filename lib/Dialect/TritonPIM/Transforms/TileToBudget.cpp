@@ -79,20 +79,41 @@ static std::optional<int64_t> loopFullExtent(scf::ForOp forOp) {
 // K-reduction loop's per-iteration result shape is 1x512 -- already equal to
 // the visible tile's (M, N) -- so a shape-based comparison silently never
 // touches K, which is the bug this replaced).
-static std::optional<TileShape> inferFullShape(triton::DotOp dot) {
+//
+// Real autotuned kernels (FlagGems `linear_kernel`) don't fit this
+// structural model at all: M/N are split across a 2-D launch grid rather
+// than a loop (so there is no M/N `scf.for` to walk), and M/N/K are runtime
+// scalar kernel arguments, not IR-visible constants -- `loopFullExtent`'s
+// `constantInt` can never see them. `overrideM/N/K` (>= 0 when supplied,
+// from the pass's `full-m`/`full-n`/`full-k` options, which the Python
+// caller fills with the real values captured at the launch site) bypass
+// structural inference for whichever dimension is supplied, so this
+// function still works on such kernels; each dimension left unsupplied
+// (-1) keeps falling back to the structural walk exactly as before.
+static std::optional<TileShape> inferFullShape(triton::DotOp dot,
+                                               int64_t overrideM,
+                                               int64_t overrideN,
+                                               int64_t overrideK) {
   auto visible = inferVisibleTile(dot);
   if (!visible)
     return std::nullopt;
 
-  int64_t m = visible->m;
-  int64_t n = visible->n;
-  int64_t k = visible->k;
+  bool needM = overrideM < 0;
+  bool needN = overrideN < 0;
+  bool needK = overrideK < 0;
+
+  int64_t m = needM ? visible->m : overrideM;
+  int64_t n = needN ? visible->n : overrideN;
+  int64_t k = needK ? visible->k : overrideK;
 
   scf::ForOp kLoop;
   if (auto barg = dyn_cast<BlockArgument>(dot.getC()))
     kLoop = dyn_cast_or_null<scf::ForOp>(barg.getOwner()->getParentOp());
 
-  // Void (non-reduction) tiling loops on the way out, innermost first.
+  // Void (non-reduction) tiling loops on the way out, innermost first. The
+  // K-reduction loop is still identified structurally (by the block-arg
+  // check above) even when `needK` is false: misclassifying it as a void
+  // loop would corrupt `voidLoops`' size and hence the M/N assignment below.
   SmallVector<scf::ForOp, 2> voidLoops;
   for (Operation *parent = dot->getParentOp(); parent;
        parent = parent->getParentOp()) {
@@ -100,10 +121,12 @@ static std::optional<TileShape> inferFullShape(triton::DotOp dot) {
     if (!forOp)
       continue;
     if (forOp == kLoop) {
-      auto extent = loopFullExtent(forOp);
-      if (!extent)
-        return std::nullopt;
-      k = *extent;
+      if (needK) {
+        auto extent = loopFullExtent(forOp);
+        if (!extent)
+          return std::nullopt;
+        k = *extent;
+      }
     } else if (forOp.getNumResults() == 0) {
       voidLoops.push_back(forOp);
     } else {
@@ -117,13 +140,13 @@ static std::optional<TileShape> inferFullShape(triton::DotOp dot) {
   // `voidLoops` (collected innermost-first) is [N-loop] or [N-loop, M-loop].
   if (voidLoops.size() > 2)
     return std::nullopt;
-  if (voidLoops.size() >= 1) {
+  if (voidLoops.size() >= 1 && needN) {
     auto extent = loopFullExtent(voidLoops[0]);
     if (!extent)
       return std::nullopt;
     n = *extent;
   }
-  if (voidLoops.size() == 2) {
+  if (voidLoops.size() == 2 && needM) {
     auto extent = loopFullExtent(voidLoops[1]);
     if (!extent)
       return std::nullopt;
@@ -775,7 +798,7 @@ public:
       if (failed(validateDot(dot)))
         return signalPassFailure();
       auto visible = inferVisibleTile(dot);
-      auto full = inferFullShape(dot);
+      auto full = inferFullShape(dot, fullM, fullN, fullK);
       if (!visible || !full) {
         dot.emitError() << "pim-tile-to-budget could not infer the linear"
                            " tile shape";

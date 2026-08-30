@@ -116,11 +116,38 @@ def TritonPIMTileToBudget : Pass<"pim-tile-to-budget", "mlir::ModuleOp"> {
     Prepares budget-aware PIM tiling. This pass validates the linear PIM IR
     tile against the module's hardware contract and writes `pim.tile-*`
     attributes for downstream lowering and cost extraction.
+
+    The untiled (full) M/N/K of the linear operator is normally recovered by
+    walking the `tt.dot`'s enclosing `scf.for` loops -- but real autotuned
+    kernels (e.g. FlagGems `linear_kernel`) often split M/N across a 2-D
+    launch grid instead of a loop, and pass M/N/K in as runtime scalar
+    kernel arguments rather than IR-visible constants, so that structural
+    walk cannot recover them. The `full-m`/`full-n`/`full-k` options let the
+    caller (which already has the real values -- captured from the launch
+    site in Python) supply them directly; when any is >= 0 it overrides
+    the corresponding structural inference for every `tt.dot` in the
+    module. A negative value (the default) means "not supplied", falling
+    back to structural inference as before.
   }];
 
   let dependentDialects = [
     "mlir::triton::TritonDialect",
     "mlir::triton::pim::TritonPIMDialect"
+  ];
+
+  let options = [
+    Option<"fullM", "full-m",
+           "int64_t", /*default*/"-1",
+           "the operator's untiled M, from the real launch args; -1 means"
+           " infer from IR structure">,
+    Option<"fullN", "full-n",
+           "int64_t", /*default*/"-1",
+           "the operator's untiled N, from the real launch args; -1 means"
+           " infer from IR structure">,
+    Option<"fullK", "full-k",
+           "int64_t", /*default*/"-1",
+           "the operator's untiled K, from the real launch args; -1 means"
+           " infer from IR structure">,
   ];
 }
 
