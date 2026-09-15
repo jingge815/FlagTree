@@ -69,8 +69,9 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
   // Unlike TTGIR's memdesc, PIM does not require power-of-2 dimensions: a WRAM
   // buffer is a plain contiguous span with no swizzling to constrain it.
 
-  if (!isa<WRAMSpaceAttr, MRAMSpaceAttr>(memorySpace))
-    return emitError() << "memorySpace must be #pim.wram or #pim.mram; got "
+  if (!isa<WRAMSpaceAttr, MRAMSpaceAttr, L1SpaceAttr, L2SpaceAttr>(memorySpace))
+    return emitError() << "memorySpace must be #pim.wram, #pim.mram, #pim.l1 "
+                          "or #pim.l2; got "
                        << memorySpace;
 
   return success();
@@ -79,6 +80,10 @@ LogicalResult MemDescType::verify(function_ref<InFlightDiagnostic()> emitError,
 bool MemDescType::isWRAM() const { return isa<WRAMSpaceAttr>(getMemorySpace()); }
 
 bool MemDescType::isMRAM() const { return isa<MRAMSpaceAttr>(getMemorySpace()); }
+
+bool MemDescType::isL1() const { return isa<L1SpaceAttr>(getMemorySpace()); }
+
+bool MemDescType::isL2() const { return isa<L2SpaceAttr>(getMemorySpace()); }
 
 std::optional<int64_t> MemDescType::getSizeInBytes() const {
   Type elemTy = getElementType();

@@ -151,4 +151,43 @@ def TritonPIMTileToBudget : Pass<"pim-tile-to-budget", "mlir::ModuleOp"> {
   ];
 }
 
+def TritonPIMFuseActivation : Pass<"pim-fuse-activation", "mlir::ModuleOp"> {
+  let summary = "Fold activations and trailing pools into their producing operator";
+
+  let description = [{
+    Rewrites `pim.matmul`/`pim.conv`/`pim.eltwise` followed by `pim.lut`, and
+    optionally then by `pim.pool`, into a single operator carrying `activation`
+    and `fusedPool` attributes.
+
+    This is not an optimization. The target's graph format stores an activation
+    *inside* its producer's node (its `contraction` block) and has no way to
+    represent a standalone one, so the fusion has to happen before the graph
+    hand-off or the result is unrepresentable. A trailing pool folds into the
+    same node, after the activation.
+
+    Only fuses when the intermediate value has exactly one use: with two or more
+    consumers the pre-activation result is itself needed, and folding would
+    delete a value someone reads.
+
+    Operators that already carry an `activation` are left alone -- a second
+    activation would have nowhere to go, since the graph format allows one per
+    node.
+
+    Example:
+
+    ```mlir
+    %m = pim.matmul %a, %w {datapath = ...} : ...
+    %y = pim.lut %m {kind = #pim.activation<silu>} : ...
+    ```
+
+    becomes
+
+    ```mlir
+    %y = pim.matmul %a, %w {datapath = ..., activation = #pim.act_spec<kind = silu>} : ...
+    ```
+  }];
+
+  let dependentDialects = ["mlir::triton::pim::TritonPIMDialect"];
+}
+
 #endif // TRITONPIM_PASSES

@@ -1,5 +1,6 @@
 add_triton_library(TritonPIMTransforms
   ExplicitDMA.cpp
+  FuseActivation.cpp
   LowerPIMToEmitC.cpp
   TileToBudget.cpp
 

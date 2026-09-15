@@ -42,6 +42,10 @@ constexpr static char AttrTileMName[] = "pim.tile-m";
 constexpr static char AttrTileNName[] = "pim.tile-n";
 constexpr static char AttrTileKName[] = "pim.tile-k";
 constexpr static char AttrTileWramBytesName[] = "pim.tile-wram-bytes";
+// L2 budget shared by the units of one NPU, in bytes.
+constexpr static char AttrL2BytesName[] = "pim.l2-bytes";
+// L1 budget private to one functional unit, in bytes.
+constexpr static char AttrL1BytesName[] = "pim.l1-bytes";
 
 //===----------------------------------------------------------------------===//
 // Memory resources
@@ -53,6 +57,17 @@ struct WRAM : public SideEffects::Resource::Base<WRAM> {
 
 struct MRAM : public SideEffects::Resource::Base<MRAM> {
   StringRef getName() final { return "<MRAM>"; }
+};
+
+// L1 is private to one functional unit; L2 is shared by the units of one NPU.
+// They are separate resources from WRAM so that the effect machinery does not
+// treat a transfer between two levels as aliasing.
+struct L1 : public SideEffects::Resource::Base<L1> {
+  StringRef getName() final { return "<L1>"; }
+};
+
+struct L2 : public SideEffects::Resource::Base<L2> {
+  StringRef getName() final { return "<L2>"; }
 };
 
 //===----------------------------------------------------------------------===//
@@ -71,6 +86,10 @@ std::optional<int64_t> maybeLookupWramBytes(Operation *op);
 std::optional<int64_t> maybeLookupMramBytes(Operation *op);
 // DMA alignment in bytes in scope for `op`. Returns nullopt when unset.
 std::optional<int64_t> maybeLookupDmaAlign(Operation *op);
+// L2 budget in bytes in scope for `op`. Returns nullopt when unset.
+std::optional<int64_t> maybeLookupL2Bytes(Operation *op);
+// L1 budget in bytes in scope for `op`. Returns nullopt when unset.
+std::optional<int64_t> maybeLookupL1Bytes(Operation *op);
 
 // Defaults, matching the pass options of `convert-triton-to-pim`. 16 tasklets
 // is the UPMEM convention; 64 KiB is an upper bound on the WRAM of a single

@@ -157,6 +157,166 @@ LogicalResult TaskletTiledEncodingAttr::verify(
 }
 
 //===----------------------------------------------------------------------===//
+// QuantSpecAttr / DatapathAttr / WindowAttr
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+QuantSpecAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                      QuantGranularity granularity, int64_t axis,
+                      int64_t groupSize, DataExtension dataExt) {
+  // A single scale for the whole tensor has no axis and no group, so carrying
+  // either would describe a layout the granularity does not have.
+  if (granularity == QuantGranularity::PerTensor) {
+    if (axis != 0 || groupSize != 0)
+      return emitError() << "per_tensor takes no axis or groupSize";
+    return success();
+  }
+
+  if (axis < 0)
+    return emitError() << "axis must be non-negative; got " << axis;
+
+  if (granularity == QuantGranularity::PerGroup) {
+    if (groupSize <= 0)
+      return emitError() << "per_group requires a positive groupSize";
+  } else if (groupSize != 0) {
+    return emitError() << "groupSize is only meaningful for per_group";
+  }
+
+  return success();
+}
+
+LogicalResult ActSpecAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                  ActivationKind kind, LutMode mode,
+                                  FloatAttr alpha, FloatAttr clipMin,
+                                  FloatAttr clipMax) {
+  // Only the bounded and sloped activations read these; carrying one on an
+  // activation that ignores it would mislead a reader.
+  if (kind != ActivationKind::ReluX && (clipMin || clipMax))
+    return emitError() << "clip bounds are only meaningful for relu_x";
+
+  if (kind != ActivationKind::LeakyRelu && alpha)
+    return emitError() << "alpha is only meaningful for leaky_relu";
+
+  if (clipMin && clipMax &&
+      clipMin.getValue().convertToDouble() >
+          clipMax.getValue().convertToDouble())
+    return emitError() << "clipMin must not exceed clipMax";
+
+  return success();
+}
+
+LogicalResult PoolSpecAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                   PoolKind kind, WindowAttr window) {
+  // A global reduction covers the whole spatial extent, so a window would be
+  // ignored; a windowed one has no geometry without it.
+  bool global = kind == PoolKind::GlobalAverage;
+  if (global && window)
+    return emitError() << "global_average takes no window";
+  if (!global && !window)
+    return emitError() << "a windowed pool requires a window";
+
+  return success();
+}
+
+LogicalResult
+KantorBlockAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                        StringRef id, KantorMode mode, QuantSpecAttr spec) {
+  if (id.empty())
+    return emitError() << "a kantor block must name the physical block it "
+                          "configures";
+
+  // A bypassed block reads no parameters, so a layout for them would describe
+  // something that never happens.
+  if (mode == KantorMode::Off && spec)
+    return emitError() << "spec is meaningless when mode is off";
+
+  return success();
+}
+
+LogicalResult DatapathAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                   NumericMode nmuMode, NumericMode scaleMode,
+                                   QuantSpecAttr scaleSpec,
+                                   ArrayAttr kantorBlocks) {
+  // `fixed2float` describes a conversion the accumulator performs on its way
+  // out; the scaling block that follows has nothing to convert.
+  if (scaleMode == NumericMode::Fixed2Float)
+    return emitError() << "scaleMode cannot be fixed2float";
+
+  // Each physical block can only be configured once; two entries naming the
+  // same one would be two conflicting claims about one piece of hardware.
+  if (kantorBlocks) {
+    if (kantorBlocks.empty())
+      return emitError() << "kantorBlocks must not be an empty array; omit it "
+                            "when no block is engaged";
+
+    SmallPtrSet<StringAttr, 4> seen;
+    for (Attribute entry : kantorBlocks) {
+      auto block = dyn_cast<KantorBlockAttr>(entry);
+      if (!block)
+        return emitError() << "kantorBlocks must contain only "
+                              "#pim.kantor_block entries";
+      auto id = StringAttr::get(block.getContext(), block.getId());
+      if (!seen.insert(id).second)
+        return emitError() << "kantor block " << block.getId()
+                           << " is configured more than once";
+    }
+  }
+
+  return success();
+}
+
+LogicalResult WindowAttr::verify(function_ref<InFlightDiagnostic()> emitError,
+                                 DenseI64ArrayAttr kernelAttr,
+                                 DenseI64ArrayAttr stridesAttr,
+                                 DenseI64ArrayAttr padsAttr,
+                                 DenseI64ArrayAttr dilationsAttr, int64_t group,
+                                 DenseI64ArrayAttr outputPaddingAttr) {
+  if (!kernelAttr || !stridesAttr || !padsAttr || !dilationsAttr)
+    return emitError() << "kernel, strides, pads and dilations are all required";
+
+  ArrayRef<int64_t> kernel = kernelAttr.asArrayRef();
+  ArrayRef<int64_t> strides = stridesAttr.asArrayRef();
+  ArrayRef<int64_t> pads = padsAttr.asArrayRef();
+  ArrayRef<int64_t> dilations = dilationsAttr.asArrayRef();
+  ArrayRef<int64_t> outputPadding =
+      outputPaddingAttr ? outputPaddingAttr.asArrayRef() : ArrayRef<int64_t>{};
+
+  unsigned rank = kernel.size();
+  if (rank == 0)
+    return emitError() << "kernel must not be empty";
+
+  if (strides.size() != rank || dilations.size() != rank)
+    return emitError() << "strides and dilations must have one entry per "
+                          "kernel dimension ("
+                       << rank << ")";
+
+  // One pad per edge, i.e. two per spatial dimension: [top, right, bottom, left]
+  // for the 2-D case.
+  if (pads.size() != 2 * rank)
+    return emitError() << "pads must have two entries per kernel dimension ("
+                       << 2 * rank << ")";
+
+  if (llvm::any_of(kernel, [](int64_t v) { return v <= 0; }))
+    return emitError() << "kernel extents must be positive";
+  if (llvm::any_of(strides, [](int64_t v) { return v <= 0; }))
+    return emitError() << "strides must be positive";
+  if (llvm::any_of(dilations, [](int64_t v) { return v <= 0; }))
+    return emitError() << "dilations must be positive";
+  if (llvm::any_of(pads, [](int64_t v) { return v < 0; }))
+    return emitError() << "pads must be non-negative";
+
+  if (group <= 0)
+    return emitError() << "group must be positive";
+
+  if (!outputPadding.empty() && outputPadding.size() != 2 * rank)
+    return emitError() << "outputPadding, when present, must have two entries "
+                          "per kernel dimension ("
+                       << 2 * rank << ")";
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // Layout inference
 //===----------------------------------------------------------------------===//
 //
@@ -456,7 +616,9 @@ LogicalResult TritonPIMDialect::verifyOperationAttribute(Operation *op,
                           StringRef(AttrTileMName),
                           StringRef(AttrTileNName),
                           StringRef(AttrTileKName),
-                          StringRef(AttrTileWramBytesName)},
+                          StringRef(AttrTileWramBytesName),
+                          StringRef(AttrL2BytesName),
+                          StringRef(AttrL1BytesName)},
                          attr.getName().strref()) &&
       !isa<ModuleOp>(op)) {
     return op->emitOpError("has unexpected attribute ")
@@ -505,6 +667,14 @@ std::optional<int64_t> mlir::triton::pim::maybeLookupMramBytes(Operation *op) {
 
 std::optional<int64_t> mlir::triton::pim::maybeLookupDmaAlign(Operation *op) {
   return lookupModuleIntAttr(op, AttrDmaAlignName);
+}
+
+std::optional<int64_t> mlir::triton::pim::maybeLookupL2Bytes(Operation *op) {
+  return lookupModuleIntAttr(op, AttrL2BytesName);
+}
+
+std::optional<int64_t> mlir::triton::pim::maybeLookupL1Bytes(Operation *op) {
+  return lookupModuleIntAttr(op, AttrL1BytesName);
 }
 
 //===----------------------------------------------------------------------===//

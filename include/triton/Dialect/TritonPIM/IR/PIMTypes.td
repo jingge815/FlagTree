@@ -69,6 +69,8 @@ def TTPIM_MemDescType : TTPIM_TypeDef<"MemDesc", "memdesc", [ShapedTypeInterface
 
     bool isWRAM() const;
     bool isMRAM() const;
+    bool isL1() const;
+    bool isL2() const;
 
     // Bytes this buffer occupies. Returns std::nullopt when the element type
     // has no fixed size or the shape is dynamic.
@@ -84,5 +86,17 @@ def TTPIM_WRAMMemDesc : Type<
   And<[TTPIM_MemDescType.predicate,
        CPred<"::llvm::cast<::mlir::triton::pim::MemDescType>($_self).isWRAM()">]>,
   "a memory descriptor in WRAM", "::mlir::triton::pim::MemDescType">;
+
+// A memdesc known to live in L2, the NPU-shared buffer.
+def TTPIM_L2MemDesc : Type<
+  And<[TTPIM_MemDescType.predicate,
+       CPred<"::llvm::cast<::mlir::triton::pim::MemDescType>($_self).isL2()">]>,
+  "a memory descriptor in L2", "::mlir::triton::pim::MemDescType">;
+
+// A memdesc in any of the on-chip staging spaces, i.e. anywhere but MRAM.
+def TTPIM_OnChipMemDesc : Type<
+  And<[TTPIM_MemDescType.predicate,
+       CPred<"!::llvm::cast<::mlir::triton::pim::MemDescType>($_self).isMRAM()">]>,
+  "a memory descriptor in an on-chip memory", "::mlir::triton::pim::MemDescType">;
 
 #endif // TRITONPIM_TYPES
