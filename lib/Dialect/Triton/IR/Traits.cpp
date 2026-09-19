@@ -92,37 +92,51 @@ LogicalResult OpTrait::impl::verifySameOperandsAndResultEncoding(
   return verifySameOperandsEncoding(op, allowTensorPointerType);
 }
 
+// True when `op` lives in a module targeting PIM, i.e. one carrying the
+// `pim.target` attribute that `convert-triton-to-pim` (and the graph
+// compiler's operator-level emitter) writes.
+//
+// The PIM target's tensor extents come from the model -- llama2's MLP width is
+// 11008 -- and its engines stream over them rather than requiring a
+// power-of-two vector width, so that particular rule does not apply there.
+// `third_party/xpu` drops the same check for the same reason; keying it on the
+// module attribute keeps every other backend's behaviour unchanged instead.
+//
+// Matched by attribute *name* only: `TritonIR` does not link `TritonPIMIR`, so
+// none of the PIM types are reachable from here.
+static bool isPIMModule(Operation *op) {
+  auto mod = isa<ModuleOp>(op) ? cast<ModuleOp>(op)
+                               : op->getParentOfType<ModuleOp>();
+  return mod && mod->hasAttr("pim.target");
+}
+
 LogicalResult OpTrait::impl::verifyTensorSize(Operation *op) {
-  for (auto opType : op->getOperandTypes()) {
-    if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
-      int64_t numElements = 1;
-      for (int64_t s : tensorType.getShape())
-        numElements *= s;
-      if (numElements > maxTensorNumElements)
-        return op->emitError("Maximum allowed number of elements is ")
-               << maxTensorNumElements << ", but " << *op
-               << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
-        return op->emitError("Number of elements must be power-of-two, but ")
-               << *op << " doesn't follow the rule (" << numElements << ")"
-               << " elements";
-    }
-  }
-  for (auto opType : op->getResultTypes()) {
-    if (auto tensorType = dyn_cast<RankedTensorType>(opType)) {
-      int64_t numElements = 1;
-      for (int64_t s : tensorType.getShape())
-        numElements *= s;
-      if (numElements > maxTensorNumElements)
-        return op->emitError("Maximum allowed number of elements is ")
-               << maxTensorNumElements << ", but " << *op
-               << " has more than that";
-      if ((numElements & (numElements - 1)) != 0)
-        return op->emitError("Number of elements must be power-of-two, but ")
-               << *op << " doesn't follow the rule (" << numElements << ")"
-               << " elements";
-    }
-  }
+  bool requirePowerOfTwo = !isPIMModule(op);
+
+  auto checkType = [&](Type type) -> LogicalResult {
+    auto tensorType = dyn_cast<RankedTensorType>(type);
+    if (!tensorType)
+      return success();
+    int64_t numElements = 1;
+    for (int64_t s : tensorType.getShape())
+      numElements *= s;
+    if (numElements > maxTensorNumElements)
+      return op->emitError("Maximum allowed number of elements is ")
+             << maxTensorNumElements << ", but " << *op
+             << " has more than that";
+    if (requirePowerOfTwo && (numElements & (numElements - 1)) != 0)
+      return op->emitError("Number of elements must be power-of-two, but ")
+             << *op << " doesn't follow the rule (" << numElements << ")"
+             << " elements";
+    return success();
+  };
+
+  for (auto opType : op->getOperandTypes())
+    if (failed(checkType(opType)))
+      return failure();
+  for (auto opType : op->getResultTypes())
+    if (failed(checkType(opType)))
+      return failure();
   return success();
 }
 

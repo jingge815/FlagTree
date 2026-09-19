@@ -1,4 +1,5 @@
 add_triton_library(TritonPIMTransforms
+  ExpandPhases.cpp
   ExplicitDMA.cpp
   FuseActivation.cpp
   LowerPIMToEmitC.cpp

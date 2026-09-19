@@ -451,17 +451,20 @@ def TTPIM_LutModeAttr : EnumAttr<TritonPIM_Dialect, TTPIM_LutMode, "lut_mode"> {
 // Elementwise and pooling kinds
 //===----------------------------------------------------------------------===//
 
-def TTPIM_EltAdd : I32EnumAttrCase<"Add", 0, "add">;
-def TTPIM_EltSub : I32EnumAttrCase<"Sub", 1, "sub">;
-def TTPIM_EltMul : I32EnumAttrCase<"Mul", 2, "mul">;
-def TTPIM_EltDiv : I32EnumAttrCase<"Div", 3, "div">;
-def TTPIM_EltMax : I32EnumAttrCase<"Max", 4, "max">;
-def TTPIM_EltMin : I32EnumAttrCase<"Min", 5, "min">;
+def TTPIM_EltAdd    : I32EnumAttrCase<"Add",    0, "add">;
+def TTPIM_EltSub    : I32EnumAttrCase<"Sub",    1, "sub">;
+def TTPIM_EltMul    : I32EnumAttrCase<"Mul",    2, "mul">;
+def TTPIM_EltDiv    : I32EnumAttrCase<"Div",    3, "div">;
+def TTPIM_EltMax    : I32EnumAttrCase<"Max",    4, "max">;
+def TTPIM_EltMin    : I32EnumAttrCase<"Min",    5, "min">;
+// Hardware-native group absmax used by dynamic-quantization phase 0.
+// Distinct from Max: DQ pooling type 4 is max(|x|), not max(x).
+def TTPIM_EltAbsMax : I32EnumAttrCase<"AbsMax", 6, "absmax">;
 
 def TTPIM_EltwiseKind : I32EnumAttr<"EltwiseKind",
-  "Binary elementwise operation", [
+  "Elementwise / reduction kind", [
     TTPIM_EltAdd, TTPIM_EltSub, TTPIM_EltMul, TTPIM_EltDiv,
-    TTPIM_EltMax, TTPIM_EltMin
+    TTPIM_EltMax, TTPIM_EltMin, TTPIM_EltAbsMax
   ]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::triton::pim";
@@ -476,6 +479,9 @@ def TTPIM_PoolMax    : I32EnumAttrCase<"Max",           0, "max">;
 def TTPIM_PoolAvg    : I32EnumAttrCase<"Average",       1, "average">;
 def TTPIM_PoolGlobal : I32EnumAttrCase<"GlobalAverage", 2, "global_average">;
 
+// No AbsMax here on purpose: the dynamic-quantization group absmax is a
+// reduction along an axis, so it is `pim.reduce_axis` with
+// `#pim.eltwise<absmax>`. This enum is for sliding-window pooling.
 def TTPIM_PoolKind : I32EnumAttr<"PoolKind",
   "Pooling reduction", [TTPIM_PoolMax, TTPIM_PoolAvg, TTPIM_PoolGlobal]> {
   let genSpecializedAttr = 0;

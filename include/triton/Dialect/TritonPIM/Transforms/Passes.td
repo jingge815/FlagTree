@@ -190,4 +190,46 @@ def TritonPIMFuseActivation : Pass<"pim-fuse-activation", "mlir::ModuleOp"> {
   let dependentDialects = ["mlir::triton::pim::TritonPIMDialect"];
 }
 
+def TritonPIMExpandPhases : Pass<"pim-expand-phases", "mlir::ModuleOp"> {
+  let summary = "Expand opaque operators into hardware phase chains";
+
+  let description = [{
+    Rewrites three opaque operator-level ops into the phase SSA the target
+    actually executes, one engine traversal per phase:
+
+      pim.quantize {dynamic}  ->  4 phases (absmax, identity-scale, reciprocal, fp2int)
+      pim.softmax             ->  5 phases (max, exp, sum, reciprocal, mul)
+      pim.rope                ->  3 phases (mul-cos, mul-sin, add)
+
+    The templates are op-local and hardcoded: every DQ node in the llama2
+    reference artifact is 4 phases, every Softmax node is 5, with no
+    exceptions. Other operators (`pim.matmul`, `pim.normalize`, …) are left
+    alone.
+
+    Each produced op carries `pim.phase-bytes` (logical buffer size in bytes)
+    so a later orchestrator can allocate L2 without re-deriving shapes. It
+    does not assign L2 offsets, Layer IDs, or Task IDs.
+
+    DQ phases 1 and 2 both read phase 0 (a fan-out, not a chain). Softmax
+    phase 4 reads both the exp and the reciprocal. Getting either dependency
+    backwards is a silent 256x scale error.
+
+    Example:
+
+    ```mlir
+    %q = pim.quantize %x, %s {dynamic, spec = #pim.quant_spec<
+           granularity = per_group, axis = 1, groupSize = 128>}
+         : tensor<1x4096xf16>, tensor<32xf16> -> tensor<1x4096xi8>
+    ```
+
+    becomes a four-op chain ending in a non-dynamic `pim.quantize` whose
+    scale is the reciprocal of the per-group absmax.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::pim::TritonPIMDialect"
+  ];
+}
+
 #endif // TRITONPIM_PASSES
