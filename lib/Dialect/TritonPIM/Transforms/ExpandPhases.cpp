@@ -44,6 +44,11 @@ static constexpr StringRef kForceConsecutiveAttr = "pim.force-consecutive";
 // the exp phase) are helpers, not phases, so a consumer can count phases by
 // counting distinct values of this attribute rather than counting ops.
 static constexpr StringRef kPhaseAttr = "pim.phase";
+// Kantor mode as the target's layer card spells it, NOT the dialect enum
+// ordinal: the RoPE multiplies want 5 and the K-path add wants 3, while the
+// Q-path add wants 0. A consumer cannot recover those from `#pim.datapath`
+// because several distinct card values share one dialect KantorMode.
+static constexpr StringRef kKantorModeAttr = "pim.kantor-mode";
 
 static int64_t elementCount(RankedTensorType ty) {
   int64_t n = 1;
@@ -90,6 +95,18 @@ static DatapathAttr datapathWithKantor(MLIRContext *ctx, KantorMode mode) {
 static void setPhase(Operation *op, int64_t phase) {
   op->setAttr(kPhaseAttr, IntegerAttr::get(
                               IntegerType::get(op->getContext(), 64), phase));
+}
+
+static void setI64(Operation *op, StringRef name, int64_t value) {
+  op->setAttr(name, IntegerAttr::get(IntegerType::get(op->getContext(), 64),
+                                     value));
+}
+
+static void setFlp(Operation *op, int64_t minExp, int64_t maxExp,
+                   int64_t mantisa) {
+  setI64(op, "pim.flp-min-exp", minExp);
+  setI64(op, "pim.flp-max-exp", maxExp);
+  setI64(op, "pim.flp-mantisa", mantisa);
 }
 
 static LutOp emitLut(OpBuilder &b, Location loc, Value src,
@@ -191,11 +208,22 @@ static LogicalResult expandQuantize(QuantizeOp op) {
   // p1: identity LUT (÷256 lives in the FPSU scale, not here).
   auto p1 = emitLut(b, loc, p0Flat.getResult(), ActivationKind::Relu,
                     FunctionalUnit::CSTL, groupsTy, /*phase=*/1);
-  p1->setAttr("activation_mode", b.getI64IntegerAttr(1));
+  setI64(p1, "pim.activation-mode", 1);
+  setFlp(p1, /*min=*/10, /*max=*/17, /*mantisa=*/3);
+  setI64(p1, "pim.fpsu-mode", 1);
 
   // p2: reciprocal of p0 (fan-out from p0, not from p1).
   auto p2 = emitLut(b, loc, p0Flat.getResult(), ActivationKind::Reciprocal,
                     FunctionalUnit::CSTL, groupsTy, /*phase=*/2);
+  setFlp(p2, /*min=*/15, /*max=*/15, /*mantisa=*/0);
+  setI64(p2, "pim.fpsu-mode", 1);
+  // The reciprocal phase walks the per-group scalars, so how it addresses them
+  // depends on how many groups there are: a single group (the whole row is one
+  // group, as for attention scores) is a scalar walk, several groups are a
+  // strided one. Derived from groupSize, not hardcoded -- both cases occur in
+  // one network and the card values differ (2 vs 1).
+  setI64(p2, "pim.transpose-type",
+         elementCount(groupsTy) <= 1 ? 2 : 1);
 
   auto i8Ty = sameShape(srcTy, b.getIntegerType(8));
   auto qSpec = QuantSpecAttr::get(ctx, QuantGranularity::PerGroup,
@@ -210,6 +238,8 @@ static LogicalResult expandQuantize(QuantizeOp op) {
       datapathWithKantor(ctx, KantorMode::Fp2IntConverter));
   setPhaseBytes(p3, i8Ty);
   setPhase(p3, 3);
+  setI64(p3, kKantorModeAttr, 3);
+  setI64(p3, "pim.fpsu-mode", 1);
 
   op.getResult().replaceAllUsesWith(p3.getResult());
   op.erase();
@@ -250,12 +280,19 @@ static LogicalResult expandSoftmax(SoftmaxOp op) {
   auto expTy = sameShape(srcTy, f16);
   auto p1 = emitLut(b, loc, shifted.getResult(), ActivationKind::Exp,
                     FunctionalUnit::CSTL, expTy, /*phase=*/1);
+  setFlp(p1, /*min=*/9, /*max=*/16, /*mantisa=*/3);
+  setI64(p1, "pim.fpsu-mode", 1);
+  setI64(p1, "pim.transpose-type", 1);
 
   auto p2 = emitReduce(b, loc, p1.getResult(), EltwiseKind::Add, axis,
                        FunctionalUnit::VPU, maxTy, /*phase=*/2);
+  setI64(p2, "pim.fpsu-mode", 1);
 
   auto p3 = emitLut(b, loc, p2.getResult(), ActivationKind::Reciprocal,
                     FunctionalUnit::CSTL, maxTy, /*phase=*/3);
+  setFlp(p3, /*min=*/15, /*max=*/15, /*mantisa=*/0);
+  setI64(p3, "pim.fpsu-mode", 2);
+  setI64(p3, "pim.transpose-type", 2);
 
   auto p4 = b.create<EltwiseOp>(
       loc, expTy, p1.getResult(), p3.getResult(),
@@ -292,6 +329,8 @@ static LogicalResult expandRope(RopeOp op) {
   mulCos->setAttr(kForceConsecutiveAttr, b.getUnitAttr());
   setPhaseBytes(mulCos, srcTy);
   setPhase(mulCos, 0);
+  setI64(mulCos, kKantorModeAttr, 5);
+  setI64(mulCos, "pim.fpsu-mode", 1);
 
   auto mulSin = b.create<EltwiseOp>(
       loc, srcTy, op.getSrc(), op.getSin(),
@@ -301,6 +340,8 @@ static LogicalResult expandRope(RopeOp op) {
   mulSin->setAttr("pim.rotate-half", b.getUnitAttr());
   setPhaseBytes(mulSin, srcTy);
   setPhase(mulSin, 1);
+  setI64(mulSin, kKantorModeAttr, 5);
+  setI64(mulSin, "pim.fpsu-mode", 1);
 
   auto add = b.create<EltwiseOp>(
       loc, srcTy, mulCos.getResult(), mulSin.getResult(),
@@ -309,10 +350,42 @@ static LogicalResult expandRope(RopeOp op) {
   add->setAttr(kForceConsecutiveAttr, b.getUnitAttr());
   setPhaseBytes(add, srcTy);
   setPhase(add, 2);
+  // The add phase differs between the two RoPE chains: the K path requantizes
+  // on its way into the cache (card value 3), the Q path leaves the result in
+  // fp16 for the following dynamic-quantize op (card value 0). The producer
+  // marks the K path with `pim.kantor-mode` on the pim.rope op; honor it when
+  // present so the pass never has to guess which chain it is expanding.
+  if (auto given = op->getAttrOfType<IntegerAttr>(kKantorModeAttr))
+    setI64(add, kKantorModeAttr, given.getInt());
+  else
+    setI64(add, kKantorModeAttr, 0);
+  setI64(add, "pim.fpsu-mode", 1);
 
   op.getResult().replaceAllUsesWith(add.getResult());
   op.erase();
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Matmul: single phase, so nothing to expand -- but the layer card still needs
+// the FPSU / FLP / Kantor configuration, and that is operator-level knowledge
+// this pass owns. Stamping it here keeps one source of truth: a consumer reads
+// the same attributes off matmul as off the expanded phases, instead of falling
+// back to its own hardcoded table for the matmul family only.
+//===----------------------------------------------------------------------===//
+
+static void stampMatmul(MatmulOp op) {
+  // Accumulation for the matmul family runs on the 32-bit float FPSU
+  // (card value 2), unlike the phase pipelines which use value 1.
+  setI64(op, "pim.fpsu-mode", 2);
+
+  auto act = op.getActivationAttr();
+  if (!act)
+    return;
+  // A fused activation is evaluated through the LUT, so the interpolation
+  // window has to be declared. Measured on the reference gate projection.
+  setFlp(op, /*min=*/10, /*max=*/17, /*mantisa=*/3);
+  setI64(op, "pim.activation-mode", 0);
 }
 
 //===----------------------------------------------------------------------===//
@@ -330,6 +403,7 @@ struct TritonPIMExpandPhasesPass
     SmallVector<QuantizeOp> dqs;
     SmallVector<SoftmaxOp> sms;
     SmallVector<RopeOp> ropes;
+    SmallVector<MatmulOp> matmuls;
     getOperation().walk([&](Operation *op) {
       if (auto q = dyn_cast<QuantizeOp>(op))
         dqs.push_back(q);
@@ -337,7 +411,14 @@ struct TritonPIMExpandPhasesPass
         sms.push_back(s);
       else if (auto r = dyn_cast<RopeOp>(op))
         ropes.push_back(r);
+      else if (auto m = dyn_cast<MatmulOp>(op))
+        matmuls.push_back(m);
     });
+
+    // Matmul is single-phase: annotate in place, never expand. Do it before the
+    // expansions so a matmul fed by an expanded op is untouched by this walk.
+    for (auto m : matmuls)
+      stampMatmul(m);
 
     for (auto q : dqs)
       if (failed(expandQuantize(q)))

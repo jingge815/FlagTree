@@ -10,7 +10,7 @@ module {
     // CHECK: pim.reshape
     // CHECK: pim.reduce_axis {{.*}}kind = #pim.eltwise<absmax>
     // CHECK: pim.reshape
-    // CHECK: pim.lut {{.*}}activation_mode = 1 {{.*}}kind = #pim.activation<relu>
+    // CHECK: pim.lut {{.*"pim.activation-mode" = 1.*kind = #pim.activation<relu>
     // CHECK: pim.lut {{.*}}kind = #pim.activation<reciprocal>
     // CHECK: pim.quantize {{.*}}kantorBlocks = [#pim.kantor_block<id = "A", mode = fp2int_converter>]
     // CHECK-NOT: {dynamic
