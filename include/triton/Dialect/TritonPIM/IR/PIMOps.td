@@ -376,6 +376,34 @@ def TTPIM_ConvertLayoutOp : TTPIM_Op<"convert_layout", [
 class TTPIM_OperatorOp<string mnemonic, list<Trait> traits = []>
     : TTPIM_Op<mnemonic, traits>;
 
+// 每个算子级 op 共有的两个属性，集中声明一次。
+//
+//   `phases`   相位链上每个 op 的相位号、缓冲字节数与扇入
+//   `isPhased` 同一件事的显式标记（GML 侧的 `rtl_version` 不是可用代理：
+//              37 个节点带它而 69 个是相位型，softmax 节点一个都不带）
+//
+// 由 `pim-expand-phases` 写上、`pim-verify-gml-contract` 双向校验。声明在
+// ODS 里而不是 `setAttr` 裸挂：类型写错在方言层就报错，不必等到
+// `phase_plan.py` 读文本时表现为「字段静默丢失」。
+//
+// 子类用 `!con(TTPIM_OperatorAttrs.value, (ins ...))` 引入。ODS 的子类
+// `let arguments` 会**替换**基类的，不是追加，所以做不到「只改基类」；
+// 但声明只此一处，17 个算子级 op 都不用手写这两个字段。
+class TTPIM_CommonOperatorAttrs {
+  dag value = (ins
+    OptionalAttr<ArrayAttr>:$phases,
+    UnitAttr:$isPhased,
+    // 相位落在哪个定点/乘加块上的配置。声明在这里而不是靠 `setAttr` 裸挂：
+    // `pim-expand-phases` 会往 `pim.lut` / `pim.kantor` / `pim.eltwise` 三种
+    // 算子上写这两项，而裸属性会被 `attr-dict` 静默收下——读回侧按正则抠
+    // 文本时就分不清「没写」和「写了但 ODS 里没有这个字段」。
+    OptionalAttr<TTPIM_FpsuSpecAttr>:$fpsu,
+    OptionalAttr<TTPIM_KantorSpecAttr>:$kantor
+  );
+}
+def TTPIM_OperatorAttrs : TTPIM_CommonOperatorAttrs;
+
+
 def TTPIM_QuantizeOp : TTPIM_OperatorOp<"quantize"> {
   let summary = "convert a float tensor to fixed point";
 
@@ -398,19 +426,49 @@ def TTPIM_QuantizeOp : TTPIM_OperatorOp<"quantize"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$src,
     TT_Tensor:$scale,
     Optional<TT_Tensor>:$zeroPoint,
     TTPIM_QuantSpecAttr:$spec,
     UnitAttr:$dynamic,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
     $src `,` $scale (`,` $zeroPoint^)? attr-dict
     `:` type($src) `,` type($scale) (`,` type($zeroPoint)^)? `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTPIM_DynamicQuantOp : TTPIM_OperatorOp<"dynamic_quant"> {
+  let summary = "grouped dynamic quantization: absmax, reciprocal, and int8";
+
+  let description = [{
+    One operator that expands into the four-phase chain currently spelled as
+    `pim.quantize {dynamic}`. Two results: the quantized tensor and the
+    per-group scale. `originalShape` and `outShapeByGroup` are the GML field
+    families that had no IR carrier while this was still a flag on QuantizeOp.
+
+    `pim.quantize {dynamic}` remains legal and expands the same way, so old
+    IR keeps working.
+  }];
+
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
+    TT_Tensor:$src,
+    I64Attr:$groupSize,
+    OptionalAttr<I64ArrayAttr>:$originalShape,
+    OptionalAttr<I64ArrayAttr>:$outShapeByGroup,
+    DefaultValuedAttr<I64Attr, "-1">:$axis,
+    OptionalAttr<TTPIM_QuantSpecAttr>:$spec,
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+  ));
+  let results = (outs TT_Tensor:$result, TT_Tensor:$scale);
+
+  let assemblyFormat = [{
+    $src attr-dict `:` type($src) `->` type($result) `,` type($scale)
   }];
   let hasVerifier = 1;
 }
@@ -432,13 +490,13 @@ def TTPIM_DequantizeOp : TTPIM_OperatorOp<"dequantize"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$src,
     TT_Tensor:$scale,
     Optional<TT_Tensor>:$zeroPoint,
     TTPIM_QuantSpecAttr:$spec,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
@@ -448,7 +506,43 @@ def TTPIM_DequantizeOp : TTPIM_OperatorOp<"dequantize"> {
   let hasVerifier = 1;
 }
 
-def TTPIM_MatmulOp : TTPIM_OperatorOp<"matmul"> {
+def TTPIM_ConvertOp : TTPIM_OperatorOp<"convert"> {
+  let summary = "reinterpret a tensor in another element type";
+
+  let description = [{
+    A pure format conversion: no scaling, no bias, only the element type. That
+    is what separates it from `pim.fpsu_scale`, which applies an affine.
+
+    **Nothing emits this yet, and that is deliberate.** The graph format's data
+    extension digit follows the element type one for one (`fp16` is 3, `int8`
+    is 1), so the digit can be derived from the type rather than carried by an
+    op of its own -- and on the reference graph an extension digit appears on
+    every edge, which would be hundreds of nodes for a value nothing reads.
+    The op is here for the case the type system cannot see: the extension digit
+    changes while the element type does not.
+
+    Example:
+
+    ```mlir
+    %y = pim.convert %x : tensor<1x4096xf16> -> tensor<1x4096xi8>
+    ```
+  }];
+
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
+    TT_Tensor:$src,
+    // Left out means "derived from the element type". Given, it must agree
+    // with the type -- a digit that disagrees with the type describes a layout
+    // no reader can act on.
+    OptionalAttr<I64Attr>:$srcExtension,
+    OptionalAttr<I64Attr>:$dstExtension
+  ));
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def TTPIM_MatmulOp : TTPIM_OperatorOp<"matmul", [AttrSizedOperandSegments]> {
   let summary = "quantized matrix multiply on the matrix unit";
 
   let description = [{
@@ -477,22 +571,57 @@ def TTPIM_MatmulOp : TTPIM_OperatorOp<"matmul"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$a,
     TT_Tensor:$b,
     Optional<TT_Tensor>:$bias,
+    // The per-group dequantization factors, one per (group, column): required
+    // exactly when `datapath.groupDequantAccum` is set, forbidden otherwise.
+    //
+    // It has to be an operand rather than an attribute because the value is
+    // per group, and that is the whole content of the grouped datapath: with a
+    // single scalar, multiplying at each group boundary and multiplying once at
+    // the end of the row give the *same* number in exact arithmetic, so
+    // "dequantize per group" and "accumulate then dequantize once" cannot be
+    // told apart -- the rule the datapath exists to state becomes unfalsifiable.
+    Optional<TT_Tensor>:$weightScales,
+    // The lookup table a folded activation evaluates through, when it has one.
+    // The table is data, so it cannot live in an attribute: it has to be a
+    // value the graph hands over, and the producer is where the target format
+    // expects to find it -- the nested contraction block only *names* the
+    // fusion, it does not restate the datapath.
+    Optional<TT_Tensor>:$lutTable,
     TTPIM_DatapathAttr:$datapath,
     OptionalAttr<TTPIM_ActSpecAttr>:$activation,
     OptionalAttr<TTPIM_PoolSpecAttr>:$fusedPool,
+    // 折入激活的查表窗口。展开期写在 matmul 上，声明了才过得了校验。
+    OptionalAttr<I64Attr>:$flpMinExp,
+    OptionalAttr<I64Attr>:$flpMaxExp,
+    OptionalAttr<I64Attr>:$flpMantisa,
+    OptionalAttr<I64Attr>:$activationMode,
+    OptionalAttr<I64Attr>:$specialOperators,
+    OptionalAttr<TTPIM_WeightBindingAttr>:$weightBinding,
+    OptionalAttr<TTPIM_ContractionAttr>:$contraction,
+    // How this op's result rejoins the chain that consumes it. The graph
+    // format has no field for it, so it is configuration: setting it must
+    // leave the emitted graph unchanged.
+    OptionalAttr<TTPIM_CombineModeAttr>:$combineMode,
+    // Which operand stays resident. `bIsActivation` below says the same thing
+    // for two of the three cases and cannot express the third, so both are kept
+    // for now and the verifier requires them to agree.
+    OptionalAttr<TTPIM_StationarityAttr>:$stationarity,
     UnitAttr:$transposeB,
     UnitAttr:$bIsActivation,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
-    $a `,` $b (`,` $bias^)? attr-dict
-    `:` type($a) `,` type($b) (`,` type($bias)^)? `->` type($result)
+    $a `,` $b (`,` $bias^)? (`scales` $weightScales^)? (`lut` $lutTable^)?
+    attr-dict
+    `:` type($a) `,` type($b) (`,` type($bias)^)?
+    (`scales` type($weightScales)^)? (`lut` type($lutTable)^)?
+    `->` type($result)
   }];
   let hasVerifier = 1;
 }
@@ -521,7 +650,7 @@ def TTPIM_ConvOp : TTPIM_OperatorOp<"conv"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$input,
     TT_Tensor:$weight,
     Optional<TT_Tensor>:$bias,
@@ -529,9 +658,12 @@ def TTPIM_ConvOp : TTPIM_OperatorOp<"conv"> {
     TTPIM_DatapathAttr:$datapath,
     OptionalAttr<TTPIM_ActSpecAttr>:$activation,
     OptionalAttr<TTPIM_PoolSpecAttr>:$fusedPool,
+    // 折入的激活。与 matmul 同一份字段：融合 pass 对所有主算子都写它，
+    // 缺了声明就会被静默收下，校验器看不到。
+    OptionalAttr<TTPIM_ContractionAttr>:$contraction,
     UnitAttr:$transposed,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
@@ -567,7 +699,7 @@ def TTPIM_LutOp : TTPIM_OperatorOp<"lut"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$src,
     Optional<TT_Tensor>:$table,
     TTPIM_ActivationKindAttr:$kind,
@@ -575,13 +707,124 @@ def TTPIM_LutOp : TTPIM_OperatorOp<"lut"> {
     OptionalAttr<F64Attr>:$alpha,
     OptionalAttr<F64Attr>:$clipMin,
     OptionalAttr<F64Attr>:$clipMax,
+    // How the activation unit maps an input onto a segment of the table. The
+    // three are one triple: a window without its exponent bounds addresses the
+    // wrong segment, which is wrong numerics with no error anywhere.
+    OptionalAttr<I64Attr>:$flpMinExp,
+    OptionalAttr<I64Attr>:$flpMaxExp,
+    OptionalAttr<I64Attr>:$flpMantisa,
+    // 0 regular / 1 even / 2 odd. Overlaps `mode` in meaning but not in value:
+    // this is the number the target's own field carries.
+    OptionalAttr<I64Attr>:$activationMode,
+    // 0 regular, 4 reciprocal. The reciprocal table is selected by this flag
+    // rather than by the kind, so both have to agree.
+    OptionalAttr<I64Attr>:$specialOperators,
+    // The FPSU's per-phase scaling factor. On hardware the post-LUT datapath
+    // multiplies by a value that lives in a scaling buffer, so it is not
+    // derivable from the window or the activation kind: dynamic quantization's
+    // phase 1 is an identity table followed by a x1/256, and without this the
+    // lowering computed `2*absmax` where the declared phase value is
+    // `2*absmax/256`.
+    OptionalAttr<F64Attr>:$fpsuScale,
+    // 相位的寻址卡。展开期写在这个算子上，声明了才过得了校验。
+    OptionalAttr<TTPIM_TransposePurposeAttr>:$transposePurpose,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
     $src (`,` $table^)? attr-dict
     `:` type($src) (`,` type($table)^)? `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTPIM_FpsuScaleOp : TTPIM_OperatorOp<"fpsu_scale"> {
+  let summary = "affine rescale on the fixed-point unit";
+
+  let description = [{
+    Rescales `src` through the fixed-point unit's datapath: add the 32-bit
+    `bias`, multiply by the 16-bit `scale`, round, right-shift by `shift`, and
+    saturate into the result format. It does no reduction and no table lookup --
+    that is what separates it from the pooling and activation units.
+
+    Unlike `pim.quantize`, which carries a quantization *layout*, this is a
+    single sweep with no notion of groups: the three constants are tensors and
+    the granularity they were built at is in `spec`.
+
+    A standalone op only where the graph really has one rescale of its own --
+    the KV write, which is the one place the target runs in `fixed_point`. A
+    rescale that belongs to a phase stays a `#pim.fpsu_spec` on that phase's op,
+    because inserting an op there would change the phase SSA and therefore the
+    phase count.
+
+    Example:
+
+    ```mlir
+    %y = pim.fpsu_scale %x, %bias, %scale {shift = 14 : i8,
+        spec = #pim.fpsu_spec<mode = fixed_point>}
+        : tensor<1x32x128xf16>, tensor<1x32x128xf32>, tensor<1x32x128xf16>
+        -> tensor<1x32x128xi8>
+    ```
+  }];
+
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
+    TT_Tensor:$src,
+    TT_Tensor:$bias,
+    TT_Tensor:$scale,
+    I8Attr:$shift,
+    TTPIM_FpsuSpecAttr:$spec,
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+  ));
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $src `,` $bias `,` $scale attr-dict
+    `:` type($src) `,` type($bias) `,` type($scale) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTPIM_KantorOp : TTPIM_OperatorOp<"kantor", [AttrSizedOperandSegments]> {
+  let summary = "elementwise multiply, format conversion and shift";
+
+  let description = [{
+    Applies one elementwise transform to `lhs` under `spec`: multiply by a
+    second operand, convert between floating point and fixed point, or shift.
+    `rhs` is the multiplier for the multiply modes and is absent for the format
+    conversions; `scale`, `bias` and `shift` are the constants the engaged
+    blocks apply, and the two blocks in `spec` need not carry the same ones.
+
+    The float-to-fixed conversion is the step that lands a tensor in int8, and
+    the shift that goes with it scales by a power of two rather than by a
+    separate multiplier.
+
+    Example:
+
+    ```mlir
+    %q = pim.kantor %x {spec = #pim.kantor_spec<mode = fp2int_converter, cardValue = 3>}
+        : tensor<1x4096xf16> -> tensor<1x4096xi8>
+    ```
+  }];
+
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
+    TT_Tensor:$lhs,
+    Optional<TT_Tensor>:$rhs,
+    Optional<TT_Tensor>:$scale,
+    Optional<TT_Tensor>:$bias,
+    OptionalAttr<I8Attr>:$shift,
+    TTPIM_KantorSpecAttr:$spec,
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+  ));
+  let results = (outs TT_Tensor:$result);
+
+  // 三个可选操作数用关键字锚定。只靠位置分不出来：`%a, %b` 里 %b 是
+  // `rhs` 还是 `scale` 无法判定，所以打印出来的文本再解析回来会绑错
+  // （实测：只有 scale 时解析成 rhs，verifier 报 "takes no rhs operand"）。
+  let assemblyFormat = [{
+    $lhs (`rhs` $rhs^)? (`scale` $scale^)? (`bias` $bias^)? attr-dict
+    `:` type($lhs) (`rhs` type($rhs)^)? (`scale` type($scale)^)?
+    (`bias` type($bias)^)? `->` type($result)
   }];
   let hasVerifier = 1;
 }
@@ -617,23 +860,61 @@ def TTPIM_EltwiseOp : TTPIM_OperatorOp<"eltwise"> {
     ```
   }];
 
-  let arguments = (ins
-    TT_Tensor:$lhs,
-    TT_Tensor:$rhs,
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
+    // Variadic because the add/concat unit takes more than two slots: the
+    // residual add has two, a concat has thirty-two. Two operands remain the
+    // common case and keep the `$operands` list at length two -- the mnemonic
+    // does not change, which matters because cost extraction counts these by
+    // name.
+    Variadic<TT_Tensor>:$operands,
     TTPIM_EltwiseKindAttr:$kind,
     TTPIM_DatapathAttr:$datapath,
     OptionalAttr<TTPIM_DatapathAttr>:$rhsDatapath,
+    // One `#pim.datapath` per slot, when the slots differ. The residual add is
+    // why: its two inputs carry separate scaling. Absent means every slot uses
+    // `datapath` (slot 0) and `rhsDatapath` (slot 1), which is the older
+    // two-slot spelling and still valid.
+    OptionalAttr<ArrayAttr>:$perSlotDatapath,
     OptionalAttr<TTPIM_ActSpecAttr>:$activation,
     OptionalAttr<TTPIM_PoolSpecAttr>:$fusedPool,
+    OptionalAttr<TTPIM_ContractionAttr>:$contraction,
+    // How this op's result rejoins the chain that consumes it. The graph
+    // format has no field for it, so it is configuration: setting it must
+    // leave the emitted graph unchanged.
+    OptionalAttr<TTPIM_CombineModeAttr>:$combineMode,
+    // Swap the operand's halves before multiplying, negating the half that
+    // comes forward: `cat(-back, front)`. This is what RoPE's sin term needs,
+    // and it is a property of *this* multiply rather than a separate op --
+    // there is no negate anywhere in the reference implementation's chain.
+    //
+    // It used to be a bare `pim.rotate-half` string. A lowering that did not
+    // know the name computed a plain multiply: the right shape, the wrong
+    // numbers, and nothing to report it.
+    UnitAttr:$rotateHalf,
+    // 相位的寻址卡。展开期写在这个算子上，声明了才过得了校验。
+    OptionalAttr<TTPIM_TransposePurposeAttr>:$transposePurpose,
+    // 从 `pim.rope` 展开过来时，原算子身上的 6 个子块名和广播规格要跟着
+    // 最后一相（add）走，不能随原 op 一起被擦掉——否则 sin/cos 广播到多头
+    // 那一路的独立量化参数在展开后的 IR 里就没地方放了。前缀 `source` 用来
+    // 和本算子自己展开产生的相位级字段区分开。
+    OptionalAttr<StrArrayAttr>:$sourceSubBlocks,
+    OptionalAttr<TTPIM_BroadcastSpecAttr>:$sourceBroadcastSpec,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
-    $lhs `,` $rhs attr-dict
-    `:` type($lhs) `,` type($rhs) `->` type($result)
+    $operands attr-dict `:` type($operands) `->` type($result)
   }];
   let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    // The two-slot spelling, which is what every expansion in this dialect
+    // produces today. Kept as named accessors so the binary path reads the same
+    // as before rather than turning into indexing at every use site.
+    ::mlir::Value getLhs() { return getOperands()[0]; }
+    ::mlir::Value getRhs() { return getOperands()[1]; }
+  }];
 }
 
 def TTPIM_PoolOp : TTPIM_OperatorOp<"pool"> {
@@ -656,16 +937,100 @@ def TTPIM_PoolOp : TTPIM_OperatorOp<"pool"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$input,
     TTPIM_PoolKindAttr:$kind,
     OptionalAttr<TTPIM_WindowAttr>:$window,
     OptionalAttr<TTPIM_NumericModeAttr>:$mode,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = "$input attr-dict `:` type($input) `->` type($result)";
+  let hasVerifier = 1;
+}
+
+def TTPIM_GatherOp : TTPIM_OperatorOp<"gather", [Pure]> {
+  let summary = "row lookup from a table";
+
+  let description = [{
+    Reads the rows of `table` named by `indices`. This is the word embedding:
+    pure addressing, no arithmetic.
+
+    Not an analog in-array lookup. The table is a quarter of a gigabyte for
+    llama2-7b, so where it lives and how much of it is resident is the
+    orchestrator's decision; this op only states which rows are read.
+
+    The result takes `indices`'s shape followed by the table's row shape --
+    `[B, S]` indices into a `[vocab, hidden]` table give `[B, S, hidden]`.
+
+    Example:
+
+    ```mlir
+    %y = pim.gather %table, %ids
+        : tensor<32000x4096xf16>, tensor<1x16xi32> -> tensor<1x16x4096xf16>
+    ```
+  }];
+
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
+    TT_Tensor:$table,
+    TT_Tensor:$indices,
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+  ));
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $table `,` $indices attr-dict
+    `:` type($table) `,` type($indices) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
+def TTPIM_GlobalPoolOp : TTPIM_OperatorOp<"global_pool"> {
+  let summary = "grouped reduction on the pooling unit";
+
+  let description = [{
+    Reduces each run of `groupSize` consecutive elements along the last axis to
+    one value, under `kind`. This is the dynamic-quantization phase 0: it takes
+    an absmax per quantized group, not over a sliding window.
+
+    Not a `pim.reduce_axis` with a group size bolted on. `reduce_axis` collapses
+    a whole axis on the vector unit and has no group size, no per-channel or
+    per-group flags and no pooling data type -- the four field families this
+    unit's output is described by. Softmax's two reductions stay on
+    `reduce_axis` on purpose: the target gives them no `global_pooling_*` fields
+    at all, so routing them here would invent a description they do not have.
+
+    Reducing has to sweep the whole group before it has an answer, so one
+    traversal does one reduction; it never merges with a neighbouring pass.
+
+    The per-channel and per-group axes are this unit's numbering (2 and 3), not
+    the quantization spec's tensor axes -- the same quantization decision lands
+    on each unit under that unit's own axis numbering.
+
+    Example:
+
+    ```mlir
+    %m = pim.global_pool %x {kind = #pim.pool_kind<absmax>, groupSize = 128 : i64}
+        : tensor<1x32x128xf16> -> tensor<1x32x1xf16>
+    ```
+  }];
+
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
+    TT_Tensor:$src,
+    TTPIM_GlobalPoolKindAttr:$kind,
+    I64Attr:$groupSize,
+    DefaultValuedAttr<BoolAttr, "true">:$spc,
+    DefaultValuedAttr<I64Attr, "2">:$spcAxis,
+    DefaultValuedAttr<BoolAttr, "true">:$spg,
+    DefaultValuedAttr<I64Attr, "3">:$spgAxis,
+    DefaultValuedAttr<TTPIM_PoolDTypeAttr,
+                      "PoolDType::FloatingPoint">:$dtype,
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+  ));
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
   let hasVerifier = 1;
 }
 
@@ -691,12 +1056,12 @@ def TTPIM_ReduceAxisOp : TTPIM_OperatorOp<"reduce_axis"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$src,
     TTPIM_EltwiseKindAttr:$kind,
     I64Attr:$axis,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
@@ -720,6 +1085,22 @@ def TTPIM_RopeOp : TTPIM_OperatorOp<"rope"> {
     shape detail. `transposeInput` marks the variant that begins with a
     transpose, which the unit folds in.
 
+    `tailCardValue` is the addressing-card value the *final* phase runs under,
+    and only the graph compiler knows it: the K chain requantizes on its way
+    into the KV cache (card value 3), while the Q chain leaves the result in
+    fp16 for the dynamic-quantize op that follows (card value 0). Two chains
+    expand from the same op, so the pass cannot tell them apart on its own --
+    guessing forces both to the same value and silently drops the K chain's
+    requantization. It is a plain integer rather than a `KantorMode` because
+    the dialect's enum shares one name across several card values, so the
+    value cannot be recovered from the mode.
+
+    This used to be a bare `pim.kantor-mode` string attribute written by the
+    graph compiler and read back here by name. Renaming either side made
+    `getAttrOfType` return null, the value fell back to 0, and the K chain's
+    requantization plus its flat `contraction` tag both vanished -- with the
+    IR still verifying and the graph still running.
+
     Example:
 
     ```mlir
@@ -729,14 +1110,19 @@ def TTPIM_RopeOp : TTPIM_OperatorOp<"rope"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$src,
     TT_Tensor:$cos,
     TT_Tensor:$sin,
     I64Attr:$numHeads,
     UnitAttr:$transposeInput,
-    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+    DefaultValuedAttr<I64Attr, "0">:$tailCardValue,
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit,
+    // 6 个编号定点子块的语义顺序。缺省表示不声明子块。
+    OptionalAttr<StrArrayAttr>:$subBlocks,
+    // sin/cos 广播到各头的那一路，带独立量化参数。
+    OptionalAttr<TTPIM_BroadcastSpecAttr>:$broadcastSpec
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
@@ -772,20 +1158,26 @@ def TTPIM_NormalizeOp : TTPIM_OperatorOp<"normalize", [
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$src,
     Optional<TT_Tensor>:$weight,
     Optional<TT_Tensor>:$bias,
+    // An operand rather than an attribute because the target reads it from a
+    // buffer of its own (`RMSNorm_Add_Const`). As an f64 attribute it could not
+    // be pointed at that buffer, and the value would have to be duplicated on
+    // both sides of the hand-off.
+    Optional<TT_Tensor>:$epsilon,
     I64Attr:$axis,
-    DefaultValuedAttr<F64Attr, "1.0e-5">:$epsilon,
     UnitAttr:$rmsNorm,
+    OptionalAttr<TTPIM_VpuParamsAttr>:$vpuParams,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
-    $src (`,` $weight^)? (`,` $bias^)? attr-dict
-    `:` type($src) (`,` type($weight)^)? (`,` type($bias)^)? `->` type($result)
+    $src (`,` $weight^)? (`bias` $bias^)? (`eps` $epsilon^)? attr-dict
+    `:` type($src) (`,` type($weight)^)? (`bias` type($bias)^)?
+    (`eps` type($epsilon)^)? `->` type($result)
   }];
   let hasVerifier = 1;
 }
@@ -809,11 +1201,11 @@ def TTPIM_SoftmaxOp : TTPIM_OperatorOp<"softmax"> {
     ```
   }];
 
-  let arguments = (ins
+  let arguments = !con(TTPIM_OperatorAttrs.value, (ins
     TT_Tensor:$src,
     I64Attr:$axis,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
-  );
+  ));
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
@@ -1006,7 +1398,15 @@ def TTPIM_TransposeOp : TTPIM_Op<"transpose", [Pure]> {
     ```
   }];
 
-  let arguments = (ins TT_Tensor:$src, DenseI64ArrayAttr:$axes);
+  let arguments = (ins
+    TT_Tensor:$src,
+    DenseI64ArrayAttr:$axes,
+    // Why the axes are permuted. Absent means the axis order is the whole
+    // story -- a node is emitted -- which is what an unannotated transpose in
+    // hand-written IR means.
+    OptionalAttr<TTPIM_TransposePurposeAttr>:$purpose,
+    UnitAttr:$onthefly
+  );
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
@@ -1027,7 +1427,11 @@ def TTPIM_ReshapeOp : TTPIM_Op<"reshape", [Pure]> {
     ```
   }];
 
-  let arguments = (ins TT_Tensor:$src);
+  let arguments = (ins
+    TT_Tensor:$src,
+    // Produces no layer of its own: the layout already agrees.
+    UnitAttr:$onthefly
+  );
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = "$src attr-dict `:` type($src) `->` type($result)";
@@ -1052,7 +1456,12 @@ def TTPIM_SplitOp : TTPIM_Op<"split", [Pure]> {
     ```
   }];
 
-  let arguments = (ins TT_Tensor:$src, I64Attr:$axis);
+  let arguments = (ins
+    TT_Tensor:$src,
+    I64Attr:$axis,
+    // Produces no layer of its own: the layout already agrees.
+    UnitAttr:$onthefly
+  );
   let results = (outs Variadic<TT_Tensor>:$results);
 
   let assemblyFormat = [{
@@ -1078,7 +1487,12 @@ def TTPIM_ConcatOp : TTPIM_Op<"concat", [Pure]> {
     ```
   }];
 
-  let arguments = (ins Variadic<TT_Tensor>:$srcs, I64Attr:$axis);
+  let arguments = (ins
+    Variadic<TT_Tensor>:$srcs,
+    I64Attr:$axis,
+    // Produces no layer of its own: the layout already agrees.
+    UnitAttr:$onthefly
+  );
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
@@ -1119,6 +1533,7 @@ def TTPIM_MaskOp : TTPIM_Op<"mask"> {
     TT_Tensor:$scores,
     TT_Tensor:$mask,
     UnitAttr:$transposeInput,
+    DefaultValuedAttr<TTPIM_MaskLayoutAttr, "MaskLayout::Vector">:$layout,
     OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
   );
   let results = (outs TT_Tensor:$result);
@@ -1131,7 +1546,8 @@ def TTPIM_MaskOp : TTPIM_Op<"mask"> {
 }
 
 def TTPIM_KvCacheOp : TTPIM_Op<"kv_cache", [
-    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>,
+    AttrSizedOperandSegments]> {
   let summary = "read or write the KV cache through the DMA engine";
 
   let description = [{
@@ -1157,15 +1573,35 @@ def TTPIM_KvCacheOp : TTPIM_Op<"kv_cache", [
     TT_Tensor:$value,
     TTPIM_MemDescType:$cache,
     I32:$pos,
+    // Where a scatter writes. Required for `scatter`, forbidden otherwise: an
+    // index nothing reads is a second source of truth for the destination.
+    Optional<TT_Tensor>:$indices,
+    // The scaling side of the update. The cache is written through the one
+    // fixed-point datapath in the network -- scaling 2.0, right shift 14 -- so
+    // these carry that path's scale and zero point rather than a floating
+    // one's.
+    Optional<TT_Tensor>:$updatesSf,
+    Optional<TT_Tensor>:$updatesZp,
     I64Attr:$layer,
     UnitAttr:$isKey,
+    // Assembly sugar for `mode = read`, kept for a release; the verifier holds
+    // the two to each other.
     UnitAttr:$isRead,
-    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+    DefaultValuedAttr<TTPIM_KvModeAttr, "KvMode::Scatter">:$mode,
+    // How the cache operand is staged, e.g. "L2A_ignore". The full set of
+    // values is not known, so it is a free-form string rather than an enum.
+    OptionalAttr<StrAttr>:$inputBufferPolicy,
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit,
+    // 更新侧的定标规格。缓存只经网络里那一条定点通路写入，所以带了它
+    // 就必须是定点模式——否则定标会按一个不适用的模式解释，数值全错而不报错。
+    OptionalAttr<TTPIM_FpsuSpecAttr>:$fpsuSpec
   );
 
   let assemblyFormat = [{
-    (`read` $isRead^)? $value `,` $cache `,` $pos attr-dict
+    (`read` $isRead^)? $value `,` $cache `,` $pos
+    (`[` $indices^ `]`)? (`sf` $updatesSf^)? (`zp` $updatesZp^)? attr-dict
     `:` type($value) `,` qualified(type($cache)) `,` type($pos)
+    (`[` type($indices)^ `]`)? (`sf` type($updatesSf)^)? (`zp` type($updatesZp)^)?
   }];
   let hasVerifier = 1;
 }
@@ -1194,7 +1630,11 @@ def TTPIM_SplitHeadsOp : TTPIM_Op<"split_heads", [Pure]> {
     TT_Tensor:$src,
     I64Attr:$axis,
     I64Attr:$numHeads,
-    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit,
+    // 与 transpose/reshape/split/concat 同一标记：声明这次拆头不单独占一次
+    // 引擎遍历。没有它，`attr-dict` 会把这个名字当未声明属性静默收下，
+    // 读回侧无从判断它到底有没有这个语义。
+    UnitAttr:$onthefly
   );
   let results = (outs Variadic<TT_Tensor>:$results);
 

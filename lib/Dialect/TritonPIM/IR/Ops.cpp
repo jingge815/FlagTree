@@ -335,11 +335,107 @@ static LogicalResult verifyQuantConversion(Operation *op, QuantSpecAttr spec,
 }
 
 LogicalResult QuantizeOp::verify() {
+  if (failed(verifyComputeUnit(getOperation(), getUnit())))
+    return failure();
   return verifyQuantConversion(getOperation(), getSpec(), getSrc(), getResult(),
                                getScale(), getZeroPoint());
 }
 
+LogicalResult DynamicQuantOp::verify() {
+  if (failed(verifyComputeUnit(getOperation(), getUnit())))
+    return failure();
+  auto srcTy = dyn_cast<RankedTensorType>(getSrc().getType());
+  auto resTy = dyn_cast<RankedTensorType>(getResult().getType());
+  auto scaleTy = dyn_cast<RankedTensorType>(getScale().getType());
+  if (!srcTy || !resTy || !scaleTy)
+    return emitOpError("src, result and scale must be ranked tensors");
+  if (srcTy.getShape() != resTy.getShape())
+    return emitOpError("result shape must match src");
+
+  // The chain is float in, int8 out. Both are checked because a wrong element
+  // type still verifies structurally -- the failure would surface much later,
+  // as a lowering that reads an f16 buffer as fixed point.
+  if (!srcTy.getElementType().isF16())
+    return emitOpError("src must be f16; got ") << srcTy.getElementType();
+  if (!resTy.getElementType().isInteger(8))
+    return emitOpError("result must be i8; got ") << resTy.getElementType();
+
+  int64_t groupSize = getGroupSize();
+  if (groupSize <= 0)
+    return emitOpError("groupSize must be positive");
+  int64_t axis = getAxis();
+  int64_t rank = srcTy.getRank();
+  if (axis < 0)
+    axis += rank;
+  if (axis < 0 || axis >= rank)
+    return emitOpError("axis out of range");
+
+  // The operand attributes and the spec describe **the same** quantization.
+  // Checking only one of them lets the two disagree and nobody notices: the
+  // verifier would pass on the operand's group size while the expansion reads
+  // the spec's, producing a chain whose real group size is not the one the
+  // declared scale shape was built for.
+  auto spec = getSpec();
+  if (!spec)
+    return emitOpError("dynamic quantization needs a spec");
+  if (spec->getGranularity() != QuantGranularity::PerGroup)
+    return emitOpError("dynamic quantization is per_group; spec says ")
+           << stringifyQuantGranularity(spec->getGranularity());
+  if (spec->getGroupSize() != groupSize)
+    return emitOpError("spec groupSize is ")
+           << spec->getGroupSize() << " but the op says " << groupSize
+           << "; the two describe one quantization and must agree";
+  int64_t specAxis = spec->getAxis();
+  if (specAxis < 0)
+    specAxis += rank;
+  if (specAxis != axis)
+    return emitOpError("spec axis is ")
+           << spec->getAxis() << " but the op says " << getAxis()
+           << "; the two describe one quantization and must agree";
+
+  int64_t extent = srcTy.getDimSize(axis);
+  if (extent % groupSize != 0)
+    return emitOpError("axis extent is not divisible by groupSize");
+  int64_t groups = extent / groupSize;
+  int64_t scaleElems = 1;
+  for (int64_t d : scaleTy.getShape())
+    scaleElems *= d;
+  if (scaleElems != groups)
+    return emitOpError("scale must hold one value per group");
+
+  // Shape contract, checked only when the graph compiler states it. The last
+  // axis of `originalShape` is the one being grouped, and the per-group view
+  // replaces it with `[groups, groupSize]` -- a different split would mean the
+  // scale blob and the data disagree about where the groups are.
+  if (auto original = getOriginalShape()) {
+    if ((*original).size() != static_cast<size_t>(rank))
+      return emitOpError("originalShape must have the source's rank; got ")
+             << (*original).size() << " entries for rank " << rank;
+    int64_t last = cast<IntegerAttr>((*original)[rank - 1]).getInt();
+    if (last % groupSize != 0)
+      return emitOpError("originalShape's last axis ")
+             << last << " is not divisible by groupSize " << groupSize;
+    if (auto byGroup = getOutShapeByGroup()) {
+      if ((*byGroup).size() != static_cast<size_t>(rank) + 1)
+        return emitOpError("outShapeByGroup must have rank + 1 entries; got ")
+               << (*byGroup).size() << " for rank " << rank;
+      SmallVector<int64_t> want;
+      for (int64_t i = 0; i < rank - 1; ++i)
+        want.push_back(cast<IntegerAttr>((*original)[i]).getInt());
+      want.push_back(last / groupSize);
+      want.push_back(groupSize);
+      for (size_t i = 0; i < want.size(); ++i)
+        if (cast<IntegerAttr>((*byGroup)[i]).getInt() != want[i])
+          return emitOpError("outShapeByGroup must be originalShape with the "
+                             "grouped axis split into [groups, groupSize]");
+    }
+  }
+  return success();
+}
+
 LogicalResult DequantizeOp::verify() {
+  if (failed(verifyComputeUnit(getOperation(), getUnit())))
+    return failure();
   return verifyQuantConversion(getOperation(), getSpec(), getSrc(), getResult(),
                                getScale(), getZeroPoint());
 }
@@ -382,6 +478,123 @@ LogicalResult MatmulOp::verify() {
     if (elems != n && elems != 1)
       return emitOpError("bias must supply ")
              << n << " or 1 values; got " << elems;
+  }
+
+  // The binding and `transposeB` state the same fact about the weight's layout.
+  // Both are kept for now -- `transposeB` predates the binding -- so they have
+  // to agree rather than leave a reader to pick one.
+  if (auto binding = getWeightBinding()) {
+    bool bindingSaysTransposed =
+        binding->getFormat() == WeightFormat::WeightsTranspose;
+    if (bindingSaysTransposed != static_cast<bool>(getTransposeB()))
+      return emitOpError("weightBinding format weights_transpose must agree "
+                         "with transposeB");
+  }
+
+  // A weight-role quant spec states the value range the weight was stored in;
+  // the binding states the element width. Both describe the same storage, so a
+  // range outside what the width can hold means one of them is wrong -- and the
+  // rescale would then use a bound that never applies, silently.
+  if (auto binding = getWeightBinding()) {
+    if (auto spec = getDatapath().getScaleSpec()) {
+      if (spec.getRole() == QuantRole::Weight && spec.getRange()) {
+        int64_t elemBits = binding->getElemBits();
+        auto lo = cast<FloatAttr>(spec.getRange()[0]).getValueAsDouble();
+        auto hi = cast<FloatAttr>(spec.getRange()[1]).getValueAsDouble();
+        double wantLo = -static_cast<double>(int64_t{1} << (elemBits - 1));
+        double wantHi = static_cast<double>((int64_t{1} << (elemBits - 1)) - 1);
+        if (lo != wantLo || hi != wantHi)
+          return emitOpError("role weight states range [")
+                 << lo << ", " << hi << "], but elemBits = " << elemBits
+                 << " holds [" << wantLo << ", " << wantHi
+                 << "]; the two describe the same storage";
+      }
+    }
+  }
+
+  // The accumulator dequantizes a group at a time, so it has to use the same
+  // grouping the weight was quantized at. Two different group sizes would mean
+  // the accumulator folds in a scale that belongs to a different run of
+  // elements -- wrong numbers, and no error anywhere to say so.
+  if (getDatapath().getGroupDequantAccum()) {
+    auto binding = getWeightBinding();
+    if (!binding)
+      return emitOpError("groupDequantAccum dequantizes the weight per group, "
+                         "so the weight's layout has to be stated: it needs a "
+                         "weightBinding");
+    if (getDatapath().getGroupSize() != binding->getGroupSize())
+      return emitOpError("groupDequantAccum groupSize ")
+             << getDatapath().getGroupSize()
+             << " must equal the weight's groupSize "
+             << binding->getGroupSize();
+
+    // The factors have to be present, and there have to be one per (group,
+    // column). Without them the boundary multiplies by a single scalar, and a
+    // scalar at each boundary equals the same scalar once at the end of the row
+    // -- so "dequantize per group" would produce the same numbers as "accumulate
+    // then dequantize", and the rule this datapath exists to state could not
+    // fail a test.
+    if (!getWeightScales())
+      return emitOpError("groupDequantAccum dequantizes at every group "
+                         "boundary, so it needs the per-group factors as an "
+                         "operand; with one scalar the grouped and ungrouped "
+                         "orders give the same number");
+    auto aTy = cast<RankedTensorType>(getA().getType());
+    auto scalesTy = cast<RankedTensorType>(getWeightScales().getType());
+    int64_t k = aTy.getShape().back();
+    int64_t groupSize = getDatapath().getGroupSize();
+    if (groupSize <= 0)
+      return emitOpError("groupDequantAccum needs a positive groupSize");
+    if (k % groupSize != 0)
+      return emitOpError("the K dimension ")
+             << k << " is not a whole number of " << groupSize
+             << "-wide groups, so the last group would be short";
+    int64_t groups = k / groupSize;
+    int64_t n = cast<RankedTensorType>(getResult().getType()).getShape().back();
+    SmallVector<int64_t> want{groups, n};
+    if (scalesTy.getShape() != ArrayRef<int64_t>(want))
+      return emitOpError("weightScales must be [K/groupSize, N] = [")
+             << groups << ", " << n << "], got [" << scalesTy.getShape() << "]";
+  } else if (getWeightScales()) {
+    return emitOpError("weightScales is only meaningful with "
+                       "groupDequantAccum: without it nothing dequantizes at a "
+                       "group boundary, so the factors would go unread");
+  }
+
+  // Residency and the binding describe the same operand from two sides, so a
+  // disagreement means one of them is wrong -- and a reader has no way to tell
+  // which. Pinning them together here is what makes either one trustworthy.
+  if (auto residency = getStationarity()) {
+    auto binding = getWeightBinding();
+    switch (*residency) {
+    case Stationarity::Weight:
+      if (!binding || binding->getRole() != WeightRole::ModelWeight)
+        return emitOpError("stationarity weight means a model weight stays "
+                           "resident, so weightBinding must say role = "
+                           "model_weight");
+      break;
+    case Stationarity::KV:
+      if (!binding || binding->getRole() != WeightRole::ActivationAsWeight)
+        return emitOpError("stationarity kv means a cached K/V slice rides the "
+                           "weight path, so weightBinding must say role = "
+                           "activation_as_weight");
+      break;
+    case Stationarity::Activation:
+      // Prefill multiplies activation by activation: nothing is resident, so a
+      // weight binding would describe a path this multiply does not use.
+      if (binding)
+        return emitOpError("stationarity activation means neither operand is "
+                           "resident, so it takes no weightBinding");
+      break;
+    }
+
+    // `bIsActivation` covers two of the three cases and cannot express the
+    // third. While both exist they have to agree.
+    bool flagSaysActivation = static_cast<bool>(getBIsActivation());
+    bool residencySaysActivation = *residency != Stationarity::Weight;
+    if (flagSaysActivation != residencySaysActivation)
+      return emitOpError("bIsActivation and stationarity disagree about "
+                         "whether the second operand is an activation");
   }
 
   return success();
@@ -455,6 +668,135 @@ LogicalResult LutOp::verify() {
   if (bounded && getClipMin() && getClipMax() && *getClipMin() > *getClipMax())
     return emitOpError("clipMin must not exceed clipMax");
 
+  // The window is one triple: it says which segment of the table an input lands
+  // in, so a partial triple would address the wrong segment -- wrong numerics
+  // with nothing to report it.
+  bool anyFlp = getFlpMinExp() || getFlpMaxExp() || getFlpMantisa();
+  bool allFlp = getFlpMinExp() && getFlpMaxExp() && getFlpMantisa();
+  if (anyFlp != allFlp)
+    return emitOpError("flpMinExp, flpMaxExp and flpMantisa describe one window "
+                       "and must be given together");
+
+  // The reciprocal table is selected by this flag rather than by `kind`, so the
+  // two have to agree; 0 is the regular table and 4 the reciprocal one.
+
+  // 激活单元的映射模式只有三种取值；写别的数会一路传到 GML 而不报错。
+  if (auto mode = getActivationMode())
+    if (*mode < 0 || *mode > 2)
+      return emitOpError("activationMode is 0, 1 or 2; got ") << *mode;
+  if (auto special = getSpecialOperators()) {
+    if (*special != 0 && *special != 4)
+      return emitOpError("specialOperators is 0 (regular) or 4 (reciprocal); "
+                         "got ")
+             << *special;
+  }
+
+  // A table is 144 fp16 segments -- the 288 bytes the activation unit can
+  // address. A table of any other size is not one it can read.
+  if (auto table = getTable()) {
+    auto ty = dyn_cast<RankedTensorType>(table.getType());
+    if (!ty || !ty.hasStaticShape())
+      return emitOpError("table must have a static shape");
+    if (ty.getNumElements() != 144 || !ty.getElementType().isF16())
+      return emitOpError("table must be 144 f16 entries (288 bytes); got ")
+             << ty.getNumElements() << " x " << ty.getElementType();
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// FpsuScaleOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult FpsuScaleOp::verify() {
+  if (failed(verifyComputeUnit(getOperation(), getUnit())))
+    return failure();
+
+  auto srcTy = cast<RankedTensorType>(getSrc().getType());
+  auto biasTy = cast<RankedTensorType>(getBias().getType());
+  auto scaleTy = cast<RankedTensorType>(getScale().getType());
+
+  // Three different widths on purpose: a 32-bit bias, a 16-bit scale and an
+  // 8-bit shift. They are not interchangeable, and swapping two of them is a
+  // silent numerical error rather than a type error.
+  if (!biasTy.getElementType().isF32())
+    return emitOpError("bias must be f32; got ") << biasTy.getElementType();
+  if (scaleTy.getElementType() != srcTy.getElementType())
+    return emitOpError("scale must have the source's element type (")
+           << srcTy.getElementType() << "); got " << scaleTy.getElementType();
+
+  if (scaleTy.getShape() != biasTy.getShape())
+    return emitOpError("bias and scale must have the same shape; got ")
+           << biasTy.getShape() << " and " << scaleTy.getShape();
+
+  // A per-channel or per-group set is smaller than the tensor and broadcasts
+  // against it; one of a higher rank than the source cannot.
+  if (scaleTy.getRank() > srcTy.getRank())
+    return emitOpError("the bias/scale rank (")
+           << scaleTy.getRank() << ") exceeds the source rank ("
+           << srcTy.getRank() << ")";
+
+  // 逐通道的轴号要落在源张量的秩内：轴号越界时定标会按一个不存在的维广播。
+  // 秩为 1 时只有轴 0，而这个单元的默认轴号是 1（通道轴），对一维张量不适用，
+  // 所以只在秩大于 1 时校验。
+  FpsuSpecAttr spec = getSpec();
+  if (spec.getSpc() && srcTy.getRank() > 1) {
+    int64_t axis = spec.getSpcAxis();
+    if (axis < 0 || axis >= srcTy.getRank())
+      return emitOpError("spcAxis ")
+             << axis << " is out of range for a rank-" << srcTy.getRank()
+             << " source";
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// KantorOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult KantorOp::verify() {
+  if (failed(verifyComputeUnit(getOperation(), getUnit())))
+    return failure();
+
+  KantorMode mode = getSpec().getMode();
+
+  // The multiply modes read a second operand; the conversions do not. A
+  // float-to-fixed conversion has nothing to multiply by, and a multiply
+  // without a multiplier would produce garbage rather than fail.
+  bool multiplies = mode == KantorMode::ElementwiseMulFp16 ||
+                    mode == KantorMode::ElementwiseMulFixedPoint ||
+                    mode == KantorMode::FloatEltwiseAndScale;
+  if (multiplies && !getRhs())
+    return emitOpError("mode ")
+           << stringifyKantorMode(mode) << " requires a rhs operand";
+  if (!multiplies && getRhs())
+    return emitOpError("mode ")
+           << stringifyKantorMode(mode) << " takes no rhs operand";
+
+  // The fixed-point conversion is defined as a scaling by 2^-shift, so a
+  // conversion without the shift has no defined result -- and a lowering that
+  // spelled the shift out itself would keep compiling while ignoring whatever
+  // the IR says. Requiring it here is what makes the field load-bearing.
+  if (mode == KantorMode::Fp2IntConverter && !getShift())
+    return emitOpError(
+        "the float-to-fixed conversion needs the shift attribute; without it "
+        "the scaling is undefined and a lowering can only hardcode one");
+
+  if (auto scale = getScale()) {
+    auto ty = cast<RankedTensorType>(scale.getType());
+    if (ty.getElementType() !=
+        cast<RankedTensorType>(getLhs().getType()).getElementType())
+      return emitOpError("scale must have lhs's element type; got ")
+             << ty.getElementType();
+  }
+  if (auto bias = getBias()) {
+    auto ty = cast<RankedTensorType>(bias.getType());
+    if (!ty.getElementType().isF32())
+      return emitOpError("bias must be f32; got ") << ty.getElementType();
+  }
+
   return success();
 }
 
@@ -466,8 +808,14 @@ LogicalResult EltwiseOp::verify() {
   if (failed(verifyComputeUnit(getOperation(), getUnit())))
     return failure();
 
+  // An elementwise op combines operands, so one is not an operation -- and the
+  // accessors the rest of this dialect uses (`getLhs`, `getRhs`) would read out
+  // of bounds.
+  if (getOperands().size() < 2)
+    return emitOpError("takes at least two operands; got ")
+           << getOperands().size();
+
   auto lhsTy = cast<RankedTensorType>(getLhs().getType());
-  auto rhsTy = cast<RankedTensorType>(getRhs().getType());
   auto resTy = cast<RankedTensorType>(getResult().getType());
 
   if (lhsTy.getShape() != resTy.getShape())
@@ -475,20 +823,40 @@ LogicalResult EltwiseOp::verify() {
            << resTy.getShape() << "] must match lhs shape [" << lhsTy.getShape()
            << "]";
 
-  // `rhs` either matches `lhs` exactly or is broadcast against its trailing
-  // dimensions, which is how a per-channel factor or a bias is supplied.
-  if (rhsTy.getShape() != lhsTy.getShape()) {
-    if (rhsTy.getRank() > lhsTy.getRank())
-      return emitOpError("rhs rank ")
-             << rhsTy.getRank() << " exceeds lhs rank " << lhsTy.getRank();
-    unsigned offset = lhsTy.getRank() - rhsTy.getRank();
-    for (int64_t i = 0; i < rhsTy.getRank(); ++i) {
-      int64_t r = rhsTy.getDimSize(i), l = lhsTy.getDimSize(i + offset);
+  // Every operand after the first either matches slot 0 exactly or broadcasts
+  // against its trailing dimensions, which is how a per-channel factor, a bias,
+  // or RoPE's shared cos/sin table is supplied.
+  for (auto [slot, operand] : llvm::enumerate(getOperands().drop_front())) {
+    auto ty = cast<RankedTensorType>(operand.getType());
+    if (ty.getShape() == lhsTy.getShape())
+      continue;
+    if (ty.getRank() > lhsTy.getRank())
+      return emitOpError("operand ")
+             << (slot + 1) << " rank " << ty.getRank() << " exceeds lhs rank "
+             << lhsTy.getRank();
+    unsigned offset = lhsTy.getRank() - ty.getRank();
+    for (int64_t i = 0; i < ty.getRank(); ++i) {
+      int64_t r = ty.getDimSize(i), l = lhsTy.getDimSize(i + offset);
       if (r != l && r != 1)
-        return emitOpError("rhs shape [")
-               << rhsTy.getShape() << "] is not broadcastable against lhs shape ["
+        return emitOpError("operand ")
+               << (slot + 1) << " shape [" << ty.getShape()
+               << "] is not broadcastable against lhs shape ["
                << lhsTy.getShape() << "]";
     }
+  }
+
+  // A per-slot datapath list describes the slots, so it has to have one entry
+  // each -- a short list would silently leave the tail slots on slot 0's
+  // scaling, which is a different operation from the one written down.
+  if (auto perSlot = getPerSlotDatapath()) {
+    if (perSlot->size() != getOperands().size())
+      return emitOpError("perSlotDatapath has ")
+             << perSlot->size() << " entries for " << getOperands().size()
+             << " operands; it needs exactly one per slot";
+    for (Attribute entry : *perSlot)
+      if (!isa<DatapathAttr>(entry))
+        return emitOpError("perSlotDatapath must contain only #pim.datapath "
+                           "entries");
   }
 
   return success();
@@ -509,6 +877,82 @@ LogicalResult PoolOp::verify() {
     return emitOpError("global_average takes no window");
   if (!global && !getWindow())
     return emitOpError("windowed pooling requires a window");
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// GatherOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult GatherOp::verify() {
+  if (failed(verifyComputeUnit(getOperation(), getUnit())))
+    return failure();
+
+  auto tableTy = cast<RankedTensorType>(getTable().getType());
+  auto indicesTy = cast<RankedTensorType>(getIndices().getType());
+  auto resTy = cast<RankedTensorType>(getResult().getType());
+
+  // Indices address rows. A float index would have to be rounded somewhere, and
+  // wherever that happened would be a silent decision about which row is read.
+  if (!indicesTy.getElementType().isIntOrIndex())
+    return emitOpError("indices must be an integer type; got ")
+           << indicesTy.getElementType();
+
+  if (tableTy.getRank() < 1)
+    return emitOpError("the table needs at least one dimension to index");
+
+  // The result is the indices' shape followed by the table's row shape: one
+  // looked-up row per index.
+  SmallVector<int64_t> expected(indicesTy.getShape().begin(),
+                               indicesTy.getShape().end());
+  expected.append(tableTy.getShape().begin() + 1, tableTy.getShape().end());
+  if (resTy.getShape() != ArrayRef<int64_t>(expected))
+    return emitOpError("result shape [")
+           << resTy.getShape() << "] must be the indices shape followed by the "
+              "table's row shape, i.e. ["
+           << expected << "]";
+
+  if (resTy.getElementType() != tableTy.getElementType())
+    return emitOpError("a lookup copies rows, so the element type is the "
+                       "table's (")
+           << tableTy.getElementType() << "); got " << resTy.getElementType();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// GlobalPoolOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult GlobalPoolOp::verify() {
+  if (failed(verifyComputeUnit(getOperation(), getUnit())))
+    return failure();
+
+  auto srcTy = cast<RankedTensorType>(getSrc().getType());
+  auto resTy = cast<RankedTensorType>(getResult().getType());
+
+  int64_t groupSize = getGroupSize();
+  if (groupSize <= 0)
+    return emitOpError("groupSize must be positive; got ") << groupSize;
+
+  int64_t extent = srcTy.getShape().back();
+  if (extent % groupSize != 0)
+    return emitOpError("the reduced axis (")
+           << extent << ") is not divisible by groupSize " << groupSize;
+
+  // Each group collapses to one value and the rank is kept, so the shape is the
+  // source's with its last axis divided by the group size.
+  SmallVector<int64_t> expected(srcTy.getShape().begin(), srcTy.getShape().end());
+  expected.back() = extent / groupSize;
+  if (resTy.getShape() != ArrayRef<int64_t>(expected))
+    return emitOpError("result shape [")
+           << resTy.getShape() << "] must be [" << expected << "]";
+
+  if (resTy.getElementType() != srcTy.getElementType())
+    return emitOpError("a reduction keeps the element type; got ")
+           << srcTy.getElementType() << " in and " << resTy.getElementType()
+           << " out";
 
   return success();
 }
@@ -567,6 +1011,48 @@ LogicalResult RopeOp::verify() {
   if (cosTy.getShape() != sinTy.getShape())
     return emitOpError("cos and sin tables must have the same shape");
 
+  // Only two chains exist in the reference graph, and they use exactly these
+  // two card values: 0 (Q chain, result stays fp16 for the following dynamic
+  // quantize) and 3 (K chain, requantized on its way into the KV cache).
+  // Accepting any other integer would let a typo through as a card value the
+  // hardware has no addressing mode for -- the expansion would still run and
+  // still verify.
+  int64_t tailCard = getTailCardValue();
+  if (tailCard != 0 && tailCard != 3)
+    return emitOpError("tailCardValue must be 0 (Q chain, fp16 tail) or "
+                       "3 (K chain, requantized into the cache), got ")
+           << tailCard;
+
+  // 6 个编号定点子块，顺序固定。顺序就是语义：读回侧按位置展开，乱序会让
+  // 整块字段错位而不报错。广播是 broadcastSpec 的事，不是子块名——
+  // `Sin_Broadcast` 这种名字会让读回侧少掉一个真正的子块。
+  // 这份名单与 pim-compiler 的 contracts/gml_hw_constants.py::ROPE_UNITS 逐字
+  // 相同，改一边必须改另一边。
+  if (auto blocks = getSubBlocks()) {
+    static const char *order[] = {
+        "Llama2Activation_Add_Cos", "Llama2Activation_Add_Sin",
+        "Llama2Activation_Sin",     "Llama2Activation_Sin",
+        "Llama2Activation_Cos",     "Llama2Activation_Cos"};
+    constexpr size_t count = sizeof(order) / sizeof(order[0]);
+    if (blocks->size() != count)
+      return emitOpError("subBlocks 必须正好 ")
+             << count << " 个，收到 " << blocks->size();
+    for (auto [index, attr] : llvm::enumerate(*blocks)) {
+      auto name = dyn_cast<StringAttr>(attr);
+      if (!name || name.getValue() != order[index])
+        return emitOpError("subBlocks 顺序不对，第 ")
+               << index << " 个应为 " << order[index];
+    }
+  }
+
+  // 广播轴必须落在源张量的秩内：轴号写错时广播会静默作用到别的维上。
+  if (auto spec = getBroadcastSpec()) {
+    int64_t rank = srcTy.getRank();
+    for (int64_t axis : spec->getAxes().asArrayRef())
+      if (axis < 0 || axis >= rank)
+        return emitOpError("广播轴超出秩");
+  }
+
   return success();
 }
 
@@ -592,8 +1078,47 @@ LogicalResult NormalizeOp::verify() {
            << asSigned(getAxis()) << " is out of range for rank " << rank;
   int64_t norm = *maybeNorm;
 
-  if (getEpsilon().convertToDouble() <= 0.0)
-    return emitOpError("epsilon must be positive");
+  // RMS normalization divides by the root mean square and subtracts no mean, so
+  // there is no shift for a bias to apply. Carrying one would describe an
+  // affine step the operator does not perform.
+  if (getRmsNorm() && getBias())
+    return emitOpError("rmsNorm subtracts no mean, so it takes no bias");
+
+  // The epsilon buffer holds one value, read as fp32. A wider shape would mean
+  // a per-element epsilon, which the unit does not do.
+  if (auto eps = getEpsilon()) {
+    auto ty = cast<RankedTensorType>(eps.getType());
+    if (ty.getNumElements() != 1)
+      return emitOpError("epsilon is a single value; got ")
+             << ty.getNumElements() << " elements";
+    if (!ty.getElementType().isF32())
+      return emitOpError("epsilon is read as f32; got ")
+             << ty.getElementType();
+  }
+
+  // The scale set is per-tensor int8 with its own fp32 scale -- not the int4
+  // per-group layout the projections use. Those two paths are entirely
+  // different on the way to the graph format, and the element type is what
+  // separates them.
+  if (auto weight = getWeight()) {
+    auto ty = cast<RankedTensorType>(weight.getType());
+    if (!ty.getElementType().isInteger(8) && !ty.getElementType().isF16() &&
+        !ty.getElementType().isF32())
+      return emitOpError("the scale tensor is int8 (per-tensor) or float; got ")
+             << ty.getElementType();
+  }
+
+  // Normalization runs on the vector unit. Its carrying none of the
+  // fixed-function datapath fields is the point: filling one in would emit keys
+  // the reference graph does not have for this operator, which reads as a
+  // different node. `pim-verify-gml-contract` checks the same thing across the
+  // whole module; this catches it at the op.
+  for (StringRef forbidden : {"datapath", "fpsu", "kantor"})
+    if ((*this)->hasAttr(forbidden))
+      return emitOpError("must not carry ")
+             << forbidden
+             << ": it runs on the vector unit, and an empty datapath field set "
+                "is what says so";
 
   // Both affine parameters run along the normalized axis.
   int64_t extent = srcTy.getDimSize(norm);
@@ -761,6 +1286,55 @@ LogicalResult ParamOp::verify() {
 // TransposeOp
 //===----------------------------------------------------------------------===//
 
+// The data extension digit each element type lands on. Only these two appear
+// in the target's graphs, and the digit is a property of the type rather than
+// of any particular node -- which is why the op carries it optionally instead
+// of requiring it on every edge.
+static std::optional<int64_t> derivedDataExtension(Type elemTy) {
+  if (elemTy.isF16() || elemTy.isBF16())
+    return 3;
+  if (elemTy.isInteger(8))
+    return 1;
+  return std::nullopt;
+}
+
+LogicalResult ConvertOp::verify() {
+  auto srcTy = cast<RankedTensorType>(getSrc().getType());
+  auto resTy = cast<RankedTensorType>(getResult().getType());
+
+  for (auto [label, attr, ty] :
+       {std::tuple{"srcExtension", getSrcExtension(), srcTy},
+        std::tuple{"dstExtension", getDstExtension(), resTy}}) {
+    if (!attr)
+      continue;
+    auto derived = derivedDataExtension(ty.getElementType());
+    if (!derived)
+      return emitOpError()
+             << label << " is given, but the element type "
+             << ty.getElementType()
+             << " has no extension digit to check it against";
+    if (static_cast<int64_t>(*attr) != *derived)
+      return emitOpError()
+             << label << " is " << *attr << " but the element type "
+             << ty.getElementType() << " implies " << *derived
+             << "; a digit that disagrees with the type describes a layout no "
+                "reader can act on";
+  }
+
+  if (srcTy.getShape() != resTy.getShape())
+    return emitOpError("conversion keeps the shape; got ")
+           << srcTy.getShape() << " -> " << resTy.getShape();
+  // 两侧元素类型相同就不是一次转换。扩展位是元素类型的函数（f16→3、
+  // i8→1），类型不变时扩展位也不可能变，所以"只改扩展位"不存在。
+  if (srcTy.getElementType() == resTy.getElementType())
+    return emitOpError("both sides are ")
+           << srcTy.getElementType()
+           << ", which is not a conversion; the extension digit follows the "
+              "element type, so it cannot change on its own";
+
+  return success();
+}
+
 LogicalResult TransposeOp::verify() {
   auto srcTy = cast<RankedTensorType>(getSrc().getType());
   auto resTy = cast<RankedTensorType>(getResult().getType());
@@ -789,6 +1363,16 @@ LogicalResult TransposeOp::verify() {
       return emitOpError("result shape [")
              << resTy.getShape() << "] does not match the permutation of ["
              << srcTy.getShape() << "]";
+
+  // `onthefly` says the data needs no pass of its own, which is a claim about
+  // the layout rather than about the permutation: the two are separately
+  // checkable, and disagreeing means one of them was set by mistake.
+  if (getOnthefly() && getPurpose() &&
+      getPurpose()->getPurpose() != TransposePurpose::Absorbed)
+    return emitOpError("onthefly marks the permutation as free of a layer, but "
+                       "the purpose is ")
+           << stringifyTransposePurpose(getPurpose()->getPurpose())
+           << ", which does produce one";
 
   return success();
 }
@@ -917,6 +1501,15 @@ LogicalResult MaskOp::verify() {
            << resTy.getShape() << "] must match scores shape ["
            << scoresTy.getShape() << "]";
 
+  // The mask is **additive fp16**, not boolean: masking adds a large negative
+  // number so the following softmax drives that position to zero. An i1 mask
+  // would have to be converted somewhere, and wherever that happened would
+  // decide the masked value -- which is the numerics, not a detail.
+  auto maskElem = cast<RankedTensorType>(getMask().getType()).getElementType();
+  if (maskElem.isInteger(1))
+    return emitOpError("the mask is additive (fp16), not boolean; an i1 mask "
+                       "leaves the masked value undecided");
+
   // The mask either matches the scores exactly or broadcasts against their
   // trailing dimensions, which is how one mask covers every head.
   auto maskTy = cast<RankedTensorType>(getMask().getType());
@@ -931,6 +1524,32 @@ LogicalResult MaskOp::verify() {
       return emitOpError("mask shape [")
              << maskTy.getShape() << "] is not broadcastable against scores ["
              << scoresTy.getShape() << "]";
+  }
+
+  // The two geometries are not just different extents, and once a batch axis is
+  // 1 the shapes alone no longer say which one is meant -- hence the attribute,
+  // and hence checking it against the shape rather than trusting either alone.
+  //
+  //   vector      (decode):  one query position against the whole cache, so the
+  //                          mask is a row -- everything but the last axis is 1.
+  //   causal_tril (prefill): a square where each position sees only what
+  //                          precedes it, so the last two axes agree with the
+  //                          scores'.
+  if (maskTy.getRank() >= 2) {
+    if (getLayout() == MaskLayout::Vector) {
+      for (int64_t i = 0; i + 1 < maskTy.getRank(); ++i)
+        if (maskTy.getDimSize(i) != 1)
+          return emitOpError("layout vector masks a single query position, so "
+                             "every axis but the last is 1; got mask shape [")
+                 << maskTy.getShape() << "]";
+    } else {
+      int64_t rows = maskTy.getDimSize(maskTy.getRank() - 2);
+      int64_t cols = maskTy.getDimSize(maskTy.getRank() - 1);
+      if (rows != cols)
+        return emitOpError("layout causal_tril masks a square, so the last two "
+                           "axes agree; got mask shape [")
+               << maskTy.getShape() << "]";
+    }
   }
 
   return success();
@@ -959,6 +1578,42 @@ void KvCacheOp::getEffects(
 LogicalResult KvCacheOp::verify() {
   if (getLayer() < 0)
     return emitOpError("layer must be non-negative");
+
+  // 定标只在定点通路上成立：浮点模式下那对 scale/zp 没有含义。放在
+  // 模式分支之前——scatter 分支自己就 return，放后面对它不生效。
+  if (auto spec = getFpsuSpec())
+    if (spec->getMode() != FpsuMode::FixedPoint)
+      return emitOpError("fpsuSpec 要求 mode 为 fixed_point，收到 ")
+             << stringifyFpsuMode(spec->getMode());
+
+  // `isRead` is the older spelling of `mode = read`, kept as assembly sugar for
+  // one release. Two spellings of one fact have to agree, or a reader cannot
+  // tell which one was meant.
+  if (getIsRead() && getMode() != KvMode::Read)
+    return emitOpError("the `read` keyword and mode = ")
+           << stringifyKvMode(getMode())
+           << " disagree; the keyword is the older spelling of mode = read";
+
+  // A scatter takes its destination from the index, so the index is what makes
+  // it a scatter. A range write walks contiguous addresses and has nothing to
+  // index with -- an index here would be read by nobody.
+  // 散写是 mode 的默认值，也是最常用的写入形态。它的索引约束在这里查完
+  // 就结束，**不能提前返回**——元素类型与容量两条是所有模式共用的，散写
+  // 提前返回会让默认形态悄悄绕过它们。
+  if (getMode() == KvMode::Scatter) {
+    if (!getIndices())
+      return emitOpError("a scatter takes its destination from an index, so it "
+                         "needs an indices operand");
+    if (!getIndices().getType().getElementType().isInteger(16))
+      return emitOpError("scatter indices must be i16; a wider index would "
+                         "name a cache row the hardware cannot reach, and a "
+                         "narrower one cannot");
+  } else if (getIndices()) {
+    return emitOpError("mode = ") << stringifyKvMode(getMode())
+                                  << " walks contiguous addresses, so it has "
+                                     "nothing to index with";
+  }
+
 
   MemDescType cacheTy = getCache().getType();
   auto valueTy = cast<RankedTensorType>(getValue().getType());

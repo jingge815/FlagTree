@@ -4,6 +4,7 @@ add_triton_library(TritonPIMTransforms
   FuseActivation.cpp
   LowerPIMToEmitC.cpp
   TileToBudget.cpp
+  VerifyGmlContract.cpp
 
   DEPENDS
   TritonPIMTransformsIncGen

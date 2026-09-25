@@ -46,6 +46,13 @@ constexpr static char AttrTileWramBytesName[] = "pim.tile-wram-bytes";
 constexpr static char AttrL2BytesName[] = "pim.l2-bytes";
 // L1 budget private to one functional unit, in bytes.
 constexpr static char AttrL1BytesName[] = "pim.l1-bytes";
+// Target revision the emitted graph is written for, e.g. "1.4".
+//
+// This is the dynamic-quantization family's marker, not a statement that a node
+// is phase-shaped: 37 nodes carry it while 69 are phase-shaped, because the 32
+// softmax nodes have none. It is also not the manual's revision number -- the
+// two are different numbering schemes and must not be converted between.
+constexpr static char AttrRtlVersionName[] = "pim.rtl-version";
 
 //===----------------------------------------------------------------------===//
 // Memory resources
@@ -100,6 +107,31 @@ constexpr static int kDefaultNumDpus = 1;
 constexpr static int kDefaultWramBytes = 65536;
 constexpr static int64_t kDefaultMramBytes = 4LL * 1024 * 1024 * 1024;
 constexpr static int kDefaultDmaAlign = 8;
+
+//===----------------------------------------------------------------------===//
+// Quantization spec -> hardware block axes
+//===----------------------------------------------------------------------===//
+
+// Which hardware block a quantization decision is projected onto. The three
+// see the same decision under their own axis numbering; see
+// `deriveHardwareAxes` for the mapping.
+enum class HardwareBlock { Fpsu, Pooling, KantorA };
+
+// One block's per-channel / per-group fields. `spcAxis` and `spgAxis` are the
+// *block's* numbering, not the quantization spec's tensor axes -- the two must
+// not be mixed. -1 means the block has no such axis (-1 is what the target's
+// own field carries for the fixed-point unit, which never groups).
+struct SpcSpg {
+  bool spc;
+  int64_t spcAxis;
+  bool spg;
+  int64_t spgAxis;
+  int64_t spgGroupSize;
+};
+
+// The spc/spg `block` writes for the quantization decision `spec` describes.
+// One decision, three projections -- not three independent configurations.
+SpcSpg deriveHardwareAxes(QuantSpecAttr spec, HardwareBlock block);
 
 //===----------------------------------------------------------------------===//
 // Layout helpers

@@ -206,9 +206,9 @@ def TritonPIMExpandPhases : Pass<"pim-expand-phases", "mlir::ModuleOp"> {
     exceptions. Other operators (`pim.matmul`, `pim.normalize`, …) are left
     alone.
 
-    Each produced op carries `pim.phase-bytes` (logical buffer size in bytes)
-    so a later orchestrator can allocate L2 without re-deriving shapes. It
-    does not assign L2 offsets, Layer IDs, or Task IDs.
+    Each produced op carries `#pim.phase_spec`, whose `bytes` field is the
+    logical buffer size, so a later orchestrator can allocate L2 without
+    re-deriving shapes. It does not assign L2 offsets, Layer IDs, or Task IDs.
 
     DQ phases 1 and 2 both read phase 0 (a fan-out, not a chain). Softmax
     phase 4 reads both the exp and the reciprocal. Getting either dependency
@@ -224,6 +224,41 @@ def TritonPIMExpandPhases : Pass<"pim-expand-phases", "mlir::ModuleOp"> {
 
     becomes a four-op chain ending in a non-dynamic `pim.quantize` whose
     scale is the reciprocal of the per-group absmax.
+  }];
+
+  let dependentDialects = [
+    "mlir::triton::TritonDialect",
+    "mlir::triton::pim::TritonPIMDialect"
+  ];
+}
+
+def TritonPIMVerifyGmlContract : Pass<"pim-verify-gml-contract", "mlir::ModuleOp"> {
+  let summary = "Check the cross-attribute invariants the graph hand-off relies on";
+
+  let description = [{
+    Reads the module and fails when an invariant that spans more than one
+    attribute does not hold. It writes nothing: the graph hand-off is already
+    described by the IR, and a pass that "fixed up" a phase count would be
+    hiding the very disagreement a consumer needs to see.
+
+    What it checks:
+
+      - phase indices inside one function are unique and run `0..n-1` with no
+        gaps, so a consumer that counts phases by distinct index gets the number
+        the expansion meant;
+      - every `reads` entry names a phase that exists in the same function. The
+        attribute's own verifier already rejects a self- or forward reference --
+        that it can do without seeing the rest of the chain -- but only here is
+        the whole chain visible;
+      - dynamic quantization's phases 1 and 2 both read phase 0. They are a
+        fan-out, not a chain, and serializing them puts the reciprocal off by
+        256x: a wrong answer with nothing anywhere to report it;
+      - `pim.normalize` carries none of the fixed-function datapath fields. Its
+        empty field set *is* the semantics -- it runs on the vector unit -- and
+        filling in a default would emit keys the reference does not have.
+
+    It does not look at the tile-level symbols (`tt.dot`, `pim.dma_*`): those
+    belong to the other pipeline and are guarded by their own tests.
   }];
 
   let dependentDialects = [

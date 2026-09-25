@@ -228,11 +228,15 @@ module {
                                 %cache: !pim.memdesc<2048x8x128xf16, #pim.mram>,
                                 %pos: i32, %qkv: tensor<1x4096xf16>) {
     // CHECK: pim.mask %{{.*}}, %{{.*}} {unit = #pim.unit<vpu>}
+    %slot = arith.constant dense<[7]> : tensor<1xi16>
     %masked = pim.mask %scores, %m {unit = #pim.unit<vpu>}
         : tensor<32x1x128xf16>, tensor<1x1x128xf16> -> tensor<32x1x128xf16>
-    // CHECK: pim.kv_cache %{{.*}}, %{{.*}}, %{{.*}} {isKey, layer = 0 : i64}
-    pim.kv_cache %k, %cache, %pos {layer = 0 : i64, isKey}
-        : tensor<1x8x128xf16>, !pim.memdesc<2048x8x128xf16, #pim.mram>, i32
+    // A scatter takes its destination from the index, so the index is not
+    // optional in that mode -- which is the default, because a cache write
+    // during decoding lands wherever the step counter says.
+    // CHECK: pim.kv_cache %{{.*}}, %{{.*}}, %{{.*}}[%{{.*}}] {isKey, layer = 0 : i64}
+    pim.kv_cache %k, %cache, %pos[%slot] {layer = 0 : i64, isKey}
+        : tensor<1x8x128xf16>, !pim.memdesc<2048x8x128xf16, #pim.mram>, i32 [tensor<1xi16>]
     // CHECK: pim.split_heads %{{.*}} {axis = 1 : i64, numHeads = 32 : i64}
     %h:32 = pim.split_heads %qkv {axis = 1 : i64, numHeads = 32 : i64}
         : tensor<1x4096xf16> -> tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>, tensor<1x128xf16>

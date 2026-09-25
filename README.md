@@ -23,10 +23,11 @@ flagtree 是 flagOS 存算一体编译器体系中的**算子编译器核心模�
 4. **WRAM 预算感知切分（`pim-tile-to-budget`）**：为线性算子推断/校正 full M/N/K（可从真实 launch 参数经 `full-m/n/k` 覆盖），搜索能装进 WRAM 的 tile，写出 `pim.tile-*` 供下游 lowering 与成本模型使用。
 5. **GML 图生成支撑（算子级算子集）**：`pim.matmul/conv/eltwise/lut/pool/quantize/dequantize/reduce_axis/rope/normalize/softmax` 等计算算子，`pim.buffer_alloc/buffer_copy/decompress_weight/param/transpose/reshape/split/concat/mask/kv_cache/split_heads` 等结构与数据算子；`#pim.datapath`、`#pim.quant_spec`、`#pim.kantor_block`、`#pim.act_spec`、`#pim.pool_spec` 等描述硬件配置。
 6. **图交接融合（`pim-fuse-activation`）**：把 `pim.lut`（及尾随 `pim.pool`）折进 `pim.matmul/conv/eltwise` 的 `activation`/`fusedPool` 属性——目标图格式只允许激活内嵌在生产者节点中，不融合即不可表达。
-7. **相位展开（`pim-expand-phases`）**：将不透明算子展开为硬件相位链：`pim.quantize` 动态量化 → 4 相（absmax/identity-scale/reciprocal/fp2int），`pim.softmax` → 5 相，`pim.rope` → 3 相；每个相位写 `pim.phase-bytes`。
-8. **EmitC/NumPy 可执行产物（`pim-lower-to-emitc`）**：单 DPU、任意 `pim.num-tasklets >= 1`，按 tasklet 数将 `tt.dot` 的 M 维拆成静态展开的行块，降为 `emitc.*`，经 `-convert-func-to-emitc` / `mlir-translate --mlir-to-cpp` 生成纯 C（供 `opcompiler_bridge/driver.py` 执行）。
-9. **Python / 后端接入**：`python/src/passes.cc` 暴露 `passes.pim.add_convert_to_pim/add_tile_to_budget/add_explicit_dma`；`python/triton/backends/pim_sidecar.py` 在 NVIDIA 后端 `make_ttir()` 末尾按需旁路生成 PIM IR；`bin/RegisterTritonDialects.h` 向 `triton-opt` 注册方言与 pass。
-10. **PIM 目标校验放宽**：`lib/Dialect/Triton/IR/Traits.cpp::verifyTensorSize` 对带 `pim.target` 的模块取消“元素数必须为 2 的幂”限制（模型维度如 llama2 MLP 11008），其他后端行为不变。
+7. **相位展开（`pim-expand-phases`）**：将不透明算子展开为硬件相位链：`pim.quantize` 动态量化 → 4 相（分组 absmax / 恒等表 / 倒数表 / 浮点转定点），`pim.softmax` → 5 相，`pim.rope` → 3 相。每相的结构化配置写成 ODS 属性：相位号、逻辑缓冲字节、引擎与相位间依赖在 `#pim.phase_spec`，定标通路在 `#pim.fpsu_spec`，逐元素乘与格式转换在 `#pim.kantor_spec`，查表窗口在 `pim.lut` 自身。每相还标出它跑在哪个硬件子块（`fpsu` / `kantor` / `pooling` / `activation` / `combiner`），不再统称 `cstl`——统称会让成本抽取分不出遍历类型。K 路 RoPE 的量化尾另盖 `#pim.contraction<form = flat>`。
+8. **跨属性不变量校验（`pim-verify-gml-contract`）**：只读 pass，查单个 verifier 看不到的一致性——相位数在同一函数内唯一且从 0 连续、动态量化的相 1 与相 2 都读相 0（写成串行链会让倒数错 256 倍）、`pim.normalize` 不得携带定点/池化数据通路字段。
+9. **EmitC/NumPy 可执行产物（`pim-lower-to-emitc`）**：两条入口。**tile 级**：单 DPU、任意 `pim.num-tasklets >= 1`，按 tasklet 数将 `tt.dot` 的 M 维拆成静态展开的行块。**算子级**：图编译器发的整算子级 IR（展开后的相位链）没有 DMA，按整张量降级——张量实参变裸指针、末尾追加一个输出指针（无人读的实参不占形参），逐算子发循环与查表。两条都经 `-convert-func-to-emitc` / `mlir-translate --mlir-to-cpp` 生成纯 C（供 `opcompiler_bridge/driver.py` 执行）。未识别的**算子级** `pim.*` 直接报错：静默跳过会让生成的 C 算成另一个函数，而 numpy 镜像『对上了』只是因为两边错得一样。
+10. **Python / 后端接入**：`python/src/passes.cc` 暴露 `passes.pim.add_convert_to_pim/add_tile_to_budget/add_explicit_dma/add_fuse_activation/add_expand_phases/add_verify_gml_contract`；`python/triton/backends/pim_sidecar.py` 在 NVIDIA 后端 `make_ttir()` 末尾按需旁路生成 PIM IR；`bin/RegisterTritonDialects.h` 向 `triton-opt` 注册方言与 pass。
+11. **PIM 目标校验放宽**：`lib/Dialect/Triton/IR/Traits.cpp::verifyTensorSize` 对带 `pim.target` 的模块取消“元素数必须为 2 的幂”限制（模型维度如 llama2 MLP 11008），其他后端行为不变。
 
 ## 3. 目录结构索引
 
@@ -41,14 +42,14 @@ flagtree 是 flagOS 存算一体编译器体系中的**算子编译器核心模�
 | 【核心模块】 | include/triton | Dialect/TritonPIM | PIM 方言/类型/属性/算子与 pass 的 TableGen 声明 | `IR/PIMDialect.td`、`IR/PIMOps.td`、`IR/PIMAttrDefs.td`、`IR/PIMTypes.td`、`IR/Dialect.h`、`Transforms/Passes.td` | 查 PIM IR 长什么样、属性/算子名、pass 选项 |
 | 【核心模块】 | include/triton | Conversion/TritonToTritonPIM | `convert-triton-to-pim` pass 声明与选项 | `Passes.h`、`Passes.td` | 查转换 pass 选项（target/num-dpus/num-tasklets/wram-bytes 等） |
 | 【核心模块】 | lib/Dialect | TritonPIM/IR | 方言实现：verifier、布局推导、类型/属性解析打印 | `Dialect.cpp`、`Ops.cpp`、`Types.cpp` | 算子 verifier 报错、layout 推导、memdesc 尺寸计算 |
-| 【核心模块】 | lib/Dialect | TritonPIM/Transforms | 5 个 PIM lowering pass 的完整实现 | `ExplicitDMA.cpp`（隐式访存→DMA）、`TileToBudget.cpp`（切 tile）、`FuseActivation.cpp`、`ExpandPhases.cpp`、`LowerPIMToEmitC.cpp` | 查算子 lowering、DMA 改写、tiling、相位、EmitC 生成 |
+| 【核心模块】 | lib/Dialect | TritonPIM/Transforms | 6 个 PIM pass 的完整实现 | `ExplicitDMA.cpp`（隐式访存→DMA）、`TileToBudget.cpp`（切 tile）、`FuseActivation.cpp`、`ExpandPhases.cpp`、`VerifyGmlContract.cpp`、`LowerPIMToEmitC.cpp`（tile 级 `tt.dot` 与算子级整张量两条降级） | 查算子 lowering、DMA 改写、tiling、相位、EmitC 生成 |
 | 【核心模块】 | lib/Conversion | TritonToTritonPIM | TTIR→PIM 类型转换器、合法性与 pattern | `TritonToTritonPIMPass.cpp`、`TritonPIMConversion.cpp` | 查类型/布局转换规则、pattern 注册 |
 | 【核心模块】 | bin | —（无二级目录） | `triton-opt` 等工具的方言/pass 注册 | `RegisterTritonDialects.h`、`CMakeLists.txt`、`triton-opt.cpp` | 报 “no registered dialect/pass”、新增 pass 注册 |
 | 【核心模块】 | python/src | —（无二级目录） | Python 侧 IR/pass 绑定 | `passes.cc`（`passes.pim.*`）、`ir.cc`（方言加载、`ModuleOp.clone`） | 查 Python 调用 PIM pass 的入口/参数 |
 | 【核心模块】 | python/triton | backends | PIM sidecar 旁路输出 | `pim_sidecar.py`、`compiler.py`、`driver.py` | 查 `.pimir` 生成流程、`FLAGTREE_*` 环境变量 |
 | 【核心模块】 | third_party/nvidia | backend | NVIDIA 编译入口挂载 sidecar | `backend/compiler.py`（`make_ttir` 末尾调用 `emit_pim_ir`） | 查 GPU 编译与 PIM 旁路的衔接点 |
 | 【核心模块】 | lib/Dialect | Triton/IR | Triton 公共 verifier（PIM 放宽 2 的幂限制） | `Traits.cpp`（`verifyTensorSize`/`isPIMModule`） | 查非 2 的幂 shape 报错与 PIM 例外 |
-| 【测试用例】 | test/Dialect | TritonPIM | PIM 方言/pass 的 lit 测试（输入输出对照） | `ops.mlir`、`explicit_dma.mlir`、`tile_to_budget_*.mlir`、`lower_to_emitc*.mlir`、`operator_ops*.mlir`、`operator_shape_ops.mlir`、`fuse_activation.mlir`、`expand_phases*.mlir`、`tensor_size_pim.mlir` | 验证行为边界、抄 lit 命令 |
+| 【测试用例】 | test/Dialect | TritonPIM | PIM 方言/pass 的 lit 测试（输入输出对照） | `ops.mlir`、`explicit_dma.mlir`、`tile_to_budget_*.mlir`、`lower_to_emitc*.mlir`、`operator_ops*.mlir`、`operator_shape_ops.mlir`、`fuse_activation.mlir`、`expand_phases*.mlir`、`phase_spec*.mlir`、`verify_gml_contract.mlir`、`tensor_size_pim.mlir` | 验证行为边界、抄 lit 命令 |
 | 【测试用例】 | test/Conversion | —（无二级目录） | TTIR→PIM 转换测试 | `triton_to_pim.mlir` | 查布局转换期望结果 |
 | 【备查】 | docs | —（无二级目录，PIM 部分） | PIM 实现技术文档（架构/文件/问题清单） | `triton-pim-support-20260818.md` | 快速理解 PIM 设计与现状 |
 
@@ -151,7 +152,7 @@ TRITON_OPT=$TRITON_BUILD_DIR/bin/triton-opt
 $TRITON_OPT test/Dialect/TritonPIM/ops.mlir -pim-explicit-dma
 $TRITON_OPT in.mlir -convert-triton-to-pim='target=pim:v1 num-tasklets=16 wram-bytes=65536' \
   -pim-tile-to-budget -pim-explicit-dma          # 顺序：tile-to-budget 必须在 explicit-dma 之前
-$TRITON_OPT in.mlir -pim-fuse-activation -pim-expand-phases
+$TRITON_OPT in.mlir -pim-fuse-activation -pim-expand-phases -pim-verify-gml-contract
 $TRITON_OPT in.mlir -pim-lower-to-emitc -convert-func-to-emitc   # 再接 mlir-translate --mlir-to-cpp
 
 # lit 测试（含 test/Dialect/TritonPIM/*），在源码目录执行

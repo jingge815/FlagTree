@@ -8,7 +8,7 @@ module {
   tt.func @dq_not_per_group(%x: tensor<1x16xf16>, %s: tensor<1xf16>) {
     // expected-error @+1 {{dynamic quantize expansion requires a per_group spec}}
     %q = pim.quantize %x, %s
-       {dynamic, spec = #pim.quant_spec<granularity = per_tensor>}
+       {dynamic, spec = #pim.quant_spec<granularity = per_tensor, spc = false>}
        : tensor<1x16xf16>, tensor<1xf16> -> tensor<1x16xi8>
     tt.return
   }

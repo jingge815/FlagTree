@@ -7,7 +7,9 @@
 module {
   tt.func @matmul_lut(%a: tensor<128x512xi8>, %b: tensor<512x256xi8>,
                       %o: tensor<128x256x!tt.ptr<i8>>) {
-    // CHECK: pim.matmul{{.*}}activation = #pim.act_spec<kind = silu>
+    // 融合同时写下两样：`activation` 记录折了什么，`contraction` 记录图格式
+    // 怎么写它。表体与窗口留在主算子上——嵌套块只给融合命名，不重述数据通路。
+    // CHECK: pim.matmul{{.*}}activation = #pim.act_spec<kind = silu>{{.*}}contraction = #pim.contraction<form = named, blockName = "fused_Silu_act", innerOp = "Lut", actKind = "Silu">
     // CHECK-NOT: pim.lut
     %m = pim.matmul %a, %b
        {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>}
@@ -137,27 +139,6 @@ module {
 
 // -----
 
-// A table is data, and an attribute has nowhere to put an SSA value.
-// CHECK-LABEL: @table_operand_blocks_fusion
-module {
-  tt.func @table_operand_blocks_fusion(%a: tensor<128x512xi8>, %b: tensor<512x256xi8>,
-                                       %t: tensor<128xf16>,
-                                       %o: tensor<128x256x!tt.ptr<i8>>) {
-    // CHECK: pim.matmul
-    // CHECK-NOT: activation
-    // CHECK: pim.lut %{{.*}}, %{{.*}}
-    %m = pim.matmul %a, %b
-       {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>}
-       : tensor<128x512xi8>, tensor<512x256xi8> -> tensor<128x256xi8>
-    %y = pim.lut %m, %t {kind = #pim.activation<silu>}
-       : tensor<128x256xi8>, tensor<128xf16> -> tensor<128x256xi8>
-    tt.store %o, %y : tensor<128x256x!tt.ptr<i8>>
-    tt.return
-  }
-}
-
-// -----
-
 // Only matmul/conv/eltwise nodes can hold an activation.
 // CHECK-LABEL: @non_fusable_producer
 module {
@@ -197,6 +178,67 @@ module {
         window = #pim.window<kernel = [3, 3], strides = [2, 2],
                              pads = [1, 1, 1, 1], dilations = [1, 1]>}
        : tensor<1x64x112x112xi8> -> tensor<1x64x56x56xi8>
+    tt.return
+  }
+}
+
+// -----
+
+// `silu` folds into the gate projection, and the gate projection is a matmul.
+// Folding it into an elementwise producer would put a `fused_Silu_act`
+// contraction on a node the graph format never carries one on -- a nested block
+// the other side's parser reads as a different operator.
+// CHECK-LABEL: @eltwise_keeps_silu_separate
+module {
+  tt.func @eltwise_keeps_silu_separate(%a: tensor<4x8xi8>, %b: tensor<4x8xi8>) {
+    // CHECK: pim.eltwise
+    // CHECK-NOT: contraction
+    // CHECK: pim.lut
+    // CHECK: kind = #pim.activation<silu>
+    %s = pim.eltwise %a, %b
+       {kind = #pim.eltwise<add>,
+        datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>}
+       : tensor<4x8xi8>, tensor<4x8xi8> -> tensor<4x8xi8>
+    %y = pim.lut %s {kind = #pim.activation<silu>}
+       : tensor<4x8xi8> -> tensor<4x8xi8>
+    tt.return
+  }
+}
+
+// -----
+
+// A table folds too. The table is data, so it cannot live in an attribute: it
+// moves onto the producer, which is where the target format keeps the gate
+// projection's table -- the nested contraction block names the fusion, it does
+// not restate the datapath.
+// CHECK-LABEL: @matmul_lut_with_table
+module {
+  tt.func @matmul_lut_with_table(%a: tensor<128x512xi8>, %b: tensor<512x256xi8>,
+                                 %t: tensor<144xf16>,
+                                 %o: tensor<128x256x!tt.ptr<i8>>) {
+    // CHECK: pim.matmul {{.*}} lut {{.*}}activation = #pim.act_spec<kind = silu>{{.*}}contraction = #pim.contraction<form = named, blockName = "fused_Silu_act"
+    // CHECK-NOT: pim.lut
+    %m = pim.matmul %a, %b
+       {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>}
+       : tensor<128x512xi8>, tensor<512x256xi8> -> tensor<128x256xi8>
+    %y = pim.lut %m, %t {kind = #pim.activation<silu>}
+       : tensor<128x256xi8>, tensor<144xf16> -> tensor<128x256xi8>
+    tt.store %o, %y : tensor<128x256x!tt.ptr<i8>>
+    tt.return
+  }
+}
+
+
+// -----
+
+// rsqrt 属于 RMSNorm，不折进主算子——折了 RMSNorm 就不再是独立节点。
+// CHECK-LABEL: @rsqrt_stays_separate
+module {
+  tt.func @rsqrt_stays_separate(%a: tensor<4x8xf16>, %b: tensor<8x4xf16>) {
+    %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>} : tensor<4x8xf16>, tensor<8x4xf16> -> tensor<4x4xf16>
+    // CHECK: pim.lut
+    // CHECK-NOT: contraction
+    %y = pim.lut %m {kind = #pim.activation<rsqrt>} : tensor<4x4xf16> -> tensor<4x4xf16>
     tt.return
   }
 }

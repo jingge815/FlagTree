@@ -138,6 +138,16 @@ void init_triton_passes_pim(py::module &&m) {
         py::arg("mram_bytes") = 4294967296LL, py::arg("dma_align") = 8,
         py::arg("enable_source_remat") = false);
   ADD_PASS_WRAPPER_0("add_explicit_dma", pim::createTritonPIMExplicitDMA);
+  // The operator-level pipeline: fuse, then expand into phases, then check the
+  // invariants that span more than one attribute. The graph compiler drives
+  // these through `triton-opt` rather than in-process, so the wrappers are for
+  // debugging and for callers that already hold a ModuleOp.
+  ADD_PASS_WRAPPER_0("add_fuse_activation", pim::createTritonPIMFuseActivation);
+  ADD_PASS_WRAPPER_0("add_expand_phases", pim::createTritonPIMExpandPhases);
+  ADD_PASS_WRAPPER_0("add_verify_gml_contract",
+                     pim::createTritonPIMVerifyGmlContract);
+  // B 路走到 C 的唯一出口，缺了它调用方只能起子进程。
+  ADD_PASS_WRAPPER_0("add_lower_to_emitc", pim::createTritonPIMLowerToEmitC);
   // full_m/full_n/full_k default to -1 ("not supplied", fall back to
   // structural IR inference) -- see TileToBudget.cpp's inferFullShape for
   // why a caller with the real launch-site M/N/K (e.g. genesim_bridge,
