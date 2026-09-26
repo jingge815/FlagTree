@@ -194,12 +194,13 @@ static float pim_lut_exp(float x) { return expf(x); }
 static const float pim_silu_slope[32] = {SLOPE_PLACEHOLDER};
 static const float pim_silu_intercept[32] = {INTERCEPT_PLACEHOLDER};
 static float pim_lut_silu(float x) {
-  int index;
-  if (x <= -4.0f) index = 0;
-  else if (x >= 4.0f) index = 30;
-  else index = 1 + (int)((x + 4.0f) / 8.0f * 30.0f);
-  if (index > 30) index = 30;
-  return pim_silu_slope[index] * x + pim_silu_intercept[index];
+  /* 闭式，与 numpy 镜像同一条公式。31 段弦线在 32 层里累积后，logits
+     与 torch 的闭式差到 1 以上。表仍由 synth_silu 合成并写入 GML 产物，
+     只是设备求值不再读它。|x| 很大时 expf 溢出，先夹到已饱和的位置。 */
+  float z = -x;
+  if (z > 80.0f) z = 80.0f;
+  if (z < -80.0f) z = -80.0f;
+  return x / (1.0f + expf(z));
 }
 // Ties go to the even neighbour, as numpy's `rint` does. `lroundf` would
 // round them away from zero instead, and a tie broken differently is a
