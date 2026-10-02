@@ -86,8 +86,82 @@ def TTPIM_TaskletTiledEncodingAttr
       if (remaining > 1)
         taskletsPerDpu[order[rank - 1]] *= remaining;
 
-      // Kernels are single-DPU by construction; see the note above.
+      // `numDpus` here is how many DPUs the *device* has, not how many hold
+      // this tensor -- the conversion pass gets it from `-num-dpus`, a hardware
+      // parameter. Writing it into `dpusPerDevice` would claim every tensor is
+      // split that many ways, which is false for the replicated ones. The
+      // cross-DPU split is a graph-level decision and arrives through the
+      // placement-aware builder below.
       (void)numDpus;
+
+      return $_get(context, sizePerTasklet, taskletsPerDpu, dpusPerDevice,
+                   order);
+    }]>,
+    // Same tasklet distribution, but with the cross-DPU split filled in from a
+    // graph-level placement decision. This is the writing point `dpusPerDevice`
+    // never had: the builder above cannot supply one (its `numDpus` is a
+    // hardware count), so before this existed no FlagTree code path could
+    // produce a non-all-ones value and the field was reachable only by hand.
+    //
+    // Only `shard` marks an axis. `replicate` and `partial` leave all ones:
+    // every DPU holds the whole shape, so no axis of *this tensor* is split.
+    // That is also why the count cannot be recovered from the encoding alone,
+    // and why `#pim.placement` carries it separately.
+    AttrBuilder<(ins "ArrayRef<int64_t>":$shape,
+                     "ArrayRef<unsigned>":$sizePerTasklet,
+                     "ArrayRef<unsigned>":$order,
+                     "unsigned":$numTasklets,
+                     "::mlir::triton::pim::PlacementSpecAttr":$placement), [{
+      // `order` arrives as an ArrayRef, which cannot be reassigned; the layout
+      // override below may replace it, so keep a copy.
+      ::llvm::SmallVector<unsigned> orderStorage(order.begin(), order.end());
+      // Same tasklet distribution as the builder above. Duplicated rather than
+      // delegated because `$_get` resolves to a builder, not to the storage
+      // constructor, so calling it here would recurse into the wrong overload.
+      unsigned rank = sizePerTasklet.size();
+      SmallVector<unsigned, 4> taskletsPerDpu(rank, 1);
+      SmallVector<unsigned, 4> dpusPerDevice(rank, 1);
+
+      unsigned remaining = numTasklets;
+      for (unsigned d = 0; d < rank && remaining > 1; ++d) {
+        unsigned i = order[d];
+        unsigned avail = std::max<unsigned>(
+            1, (unsigned)shape[i] / std::max<unsigned>(1, sizePerTasklet[i]));
+        taskletsPerDpu[i] = std::clamp<unsigned>(remaining, 1, avail);
+        remaining /= taskletsPerDpu[i];
+      }
+      if (remaining > 1)
+        taskletsPerDpu[order[rank - 1]] *= remaining;
+
+      // The one line the other builder cannot write.
+      if (placement &&
+          placement.getKind() == ::mlir::triton::pim::PlacementKind::Shard) {
+        int64_t dim = placement.getDim();
+        // `dim` is indexed from the outside and applied to every tensor with
+        // rank > dim, so a kernel holding tensors of several ranks gets the
+        // split on a different physical axis per rank (`[1, 2]` for rank 2,
+        // `[1, 2, 1]` for rank 3). The graph compiler states it in its own
+        // kernel coordinates (rank 2, see `_A_PATH_TENSOR_RANK`), which is why
+        // `verifyAgreesWith` compares only the split WIDTH and not the axis --
+        // see `placement_to_layout.mlir`'s mixed-rank block, which pins this.
+        // Out-of-range leaves all ones; the attribute's own verifier is what
+        // reports it, so this builder does not need a second diagnostic.
+        if (dim >= 0 && (unsigned)dim < rank)
+          dpusPerDevice[dim] = (unsigned)placement.getNumDpus();
+      }
+
+      // A stated layout reorders the tensor: the graph compiler's
+      // `elem_strides` say which axis is innermost, and that is exactly what
+      // `order` means here. It changes which axis the tasklets walk, and so
+      // which stride `-pim-explicit-dma` proves for the transfer. An omitted
+      // order keeps the row-major default, so nothing changes for a module
+      // that does not state one.
+      if (placement && placement.getOrder()) {
+        auto stated = placement.getOrder().asArrayRef();
+        if (stated.size() == rank)
+          orderStorage.assign(stated.begin(), stated.end());
+      }
+      order = orderStorage;
 
       return $_get(context, sizePerTasklet, taskletsPerDpu, dpusPerDevice,
                    order);
@@ -1236,6 +1310,133 @@ def TTPIM_KvMode : I32EnumAttr<"KvMode",
 def TTPIM_KvModeAttr
     : EnumAttr<TritonPIM_Dialect, TTPIM_KvMode, "kv_mode"> {
   let assemblyFormat = "`<` $value `>`";
+}
+
+//===----------------------------------------------------------------------===//
+// Placement
+//===----------------------------------------------------------------------===//
+//
+// Which DPUs hold a tensor, and in what relationship to the whole. This is the
+// cross-DPU half of the Placement dimension; `#pim.tasklet_tiled`'s
+// `dpusPerDevice` is the per-axis arithmetic, and the two must agree
+// (`verifyAgreesWith` below).
+//
+// Why a separate attribute rather than more fields on the layout encoding: the
+// layout encoding describes *one tensor's axes*, and `dpusPerDevice` can only
+// say "this axis is spread over N DPUs". It cannot distinguish a tensor that is
+// replicated on every DPU from one that lives on a single DPU -- both are
+// all-ones -- and it has nowhere to put the reduction that a partial result
+// still owes. Those are exactly the cases a tensor-parallel graph compiler
+// produces, so they need somewhere to live.
+
+def TTPIM_PlaceShard     : I32EnumAttrCase<"Shard",     0, "shard">;
+def TTPIM_PlaceReplicate : I32EnumAttrCase<"Replicate", 1, "replicate">;
+def TTPIM_PlacePartial   : I32EnumAttrCase<"Partial",   2, "partial">;
+
+def TTPIM_PlacementKind : I32EnumAttr<"PlacementKind",
+  "How a tensor's elements are distributed over the DPUs that hold it", [
+    TTPIM_PlaceShard, TTPIM_PlaceReplicate, TTPIM_PlacePartial
+  ]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::triton::pim";
+}
+
+// How the DPU-local pieces of a Partial tensor combine into the whole.
+// Only `sum` and `mean` occur: these are the reductions a tensor-parallel split
+// of a contraction leaves behind. `max` is deliberately absent -- a sharded
+// softmax max is a `pim.reduce_axis` in the graph, not an owed combination.
+// `none` is a real case, not padding: Shard and Replicate owe no reduction, and
+// an enum that cannot say so would force an optional-attribute parameter whose
+// assembly form (`reduce = #pim.partial_reduce<sum>`) is far noisier than the
+// rest of this attribute's `key = value` syntax.
+def TTPIM_PartialNone : I32EnumAttrCase<"None", 0, "none">;
+def TTPIM_PartialSum  : I32EnumAttrCase<"Sum",  1, "sum">;
+def TTPIM_PartialMean : I32EnumAttrCase<"Mean", 2, "mean">;
+
+def TTPIM_PartialReduce : I32EnumAttr<"PartialReduce",
+  "Reduction a Partial placement still owes before its value is whole", [
+    TTPIM_PartialNone, TTPIM_PartialSum, TTPIM_PartialMean
+  ]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::mlir::triton::pim";
+}
+
+def TTPIM_PlacementSpecAttr : TritonPIM_Attr<"PlacementSpec", "placement"> {
+  let mnemonic = "placement";
+
+  let description = [{
+    Where a tensor lives across DPUs, as decided by the graph-level compiler.
+
+    An operator kernel only ever addresses its own DPU, so this attribute does
+    not change what a kernel computes. It is here because the graph compiler is
+    the only party that knows the decision, and the passes that size tiles and
+    cost DMA need it: a tensor split over `numDpus` DPUs presents `1/numDpus` of
+    its global bytes to each one, and sizing against the global shape overcounts
+    by exactly that factor.
+
+      - `shard`: `dim` is split across `numDpus` DPUs. `dim` must be a valid axis
+        and `reduce` must be absent -- a sharded tensor owes nothing.
+      - `replicate`: every DPU holds the whole tensor. `dim` and `reduce` must
+        both be absent; `numDpus` is how many copies exist.
+      - `partial`: each DPU holds a partial value over the whole shape, and
+        `reduce` says how they combine. `dim` must be absent -- the split is
+        over the contraction that produced it, not over an axis of the result.
+
+    `dpuIds` is optional and lists exactly which DPUs participate. Omitted means
+    "the first `numDpus`", which is the common case; a pipeline-parallel stage
+    that owns DPUs 4..7 needs the explicit form. When present its length must
+    equal `numDpus`, because a list that disagrees with the count would leave two
+    answers to "how many DPUs" with nothing to say which is right.
+
+    `stage` is the pipeline-parallel stage that owns this tensor; 0 when there is
+    no pipelining. It is carried rather than derived because the DPU ids alone do
+    not determine it -- two stages can own disjoint DPU sets of the same size.
+
+    Examples:
+
+    ```mlir
+    #pim.placement<kind = shard, dim = 1, numDpus = 2>
+    #pim.placement<kind = replicate, numDpus = 4>
+    #pim.placement<kind = partial, numDpus = 2, reduce = sum>
+    #pim.placement<kind = shard, dim = 0, numDpus = 2, dpuIds = [4, 5], stage = 1>
+    #pim.placement<kind = shard, dim = 1, numDpus = 2, order = [0, 1]>
+    ```
+
+    `order` is the layout of the tensor, fastest-changing axis first. Omitted
+    means "not stated", which the encoding builders treat as row-major, so a
+    module that says nothing about layout converts exactly as before.
+  }];
+
+  let parameters = (ins
+    EnumParameter<TTPIM_PlacementKind>:$kind,
+    DefaultValuedParameter<"int64_t", "-1">:$dim,
+    DefaultValuedParameter<"int64_t", "1">:$numDpus,
+    DefaultValuedParameter<
+        "::mlir::triton::pim::PartialReduce",
+        "::mlir::triton::pim::PartialReduce::None">:$reduce,
+    OptionalParameter<"::mlir::DenseI64ArrayAttr">:$dpuIds,
+    DefaultValuedParameter<"int64_t", "0">:$stage,
+    // 排布的维序，最内层在前。空表示「未声明」，按行主序处理 ——
+    // 不声明与声明行主序产出的编码逐字节相同。
+    OptionalParameter<"::mlir::DenseI64ArrayAttr">:$order,
+    // 这块张量在 MRAM 里的起始字节。0 表示从基址起，不另加偏移。
+    DefaultValuedParameter<"int64_t", "0">:$mramOffset,
+    // 逐分片的额外对齐字节数，必须是 2 的幂。0 表示没有额外要求。
+    DefaultValuedParameter<"int64_t", "0">:$alignBytes
+  );
+
+  let extraClassDeclaration = [{
+    // The DPU ids this placement covers, explicit list or implied 0..numDpus-1.
+    ::llvm::SmallVector<int64_t> resolvedDpuIds() const;
+    // Whether this placement and a tensor layout encoding describe the same
+    // cross-DPU split. Reports an error through `emitError` when they do not.
+    ::mlir::LogicalResult verifyAgreesWith(
+        ::llvm::function_ref<::mlir::InFlightDiagnostic()> emitError,
+        ::mlir::triton::pim::TaskletTiledEncodingAttr enc) const;
+  }];
+
+  let assemblyFormat = "`<` struct(params) `>`";
+  let genVerifyDecl = 1;
 }
 
 #endif // TRITONPIM_ATTRDEFS

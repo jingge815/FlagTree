@@ -56,13 +56,21 @@ module {
 }
 
 // The front-end tile here is the whole (untiled) M=8/N=4/K=16 -- no `scf.for`
-// at all, unlike the other fixtures. `wram-bytes=32`/`dma-align=8` forces a
-// tile that fits in only 24 bytes (2*2*2 + 2*2*2 + 2*2*2), which needs all
-// three dimensions shrunk to 2.
-// OK-DAG: "pim.tile-m" = 2 : i64
+// at all, unlike the other fixtures. `wram-bytes=32`/`dma-align=8` forces the
+// tile right down.
+//
+// The three staged buffers are not all the same width: x and w hold f16
+// operands, `out` holds the f32 accumulator (see `bytesFor`). So a tile costs
+// (m*k + n*k)*2 + m*n*4, and only tiles of 8 elements fit the 32-byte WRAM:
+// 2x2x2 (8+8+16) and 1x2x4 (8+16+8) both total exactly 32, and all three
+// buffers stay 8-byte aligned in each. They tie on element count, so the
+// search's stated preference order decides -- larger K first:
+//   std::tuple(k, n, m) > std::tuple(best->k, best->n, best->m)
+// which picks 1x2x4 (k=4) over 2x2x2 (k=2).
+// OK-DAG: "pim.tile-m" = 1 : i64
 // OK-DAG: "pim.tile-n" = 2 : i64
-// OK-DAG: "pim.tile-k" = 2 : i64
-// OK-DAG: "pim.tile-wram-bytes" = 24 : i64
+// OK-DAG: "pim.tile-k" = 4 : i64
+// OK-DAG: "pim.tile-wram-bytes" = 32 : i64
 // The rewrite must introduce a real M-tile loop (there was none before) --
 // this is the one thing that distinguishes M-splitting from the N/K-only
 // path the other fixtures cover.

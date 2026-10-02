@@ -35,6 +35,36 @@ constexpr static char AttrMramBytesName[] = "pim.mram-bytes";
 constexpr static char AttrDmaAlignName[] = "pim.dma-align";
 // Target string, e.g. "pim:v1".
 constexpr static char AttrTargetName[] = "pim.target";
+// The graph compiler's cross-DPU placement for this kernel's tensors. Written by
+// the graph compiler (it is the only party that knows the sharding decision),
+// read by `convert-triton-to-pim` and by the tile/DMA passes downstream.
+// Absent means single-DPU.
+constexpr static char AttrPlacementName[] = "pim.placement";
+// Per-DPU MRAM this operator occupies. The shapes reaching `pim-tile-to-budget`
+// are already one DPU's share, so this is NOT the global footprint divided by
+// the split -- an earlier version did that and loosened the budget by exactly
+// the split factor. Written back by that pass: the graph compiler decides the
+// split, but only the pass knows the footprint, because only it resolves the
+// tile. Read by the GeneSim cost model and the memory planner.
+constexpr static char AttrPlacedMramBytesName[] = "pim.placed-mram-bytes";
+// The split width `pim-tile-to-budget` actually saw on the module, not a divisor
+// it applied (it divides nothing; see above). The placement states the intent;
+// this states what the pass saw, so the two can be compared instead of assumed
+// equal. A pattern that drops the placement leaves this at 1 while the intent
+// still says N, which is the drift a consumer needs to be able to detect.
+constexpr static char AttrPlacedShardsName[] = "pim.placed-shards";
+// Bytes set aside on each DPU to stage an incoming piece of a `partial`
+// reduction; 0 for `shard` and `replicate`, which owe no reduction. Written
+// back by `pim-tile-to-budget`: the graph compiler decides that a tensor is
+// partial, but the staging size depends on the tile, which only this pass
+// resolves. Read by the GeneSim cost model's capacity check.
+constexpr static char AttrPlacedReduceBytesName[] = "pim.placed-reduce-bytes";
+// Bytes per element this pass actually charged when sizing tiles and the MRAM
+// footprint, taken from the operand type (`inferDtypeSize`). Written back by
+// `pim-tile-to-budget`: a text-level consumer sees the element *type* but has to
+// guess the width from a name table, and guessing wrong scales every byte count
+// it derives. This is the dtype dimension's return path.
+constexpr static char AttrPlacedElemBytesName[] = "pim.placed-elem-bytes";
 // WRAM actually claimed by this kernel's `pim.wram_alloc`s, in bytes. Written
 // by `pim-explicit-dma`.
 constexpr static char AttrWramBytesUsedName[] = "pim.wram-bytes-used";
@@ -86,6 +116,10 @@ struct L2 : public SideEffects::Resource::Base<L2> {
 int lookupNumTasklets(Operation *op);
 // Number of DPUs in scope for `op`. Falls back to 1.
 int lookupNumDpus(Operation *op);
+// Declared DPU count, or nullopt when the module does not state one. Callers
+// that are checking a placement against the hardware must use this: the
+// fallback above turns "not declared" into a hardware fact.
+std::optional<int64_t> maybeLookupNumDpus(Operation *op);
 // WRAM budget in bytes in scope for `op`. Returns nullopt when unset, so
 // callers can tell "no budget declared" from "budget of zero".
 std::optional<int64_t> maybeLookupWramBytes(Operation *op);
@@ -144,6 +178,26 @@ TaskletTiledEncodingAttr getDefaultTaskletTiledEncoding(MLIRContext *context,
                                                         ArrayRef<int64_t> shape,
                                                         int numTasklets,
                                                         int numDpus);
+
+// Same, but with the cross-DPU split taken from a graph-level placement. This
+// is the only way a non-all-ones `dpusPerDevice` gets written: the default
+// builder's `numDpus` is a hardware count, not a sharding decision.
+TaskletTiledEncodingAttr
+getPlacedTaskletTiledEncoding(MLIRContext *context, ArrayRef<int64_t> shape,
+                              int numTasklets, PlacementSpecAttr placement);
+
+// Whether a module-level placement is consistent with the hardware it is being
+// compiled for. Returns failure (after emitting) when it is not; a null
+// placement is the single-DPU case and always succeeds.
+LogicalResult verifyModulePlacement(Operation *mod, PlacementSpecAttr placement,
+                                    int numDpus);
+
+// Whether every PIM-layout tensor type in `mod` records the same cross-DPU split
+// that `placement` declares. The two carriers of the Placement dimension can
+// drift -- a pattern that rebuilds a tensor type can drop the split -- and a
+// dropped split costs downstream as if the tensor were unsharded.
+LogicalResult verifyLayoutsMatchPlacement(Operation *mod,
+                                          PlacementSpecAttr placement);
 
 // Bytes a tensor of this type occupies when staged in WRAM whole, or nullopt if
 // that cannot be determined statically.

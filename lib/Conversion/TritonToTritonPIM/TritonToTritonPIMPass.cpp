@@ -609,8 +609,17 @@ public:
     mod->setAttr(AttrDmaAlignName, b.getI32IntegerAttr(dmaAlign));
     mod->setAttr(AttrTargetName, b.getStringAttr(this->target.getValue()));
 
+    // The graph compiler states its cross-DPU decision as a module attribute:
+    // it is the only party that knows it, and a kernel cannot infer it from its
+    // own body. Absent means single-DPU, which is what every module looked like
+    // before this attribute existed.
+    auto placement =
+        mod->getAttrOfType<pim::PlacementSpecAttr>(AttrPlacementName);
+    if (failed(verifyModulePlacement(mod, placement, numDpus)))
+      return signalPassFailure();
+
     TritonPIMTypeConverter typeConverter(context, numTasklets, numDpus,
-                                         enableSourceRemat);
+                                         enableSourceRemat, placement);
     TritonPIMConversionTarget convTarget(*context, typeConverter);
 
     RewritePatternSet patterns(context);
@@ -622,6 +631,15 @@ public:
     patterns.insert<GenericOpPattern<ub::PoisonOp>>(typeConverter, context);
 
     if (failed(applyPartialConversion(mod, convTarget, std::move(patterns))))
+      return signalPassFailure();
+
+    // The Placement dimension now has two carriers: `#pim.placement` on the
+    // module (what the graph compiler decided) and `dpusPerDevice` inside each
+    // tensor's layout encoding (what conversion actually wrote). Two carriers
+    // for one fact can drift, so check they still agree before handing the
+    // module on -- a mismatch here means a pattern rebuilt a tensor type and
+    // dropped the split, which downstream would silently cost as if unsharded.
+    if (placement && failed(verifyLayoutsMatchPlacement(mod, placement)))
       return signalPassFailure();
   }
 };

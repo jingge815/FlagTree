@@ -24,3 +24,15 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// 起始地址按字节计，必须是元素宽度的整数倍：f32 是 4 字节，6 不是倍数。
+module {
+  tt.func @mram_offset_not_a_multiple_of_the_element(%p: tensor<64x!tt.ptr<f32>>) {
+    %buf = pim.wram_alloc : !pim.memdesc<64xf32, #pim.wram>
+    // expected-error @below {{mram_offset 6 is not a multiple of the 4-byte element size}}
+    pim.dma_load %p -> %buf {mram_offset = 6 : i64} : tensor<64x!tt.ptr<f32>> -> !pim.memdesc<64xf32, #pim.wram>
+    tt.return
+  }
+}

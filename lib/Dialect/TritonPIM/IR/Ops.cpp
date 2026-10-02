@@ -45,7 +45,9 @@ static Type getPointeeElementType(RankedTensorType ptrTensorTy) {
 // must be self-consistent.
 static LogicalResult verifyDmaLayoutAttrs(Operation *op, int64_t rank,
                                           std::optional<int64_t> contiguousDim,
-                                          std::optional<int64_t> elemStride) {
+                                          std::optional<int64_t> elemStride,
+                                          std::optional<int64_t> mramOffset,
+                                          unsigned elemBits) {
   if (contiguousDim && (*contiguousDim < 0 || *contiguousDim >= rank))
     return op->emitOpError("contiguous_dim ")
            << *contiguousDim << " is out of range for rank " << rank;
@@ -57,6 +59,18 @@ static LogicalResult verifyDmaLayoutAttrs(Operation *op, int64_t rank,
   // its own.
   if (elemStride && !contiguousDim)
     return op->emitOpError("elem_stride requires contiguous_dim to be set");
+
+  // 起始地址按字节计，降到 EmitC 时要换算成元素偏移，所以必须是元素宽度的整数倍。
+  if (mramOffset) {
+    if (*mramOffset < 0)
+      return op->emitOpError("mram_offset is a byte address, so it cannot be "
+                             "negative; got ")
+             << *mramOffset;
+    if (elemBits % 8 == 0 && *mramOffset % (elemBits / 8) != 0)
+      return op->emitOpError("mram_offset ")
+             << *mramOffset << " is not a multiple of the " << (elemBits / 8)
+             << "-byte element size";
+  }
 
   return success();
 }
@@ -203,7 +217,8 @@ LogicalResult DmaLoadOp::verify() {
   }
 
   return verifyDmaLayoutAttrs(getOperation(), ptrTy.getRank(),
-                              getContiguousDim(), getElemStride());
+                              getContiguousDim(), getElemStride(),
+                              getMramOffset(), pointee.getIntOrFloatBitWidth());
 }
 
 //===----------------------------------------------------------------------===//
@@ -238,7 +253,8 @@ LogicalResult DmaStoreOp::verify() {
            << bufTy.getShape() << "]";
 
   return verifyDmaLayoutAttrs(getOperation(), ptrTy.getRank(),
-                              getContiguousDim(), getElemStride());
+                              getContiguousDim(), getElemStride(),
+                              getMramOffset(), pointee.getIntOrFloatBitWidth());
 }
 
 //===----------------------------------------------------------------------===//
@@ -843,6 +859,31 @@ LogicalResult EltwiseOp::verify() {
                << "] is not broadcastable against lhs shape ["
                << lhsTy.getShape() << "]";
     }
+  }
+
+  // `combineMode` says how this result rejoins the chain that consumes it, and
+  // `skip_connection` is a claim about that chain, not about this op: it means
+  // the result is added back to a value from earlier in the chain. An op with a
+  // single consumer-shaped operand cannot be the merge point of a skip
+  // connection -- the value being skipped past has to arrive as an operand too.
+  //
+  // This is where the attribute stops being a record. Before this, `combineMode`
+  // had five producers inside `-pim-expand-phases` (all passing a null
+  // placeholder) and `getCombineMode()` was never called anywhere in the
+  // dialect, so any value written to it -- right or wrong -- had exactly the
+  // same effect: none.
+  if (auto combine = getCombineMode()) {
+    // A skip connection rejoins the chain by *adding* the skipped value back.
+    // Multiplying or dividing by it is a different operation -- the residual
+    // would be scaled rather than restored -- so the mode and the kind have to
+    // agree. (The operand count cannot carry this check: the `>= 2` requirement
+    // above already holds for every eltwise op, so a count-based test here
+    // could never fire.)
+    EltwiseKind kind = getKind();
+    if (*combine == CombineMode::SkipConnection && kind != EltwiseKind::Add)
+      return emitOpError("skip_connection adds the skipped value back, but this "
+                         "op's kind is ")
+             << stringifyEltwiseKind(kind);
   }
 
   // A per-slot datapath list describes the slots, so it has to have one entry

@@ -155,6 +155,20 @@ static std::optional<TileShape> inferFullShape(triton::DotOp dot,
   return TileShape{m, n, k};
 }
 
+// 内核是否被 launch grid 切分。FlagGems 的 autotune 内核按 2 维 grid 划分 M/N，
+// 一个 program 只算一块，循环不覆盖整算子；图编译器那侧的内核（`kernel_src.py`）
+// 是整算子内核，不读 program id。
+//
+// 这个判据决定要不要重建：重建出来的内核是「一个 program 算完整张输出」，而启动
+// 网格不变——对 grid 内核来说语义就变了，按「单 program 成本 × 网格」建模的成本
+// 口径也随之失效。所以 grid 内核只按实测分块回写属性，不改写。此时若实测分块
+// 超预算，`pim.tile-wram-bytes` 会如实大于 `pim.wram-bytes`，让超支可见。
+static bool isGridPartitioned(ModuleOp mod) {
+  bool found = false;
+  mod.walk([&](triton::GetProgramIdOp) { found = true; });
+  return found;
+}
+
 static std::optional<int64_t> inferDtypeSize(Value v) {
   auto ty = dyn_cast<RankedTensorType>(v.getType());
   if (!ty)
@@ -313,10 +327,10 @@ public:
     while (auto cvt = aVal.getDefiningOp<ConvertLayoutOp>())
       aVal = cvt.getSrc();
     auto xLoad = aVal.getDefiningOp<triton::LoadOp>();
-    auto wLoad = bVal.getDefiningOp<triton::TransOp>();
     if (!xLoad)
       return dot.emitError() << "pim-tile-to-budget rewrite expects a's tt.load"
                                  " directly feeding tt.dot";
+    auto wLoad = bVal.getDefiningOp<triton::TransOp>();
     if (!wLoad)
       return dot.emitError() << "pim-tile-to-budget rewrite expects a tt.trans"
                                  " directly feeding tt.dot's b operand";
@@ -695,19 +709,98 @@ static LogicalResult validateDot(triton::DotOp dot) {
   return success();
 }
 
-static int64_t bytesFor(TileShape tile, int64_t elemBytes) {
-  return (tile.m * tile.k + tile.n * tile.k + tile.m * tile.n) * elemBytes;
+// Bytes the three staged buffers occupy: x (m*k) and w (n*k) hold operands,
+// out (m*n) holds the accumulator.
+//
+// `accumBytes` is separate from `elemBytes` because the accumulator is wider
+// than the operands on the real kernel: `tt.dot` takes f16 and produces f32
+// (measured on the graph compiler's `linear` -- `tensor<4x32xf16> *
+// tensor<32x512xf16> -> tensor<4x512xf32>`). Charging the operand width for all
+// three undercounts the output tile by exactly the ratio, which loosens both the
+// WRAM and the MRAM check on every mixed-precision kernel -- the common case.
+static int64_t bytesFor(TileShape tile, int64_t elemBytes, int64_t accumBytes) {
+  return (tile.m * tile.k + tile.n * tile.k) * elemBytes +
+         tile.m * tile.n * accumBytes;
+}
+
+// How many DPUs the module's placement splits its tensors over, or 1 when there
+// is no placement (single-DPU) or the placement does not split (replicate /
+// partial both keep the whole shape on every DPU).
+//
+// Reported back as `pim.placed-shards` so a consumer can compare the split this
+// pass saw against the one the graph compiler declared. It does NOT divide the
+// footprint: the shapes reaching this pass are already one DPU's share.
+//
+// It counts the tensor ENCODINGS, not the module placement. Reading the
+// placement back would make the value a mirror of the intent: `placed-shards`
+// would equal `numDpus` by construction, and the consumer's "intent vs effect"
+// comparison could never fire while both the attribute's comment and the design
+// describe it as what this pass actually saw. The encodings are what the passes
+// below really see, so a pattern that rebuilds a tensor type and drops the split
+// shows up here as 1 -- which is the drift the consumer is there to detect.
+static int64_t localShardCount(ModuleOp mod) {
+  int64_t width = 1;
+  mod.walk([&](Operation *op) {
+    SmallVector<Type> types(op->getResultTypes());
+    for (Value operand : op->getOperands())
+      types.push_back(operand.getType());
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          types.push_back(arg.getType());
+    for (Type ty : types) {
+      auto tensorTy = dyn_cast<RankedTensorType>(ty);
+      if (!tensorTy)
+        continue;
+      if (auto enc = dyn_cast_or_null<TaskletTiledEncodingAttr>(
+              tensorTy.getEncoding()))
+        width = std::max(width, (int64_t)enc.getTotalDpusPerDevice());
+    }
+  });
+  return width;
+}
+
+// Extra MRAM a `partial` placement needs on each DPU, in bytes.
+//
+// `partial` says every DPU holds a whole-shaped *piece* of the sum, and the
+// value only exists once those pieces are reduced across DPUs. The reduction
+// has to land somewhere: a DPU receiving a peer's piece needs room for it
+// alongside its own. One peer's piece is the whole per-DPU output (not a WRAM
+// tile), and it is real occupancy -- charge it against the same per-DPU MRAM
+// budget as the operands.
+//
+// This is the point where the `replicate` and `partial` kinds stop being a
+// record and start changing a decision. The two are identical in shape (both
+// keep the whole shape on every DPU) and were therefore indistinguishable to
+// this pass before; they are not identical in cost, because only one of them
+// owes a reduction. `shard` and `replicate` return 0: a shard's pieces are
+// disjoint and a replicate's are already complete, so neither needs a landing
+// buffer.
+static int64_t reduceStagingBytes(ModuleOp mod, TileShape full,
+                                  int64_t accumBytes) {
+  auto placement = mod->getAttrOfType<PlacementSpecAttr>(AttrPlacementName);
+  if (!placement || placement.getKind() != PlacementKind::Partial)
+    return 0;
+  if (placement.getNumDpus() < 2)
+    return 0;
+  // Charged at the accumulator's width, not the operands': the piece arriving
+  // from a peer IS a partial sum, so it has the accumulator's format (f32 where
+  // the operands are f16). Using the operand width would undercount it by the
+  // same ratio `bytesFor` used to undercount the output tile.
+  return full.m * full.n * accumBytes;
 }
 
 // Whether `tile` fits the WRAM budget and each of the three staged buffers
 // (x, w, out) is separately DMA-aligned -- the design's per-buffer alignment
 // requirement, stricter than (and a superset of) checking only the summed
 // footprint.
-static bool fitsBudget(TileShape tile, int64_t elemBytes, int64_t wram,
-                       int64_t dma) {
+static bool fitsBudget(TileShape tile, int64_t elemBytes, int64_t accumBytes,
+                       int64_t wram, int64_t dma) {
   int64_t xBytes = tile.m * tile.k * elemBytes;
   int64_t wBytes = tile.n * tile.k * elemBytes;
-  int64_t oBytes = tile.m * tile.n * elemBytes;
+  // The output tile holds the accumulator, which is f32 where the operands are
+  // f16 -- see `bytesFor`.
+  int64_t oBytes = tile.m * tile.n * accumBytes;
   if (xBytes + wBytes + oBytes > wram)
     return false;
   return xBytes % dma == 0 && wBytes % dma == 0 && oBytes % dma == 0;
@@ -743,14 +836,15 @@ static SmallVector<int64_t, 8> powerOfTwoDivisorsDesc(int64_t full) {
 // pass. On failure, `*smallestTried` (if non-null) is left holding {1,1,1}
 // clamped to `visible`, for a diagnostic.
 static std::optional<TileShape> searchTile(TileShape visible, int64_t elemBytes,
-                                           int64_t wram, int64_t dma,
+                                           int64_t accumBytes, int64_t wram,
+                                           int64_t dma,
                                            TileShape *smallestTried = nullptr) {
   std::optional<TileShape> best;
   for (int64_t m : powerOfTwoDivisorsDesc(visible.m))
     for (int64_t n : powerOfTwoDivisorsDesc(visible.n))
       for (int64_t k : powerOfTwoDivisorsDesc(visible.k)) {
         TileShape tile{m, n, k};
-        if (!fitsBudget(tile, elemBytes, wram, dma))
+        if (!fitsBudget(tile, elemBytes, accumBytes, wram, dma))
           continue;
         if (!best || m * n * k > best->m * best->n * best->k ||
             (m * n * k == best->m * best->n * best->k &&
@@ -776,12 +870,20 @@ public:
     auto wram = maybeLookupWramBytes(mod);
     auto mram = maybeLookupMramBytes(mod);
     auto dma = maybeLookupDmaAlign(mod);
+    // 分片起始对齐比模块级 dma-align 更严时，按更严的那个选分块：每块缓冲
+    // 都要落在这个对齐上，否则 DMA 写出去的地址不合分片的对齐要求。
+    if (auto placement = mod->getAttrOfType<PlacementSpecAttr>(AttrPlacementName))
+      if (placement.getAlignBytes() > (dma ? *dma : 0))
+        dma = placement.getAlignBytes();
     if (!wram || !mram || !dma) {
       mod.emitError() << "pim-tile-to-budget requires " << AttrWramBytesName
                       << ", " << AttrMramBytesName << " and "
                       << AttrDmaAlignName;
       return signalPassFailure();
     }
+
+    // grid 切分的内核只报分块，不改写（理由见 `isGridPartitioned`）。
+    bool gridPartitioned = isGridPartitioned(mod);
 
     bool sawDot = false;
     SmallVector<triton::DotOp> dots;
@@ -793,6 +895,22 @@ public:
 
     std::optional<TileShape> chosen;
     std::optional<int64_t> elemBytes;
+    // The accumulator's width, kept beside `elemBytes` because the two differ on
+    // the real kernel (f16 operands, f32 accumulator) and the tile sizing needs
+    // both.
+    std::optional<int64_t> accumElemBytes;
+    // Footprint of the last dot examined, already one DPU's share: the shapes
+    // reaching this pass come from the execution plan's local shape, so nothing
+    // is divided on the way out.
+    int64_t perDpuFootprint = 0;
+    // Bytes this pass set aside on each DPU to stage an incoming piece of a
+    // `partial` reduction; 0 for the other two placement kinds. Reported back
+    // so the graph compiler can see what the reduction actually cost -- it
+    // depends on the tile, which is resolved here, so only this pass knows it.
+    int64_t reduceStaging = 0;
+    // Bytes per element this pass charged, from the operand type. Reported back
+    // so a text-level consumer need not guess the width from a type name.
+    int64_t placedElemBytes = 0;
     for (triton::DotOp dot : dots) {
       sawDot = true;
       if (failed(validateDot(dot)))
@@ -805,26 +923,66 @@ public:
         return signalPassFailure();
       }
       auto bytes = inferDtypeSize(dot.getA());
+      // The accumulator's own width. `tt.dot` on this kernel takes f16 and
+      // produces f32, so the output tile is wider than the operands; charging
+      // the operand width for it undercounts by that ratio. Falls back to the
+      // operand width when the result type is not byte-aligned -- same shape of
+      // answer this pass has always given for odd types.
+      auto accumBytes = inferDtypeSize(dot.getResult());
       if (!bytes) {
         dot.emitError() << "pim-tile-to-budget only handles byte-aligned"
                            " f16/f32 tiles";
         return signalPassFailure();
       }
+      // An accumulator type this pass cannot measure falls back to the operand
+      // width -- the answer it gave before the two were distinguished.
+      int64_t accum = accumBytes.value_or(*bytes);
       elemBytes = bytes;
+      accumElemBytes = accum;
 
       // MRAM is a property of the whole (untiled) operator, independent of
       // how the WRAM-side tile gets chosen below.
-      if (bytesFor(*full, *bytes) > *mram) {
-        dot.emitError() << "linear footprint " << bytesFor(*full, *bytes)
-                        << " exceeds mram-bytes " << *mram;
+      //
+      // `*full` is already the shape of ONE DPU's share, so this footprint is
+      // directly comparable to the per-DPU MRAM budget -- no division by the
+      // split.
+      //
+      // That is a property of who writes `pim.placement`: the graph compiler,
+      // and it builds the kernel from the execution plan's `local_shape`. A tp2
+      // `linear` arrives as weight 32x64 when the global weight is 64x64. An
+      // earlier version divided here, reasoning that `*full` was global; that
+      // reasoning held only for the GeneSim path, whose `full-m/n/k` overrides
+      // do come from launch-side globals -- but that path never writes a
+      // placement, so the division could only ever fire where it was wrong. It
+      // loosened this budget check by exactly the split factor: measured, a
+      // kernel needing 7168 B per DPU passed a 5000 B budget.
+      // Per-dot locals: the reported values are bound to the dot that `chosen`
+      // describes, further down. Overwriting them every iteration made a
+      // two-dot module report tile attributes for the first dot and a footprint
+      // for the last -- two different operators in one set of attributes.
+      int64_t footprint = bytesFor(*full, *bytes, accum);
+      // A `partial` placement owes a cross-DPU reduction, and the incoming
+      // piece needs somewhere to land. That buffer occupies the same per-DPU
+      // MRAM as the operands, so it belongs in this check.
+      int64_t staging = reduceStagingBytes(mod, *full, accum);
+      footprint += staging;
+      if (footprint > *mram) {
+        dot.emitError() << "linear footprint " << footprint
+                        << " exceeds mram-bytes " << *mram << " (per DPU"
+                        << (staging > 0
+                                ? ", including " + std::to_string(staging) +
+                                      " bytes staging the partial reduction"
+                                : "")
+                        << ")";
         return signalPassFailure();
       }
 
       TileShape tile = *visible;
-      bool needsRewrite = !fitsBudget(tile, *bytes, *wram, *dma);
+      bool needsRewrite =
+          !gridPartitioned && !fitsBudget(tile, *bytes, accum, *wram, *dma);
       if (needsRewrite) {
         TileShape smallestTried = tile;
-        auto found = searchTile(*visible, *bytes, *wram, *dma, &smallestTried);
+        auto found = searchTile(*visible, *bytes, accum, *wram, *dma, &smallestTried);
         if (!found) {
           dot.emitError()
               << "no legal power-of-two tile fits: M=" << full->m
@@ -840,9 +998,14 @@ public:
 
       // Check tile-shape consistency, and emit diagnostics, before the
       // rewrite below erases `dot` -- nothing may reference it afterwards.
-      if (!chosen)
+      if (!chosen) {
         chosen = tile;
-      else if (chosen->m != tile.m || chosen->n != tile.n ||
+        // The reported values travel with `chosen`, so all four attributes
+        // describe the same dot.
+        perDpuFootprint = footprint;
+        reduceStaging = staging;
+        placedElemBytes = *bytes;
+      } else if (chosen->m != tile.m || chosen->n != tile.n ||
                chosen->k != tile.k) {
         dot.emitError() << "pim-tile-to-budget only handles one consistent"
                            " linear tile shape";
@@ -860,7 +1023,7 @@ public:
       }
     }
 
-    if (!sawDot || !chosen || !elemBytes)
+    if (!sawDot || !chosen || !elemBytes || !accumElemBytes)
       return signalPassFailure();
 
     Builder b(&getContext());
@@ -868,7 +1031,35 @@ public:
     mod->setAttr(AttrTileNName, b.getI64IntegerAttr(chosen->n));
     mod->setAttr(AttrTileKName, b.getI64IntegerAttr(chosen->k));
     mod->setAttr(AttrTileWramBytesName,
-                 b.getI64IntegerAttr(bytesFor(*chosen, *elemBytes)));
+                 b.getI64IntegerAttr(bytesFor(*chosen, *elemBytes, *accumElemBytes)));
+
+    // The Placement dimension's return path. The graph compiler decided the
+    // split; what it cannot know is what the split actually cost, because the
+    // per-DPU footprint depends on the tile -- and the tile is resolved here.
+    //
+    // Two attributes, and the second is not redundant with the placement's own
+    // `numDpus`: it is the split width this pass actually *saw* on the module.
+    // A pattern that drops the placement on the way here leaves it at 1 while
+    // the intent still says N, which is exactly the drift a consumer needs to be
+    // able to detect rather than assume away.
+    mod->setAttr(AttrPlacedShardsName,
+                 b.getI64IntegerAttr(localShardCount(mod)));
+    mod->setAttr(AttrPlacedMramBytesName,
+                 b.getI64IntegerAttr(perDpuFootprint));
+    // The return path for the `partial` kind: how many bytes the reduction
+    // staging took. Written even without a placement -- a consumer reading 0
+    // learns "no staging was needed", which is different from "this pass did
+    // not say", and the single-DPU case is exactly where the footprint is not
+    // divided by anything, so gating these on a placement would silently drop
+    // the capacity check's input there.
+    mod->setAttr(AttrPlacedReduceBytesName,
+                 b.getI64IntegerAttr(reduceStaging));
+    // The dtype dimension's return path: the element width this pass charged.
+    // Only written when a tile was actually sized -- 0 would be a claim, and
+    // "this pass did not reach a dot" is not the same as "elements are 0 bytes".
+    if (placedElemBytes > 0)
+      mod->setAttr(AttrPlacedElemBytesName,
+                   b.getI64IntegerAttr(placedElemBytes));
   }
 };
 

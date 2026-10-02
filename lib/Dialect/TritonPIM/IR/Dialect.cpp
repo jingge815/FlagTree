@@ -157,6 +157,165 @@ LogicalResult TaskletTiledEncodingAttr::verify(
 }
 
 //===----------------------------------------------------------------------===//
+// PlacementSpecAttr
+//===----------------------------------------------------------------------===//
+
+SmallVector<int64_t> PlacementSpecAttr::resolvedDpuIds() const {
+  if (auto ids = getDpuIds())
+    return SmallVector<int64_t>(ids.asArrayRef());
+  // Omitted means the first `numDpus`, which is what a single-stage graph
+  // compiler emits. Materializing it here keeps consumers from each deciding
+  // what the absent case meant.
+  SmallVector<int64_t> implied;
+  implied.reserve(getNumDpus());
+  for (int64_t i = 0; i < getNumDpus(); ++i)
+    implied.push_back(i);
+  return implied;
+}
+
+LogicalResult PlacementSpecAttr::verifyAgreesWith(
+    function_ref<InFlightDiagnostic()> emitError,
+    TaskletTiledEncodingAttr enc) const {
+  if (!enc)
+    return success();  // nothing to disagree with
+
+  unsigned total = enc.getTotalDpusPerDevice();
+
+  // All-ones is always acceptable: it says "this tensor is not distributed",
+  // which is true of plenty of tensors inside a sharded kernel -- index vectors
+  // (`offs_m`), the broadcast columns derived from them (`tensor<4x1xi32>`), any
+  // value whose axes the split simply does not touch. Requiring every same-rank
+  // tensor to carry the split rejects a correct kernel: measured on a real tp2
+  // `linear`, 9 of 48 tensors enter as rank-1 and keep all-ones through
+  // `expand_dims`, and the strict form failed the whole compile.
+  //
+  // What must hold is the other direction: an encoding that *does* record a
+  // split has to record the same one the placement declares. That still catches
+  // every way the two carriers can drift -- wrong width, wrong axis, or a split
+  // under a placement that forbids one -- because each of those is non-all-ones.
+  if (total == 1)
+    return success();
+
+  // Only the split *width* is invariant inside a kernel, not the axis it sits
+  // on. `tt.trans` permutes the encoding, so a tensor that arrived as
+  // `dpusPerDevice = [1, 2]` correctly becomes `[2, 1]` after a transpose;
+  // `expand_dims` inserts axes and shifts the position further. Pinning the axis
+  // against the module-level `dim` rejects a correct kernel -- measured on a real
+  // tp2 `linear`, which transposes its weight block.
+  //
+  // The width survives all of those, and it is what the resource arithmetic
+  // depends on: N DPUs means each one holds 1/N of the bytes, wherever the axis
+  // ended up. So that is the invariant checked here.
+  if (getKind() == PlacementKind::Shard) {
+    if (total != (unsigned)getNumDpus())
+      return emitError() << "placement shards over " << getNumDpus()
+                         << " DPUs but the layout encoding spreads over " << total;
+    return success();
+  }
+
+  // Replicate / Partial: every DPU holds the whole shape, so no axis may be
+  // split. Reaching here means the encoding did split one.
+  return emitError() << "a " << stringifyPlacementKind(getKind())
+                     << " placement holds the whole shape on each DPU, so the "
+                        "layout encoding must not split any axis; got a "
+                        "dpusPerDevice product of "
+                     << total;
+}
+
+LogicalResult PlacementSpecAttr::verify(
+    function_ref<InFlightDiagnostic()> emitError, PlacementKind kind,
+    int64_t dim, int64_t numDpus, PartialReduce reduce,
+    DenseI64ArrayAttr dpuIds, int64_t stage, DenseI64ArrayAttr order,
+    int64_t mramOffset, int64_t alignBytes) {
+  if (mramOffset < 0)
+    return emitError() << "mramOffset is a byte address, so it cannot be "
+                          "negative; got "
+                       << mramOffset;
+  // 逐分片对齐必须是 2 的幂，且起始地址满足它。0 表示没有额外要求。
+  if (alignBytes < 0 || (alignBytes & (alignBytes - 1)))
+    return emitError() << "alignBytes must be a power of two; got "
+                       << alignBytes;
+  if (alignBytes && mramOffset % alignBytes)
+    return emitError() << "mramOffset " << mramOffset
+                       << " is not a multiple of alignBytes " << alignBytes;
+  // 排布的维序：最内层在前，必须是 [0, rank) 的一个排列。空表示未声明。
+  if (order) {
+    llvm::SmallVector<bool> seen(order.size(), false);
+    for (int64_t axis : order.asArrayRef()) {
+      if (axis < 0 || axis >= (int64_t)order.size() || seen[axis])
+        return emitError() << "order must be a permutation of [0, "
+                           << order.size() << "); got " << order;
+      seen[axis] = true;
+    }
+  }
+
+  if (numDpus < 1)
+    return emitError() << "numDpus counts the DPUs that hold the tensor, so it "
+                          "must be at least 1; got "
+                       << numDpus;
+  if (stage < 0)
+    return emitError() << "stage is a pipeline stage index, so it cannot be "
+                          "negative; got "
+                       << stage;
+
+  switch (kind) {
+  case PlacementKind::Shard:
+    if (dim < 0)
+      return emitError() << "a shard placement splits a specific axis, so dim "
+                            "must be non-negative; got "
+                         << dim;
+    if (reduce != PartialReduce::None)
+      return emitError() << "a shard placement owes no reduction, so reduce "
+                            "must be none; got "
+                         << stringifyPartialReduce(reduce);
+    if (numDpus < 2)
+      return emitError() << "a shard over a single DPU is not a split; use "
+                            "replicate instead";
+    break;
+  case PlacementKind::Replicate:
+    if (dim >= 0)
+      return emitError() << "a replicate placement holds every axis whole, so "
+                            "it must not name a dim; got "
+                         << dim;
+    if (reduce != PartialReduce::None)
+      return emitError() << "a replicate placement owes no reduction, so reduce "
+                            "must be none; got "
+                         << stringifyPartialReduce(reduce);
+    break;
+  case PlacementKind::Partial:
+    if (dim >= 0)
+      return emitError() << "a partial placement is split over the contraction "
+                            "that produced it, not over an axis of the result, "
+                            "so it must not name a dim; got "
+                         << dim;
+    // The reduction is the whole content of "partial": without it there is no
+    // way to turn the per-DPU pieces back into the value.
+    if (reduce == PartialReduce::None)
+      return emitError() << "a partial placement must say how its pieces "
+                            "combine; set reduce to sum or mean";
+    break;
+  }
+
+  if (dpuIds) {
+    ArrayRef<int64_t> ids = dpuIds.asArrayRef();
+    if ((int64_t)ids.size() != numDpus)
+      return emitError() << "dpuIds lists " << ids.size()
+                         << " DPUs but numDpus says " << numDpus
+                         << "; the two would be two answers to the same question";
+    SmallVector<int64_t> sorted(ids);
+    llvm::sort(sorted);
+    for (size_t i = 0; i < sorted.size(); ++i) {
+      if (sorted[i] < 0)
+        return emitError() << "dpuIds contains a negative DPU id " << sorted[i];
+      if (i > 0 && sorted[i] == sorted[i - 1])
+        return emitError() << "dpuIds contains duplicate DPU id " << sorted[i];
+    }
+  }
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // QuantSpecAttr / DatapathAttr / WindowAttr
 //===----------------------------------------------------------------------===//
 
@@ -918,6 +1077,11 @@ LogicalResult TritonPIMDialect::verifyOperationAttribute(Operation *op,
                           StringRef(AttrWramBytesName),
                           StringRef(AttrMramBytesName),
                           StringRef(AttrDmaAlignName),
+                          StringRef(AttrPlacementName),
+                          StringRef(AttrPlacedMramBytesName),
+                          StringRef(AttrPlacedShardsName),
+                          StringRef(AttrPlacedReduceBytesName),
+                          StringRef(AttrPlacedElemBytesName),
                           StringRef(AttrTargetName),
                           StringRef(AttrWramBytesUsedName),
                           StringRef(AttrTileMName),
@@ -965,6 +1129,10 @@ int mlir::triton::pim::lookupNumDpus(Operation *op) {
   return lookupModuleIntAttr(op, AttrNumDpusName).value_or(kDefaultNumDpus);
 }
 
+std::optional<int64_t> mlir::triton::pim::maybeLookupNumDpus(Operation *op) {
+  return lookupModuleIntAttr(op, AttrNumDpusName);
+}
+
 std::optional<int64_t> mlir::triton::pim::maybeLookupWramBytes(Operation *op) {
   return lookupModuleIntAttr(op, AttrWramBytesName);
 }
@@ -1002,6 +1170,116 @@ TaskletTiledEncodingAttr mlir::triton::pim::getDefaultTaskletTiledEncoding(
 
   return TaskletTiledEncodingAttr::get(context, shape, sizePerTasklet, order,
                                        numTasklets, numDpus);
+}
+
+LogicalResult mlir::triton::pim::verifyModulePlacement(
+    Operation *mod, PlacementSpecAttr placement, int numDpus) {
+  if (!placement)
+    return success();  // single-DPU: nothing to be inconsistent with
+
+  // A tensor cannot be spread over more DPUs than the device has. Caught here
+  // rather than at tile-sizing time because the number it contradicts is a pass
+  // option, which the attribute's own verifier cannot see.
+  if (placement.getNumDpus() > numDpus)
+    return mod->emitError()
+           << "pim.placement spreads a tensor over " << placement.getNumDpus()
+           << " DPUs but the device has only " << numDpus;
+
+  for (int64_t id : placement.resolvedDpuIds()) {
+    if (id >= numDpus)
+      return mod->emitError() << "pim.placement names DPU " << id
+                              << " but the device has only " << numDpus
+                              << " (ids 0.." << numDpus - 1 << ")";
+  }
+  return success();
+}
+
+LogicalResult mlir::triton::pim::verifyLayoutsMatchPlacement(
+    Operation *mod, PlacementSpecAttr placement) {
+  if (!placement)
+    return success();
+
+  // Did the split reach any tensor at all? Per-tensor agreement cannot answer
+  // that: all-ones is waved through there (index vectors legitimately carry it),
+  // so a module where EVERY encoding lost the split looks exactly like a module
+  // of tensors that were never split -- and that is the failure this has to
+  // catch, because downstream then costs the operator as if unsharded. Measured:
+  // a module declaring `dim = 1, numDpus = 2` whose encodings were all-ones
+  // converted with rc=0 and zero `dpusPerDevice` in the output.
+  //
+  // Only for `shard`: replicate and partial keep the whole shape on every DPU,
+  // so all-ones everywhere is the correct answer for them.
+  bool splitApplied = false;
+
+  LogicalResult result = success();
+  mod->walk([&](Operation *op) {
+    if (failed(result))
+      return;
+    // Results, operands, and block arguments. All three are needed: a pattern
+    // can rebuild either side of an op, and a kernel's tensors arrive as
+    // function arguments -- checking only results and operands misses a drifted
+    // signature entirely, because `tt.return` carries no operands (measured).
+    SmallVector<Type> types(op->getResultTypes());
+    for (Value operand : op->getOperands())
+      types.push_back(operand.getType());
+    for (Region &region : op->getRegions())
+      for (Block &block : region)
+        for (BlockArgument arg : block.getArguments())
+          types.push_back(arg.getType());
+
+    for (Type ty : types) {
+      auto tensorTy = dyn_cast<RankedTensorType>(ty);
+      if (!tensorTy)
+        continue;
+      auto enc = dyn_cast_or_null<TaskletTiledEncodingAttr>(
+          tensorTy.getEncoding());
+      if (!enc)
+        continue;  // not yet converted; the conversion target reports that
+      // Count first, then skip: a tensor of rank <= `dim` has no axis to compare
+      // against, but it can still *be* the split's record. Counting it after the
+      // skip let a module whose only split lived on such a tensor be reported as
+      // "no tensor layout records a split" and rejected -- rejecting a legal
+      // module is worse than missing an illegal one.
+      if (enc.getTotalDpusPerDevice() > 1)
+        splitApplied = true;
+      // Shape-dependent ops legitimately hold tensors of other ranks (a mask, a
+      // reduced accumulator). Comparing those against a rank-indexed shard axis
+      // would report a mismatch that is not one, so only same-rank types are
+      // checked -- they are the ones the split is expressed on.
+      if (placement.getKind() == PlacementKind::Shard &&
+          (int64_t)tensorTy.getRank() <= placement.getDim())
+        continue;
+      if (failed(placement.verifyAgreesWith(
+              [&] { return op->emitError(); }, enc))) {
+        result = failure();
+        return;
+      }
+    }
+  });
+  if (failed(result))
+    return result;
+
+  if (placement.getKind() == PlacementKind::Shard && placement.getNumDpus() > 1 &&
+      !splitApplied)
+    return mod->emitError()
+           << "pim.placement shards over " << placement.getNumDpus()
+           << " DPUs but no tensor layout in the module records a split: the "
+              "cross-DPU decision was dropped, and downstream would cost this "
+              "operator as if it were not sharded";
+  return result;
+}
+
+TaskletTiledEncodingAttr mlir::triton::pim::getPlacedTaskletTiledEncoding(
+    MLIRContext *context, ArrayRef<int64_t> shape, int numTasklets,
+    PlacementSpecAttr placement) {
+  unsigned rank = shape.size();
+  SmallVector<unsigned> sizePerTasklet(rank, 1);
+  SmallVector<unsigned> order(rank);
+  for (unsigned i = 0; i < rank; ++i)
+    order[i] = rank - 1 - i;
+
+  return TaskletTiledEncodingAttr::get(context, shape, sizePerTasklet, order,
+                                       numTasklets, placement);
 }
 
 std::optional<int64_t>

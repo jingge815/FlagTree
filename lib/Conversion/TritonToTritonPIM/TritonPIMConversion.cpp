@@ -16,18 +16,29 @@ using namespace mlir::triton::pim;
 // TypeConverter
 //===----------------------------------------------------------------------===//
 
-TritonPIMTypeConverter::TritonPIMTypeConverter(MLIRContext *context,
-                                               int numTasklets, int numDpus,
-                                               bool enableSourceRemat)
-    : context(context), numTasklets(numTasklets), numDpus(numDpus) {
+TritonPIMTypeConverter::TritonPIMTypeConverter(
+    MLIRContext *context, int numTasklets, int numDpus, bool enableSourceRemat,
+    triton::pim::PlacementSpecAttr placement)
+    : context(context), numTasklets(numTasklets), numDpus(numDpus),
+      placement(placement) {
   addConversion([](Type type) { return type; });
 
   // Attach a tasklet layout to every tensor that lacks one.
   addConversion([this](RankedTensorType tensorType) -> RankedTensorType {
     if (tensorType.getEncoding())
       return tensorType;
-    TaskletTiledEncodingAttr encoding = getDefaultTaskletTiledEncoding(
-        this->context, tensorType.getShape(), this->numTasklets, this->numDpus);
+    // With a placement the encoding records the real cross-DPU split; without
+    // one it stays all-ones, which is the single-DPU shape this pass produced
+    // before placements existed -- so an unsharded module converts byte for byte
+    // as it did.
+    TaskletTiledEncodingAttr encoding =
+        this->placement
+            ? getPlacedTaskletTiledEncoding(this->context,
+                                            tensorType.getShape(),
+                                            this->numTasklets, this->placement)
+            : getDefaultTaskletTiledEncoding(this->context,
+                                             tensorType.getShape(),
+                                             this->numTasklets, this->numDpus);
     return tensorType.cloneWithEncoding(encoding);
   });
 

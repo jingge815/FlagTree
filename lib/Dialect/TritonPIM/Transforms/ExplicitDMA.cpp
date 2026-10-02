@@ -250,6 +250,26 @@ static AddressPattern analyzePointers(Value ptrs) {
   if (!strides)
     return pat;
 
+  // 排布声明了维序时，把地址步幅乘上按该维序算出的内存步幅，用来找出沿内存
+  // 连续的那一维。order[i] 是第 i 内层的维，其内存步幅 = 内层各维元素数之积。
+  // 行主序时地址步幅本就行主序，相乘后最内维仍是 1，下面优先找单位步幅维，
+  // 结论与改动前相同。当前所有生产方都是行主序，维序恒为默认。
+  if (auto enc = dyn_cast_or_null<TaskletTiledEncodingAttr>(ptrTy.getEncoding())) {
+    ArrayRef<unsigned> order = enc.getOrder();
+    if ((int64_t)order.size() == rank) {
+      SmallVector<int64_t> memStrides(rank, 0);
+      int64_t running = 1;
+      for (unsigned axis : order) {
+        memStrides[axis] = running;
+        running *= ptrTy.getDimSize(axis);
+      }
+      SmallVector<int64_t> scaled(rank, 0);
+      for (int64_t d = 0; d < rank; ++d)
+        scaled[d] = (*strides)[d] * memStrides[d];
+      strides = std::move(scaled);
+    }
+  }
+
   // The fastest-changing dimension with unit stride is the one a DMA can walk
   // contiguously; prefer it, and otherwise report the innermost dimension that
   // varies at all.
@@ -276,6 +296,8 @@ static void annotate(Operation *op, const AddressPattern &pat) {
     return;
   Builder b(op->getContext());
   op->setAttr("contiguous_dim", b.getI64IntegerAttr(pat.contiguousDim));
+  // 步幅按元素计，只记分析证明出来的那个数。分片对齐是字节单位的起始地址
+  // 对齐，不改变行内步幅，所以不在这里抬高。
   op->setAttr("elem_stride", b.getI64IntegerAttr(pat.elemStride));
   if (pat.baseArg)
     op->setAttr("base_arg", b.getI64IntegerAttr(*pat.baseArg));
@@ -401,6 +423,29 @@ struct TritonPIMExplicitDMAPass
     // Report the WRAM footprint. Note this counts staging buffers only: values
     // that stay live in registers across the kernel, such as a dot
     // accumulator, are still SSA values at this level and get their storage
+    // 起始地址非 0 时记到对应的 DMA 上：指针回溯到的是函数实参的基址，
+    // 这块张量实际从基址往后若干字节起。只盖到 base_arg 对得上的那条 ——
+    // 一个 kernel 里 x/w/out 各有各的偏移，盖同一个会把别人的地址也挪了。
+    // 模块属性只有一个偏移，描述的是结果张量，结果张量的 base_arg 是最后一个
+    // 实参。
+    if (auto placement =
+            mod->getAttrOfType<PlacementSpecAttr>(AttrPlacementName))
+      if (placement.getMramOffset() > 0) {
+        Builder b(&getContext());
+        auto off = b.getI64IntegerAttr(placement.getMramOffset());
+        int64_t lastArg = -1;
+        mod.walk([&](triton::FuncOp fn) {
+          lastArg = (int64_t)fn.getNumArguments() - 1;
+        });
+        mod.walk([&](Operation *op) {
+          if (!isa<DmaLoadOp, DmaStoreOp>(op))
+            return;
+          auto baseArg = op->getAttrOfType<IntegerAttr>("base_arg");
+          if (baseArg && baseArg.getInt() == lastArg)
+            op->setAttr("mram_offset", off);
+        });
+      }
+
     // assigned when the IR is lowered to memrefs.
     int64_t used = 0;
     bool exact = true;

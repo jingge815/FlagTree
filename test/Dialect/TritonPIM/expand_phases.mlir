@@ -44,7 +44,14 @@ module {
     // CHECK: pim.lut {{.*}}flpMinExp = 9{{.*}}kind = #pim.activation<exp>{{.*}}#pim.phase_spec<index = 1
     // CHECK: pim.reduce_axis {{.*}}kind = #pim.eltwise<add>{{.*}}#pim.phase_spec<index = 2
     // CHECK: pim.lut {{.*}}kind = #pim.activation<reciprocal>{{.*}}#pim.phase_spec<index = 3
-    // CHECK: pim.eltwise {{.*}}kind = #pim.eltwise<mul>{{.*}}#pim.phase_spec<index = 4, bytes = 2048, unit = combiner, reads = [1, 3]>
+    // `combineMode` must carry a real value, not the null placeholder the five
+    // call sites used to pass. Without it the production half of that change had
+    // no judge at all: reverting all five to null kept the whole suite green
+    // while the emitted IR silently lost the field. It is asserted on this line
+    // rather than its own CHECK because attributes print alphabetically, so
+    // `combineMode` sits before `kind` and an ordered CHECK after this line
+    // would look for it too late.
+    // CHECK: pim.eltwise {{.*}}combineMode = #pim.combine_mode<straightforward>{{.*}}kind = #pim.eltwise<mul>{{.*}}#pim.phase_spec<index = 4, bytes = 2048, unit = combiner, reads = [1, 3]>
     // CHECK-NOT: pim.softmax
     %p = pim.softmax %s {axis = 1 : i64, unit = #pim.unit<cstl>}
        : tensor<1x1024xf16> -> tensor<1x1024xf16>

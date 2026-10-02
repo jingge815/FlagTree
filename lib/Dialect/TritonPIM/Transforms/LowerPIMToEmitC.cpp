@@ -641,6 +641,18 @@ struct TritonPIMLowerToEmitCPass
     for (auto f : funcs)
       if (failed(lowerFunc(f)))
         return signalPassFailure();
+
+    // Lowering to EmitC leaves the PIM dialect behind, so PIM *dialect*
+    // attributes cannot stay: `mlir-translate` loads no dialect and rejects
+    // `#pim.placement<...>` as "created with unregistered dialect" (measured).
+    // The hardware attributes are exempt because they are builtin integers and
+    // strings that merely carry `pim.`-prefixed *names*.
+    //
+    // Removing it here, rather than earlier, is deliberate: the placement has to
+    // survive through `-pim-explicit-dma` because the pim mlir that stage emits
+    // is what the GeneSim cost model reads it from. This pass is the first point
+    // at which it has done its job.
+    mod->removeAttr(AttrPlacementName);
   }
 
   LogicalResult lowerFunc(triton::FuncOp oldFunc) {
@@ -762,6 +774,8 @@ struct TritonPIMLowerToEmitCPass
                            loops);
       if (failed(view))
         return failure();
+      // `mram_offset` 不在这里加。运行时按每个 access 的真实地址传指针
+      // （base + offset），内核再加一遍会把结果写到 2 倍偏移处。
       state.record(dmaLoad.getResult(), *view);
       return success();
     }
@@ -1147,9 +1161,12 @@ struct TritonPIMLowerToEmitCPass
             return dmaStore.emitError()
                   << "pim-lower-to-emitc could not reduce the output "
                      "transfer's address computation to an affine form";
-          return makeView(dmaStore, *base, shape->first, shape->second,
+          auto view = makeView(dmaStore, *base, shape->first, shape->second,
                           dmaStore.getMemDescType().getElementType(), *off,
                           loops);
+          if (failed(view))
+            return failure();
+          return view;
         }
       }
     }

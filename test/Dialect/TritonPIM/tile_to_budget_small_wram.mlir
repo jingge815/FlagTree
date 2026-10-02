@@ -22,5 +22,9 @@ module {
 // OK-DAG: "pim.tile-m" = 64 : i64
 // OK-DAG: "pim.tile-n" = 128 : i64
 // OK-DAG: "pim.tile-k" = 32 : i64
-// OK-DAG: "pim.tile-wram-bytes" = 28672 : i64
+// 64x128x32 with f16 operands and an f32 accumulator:
+//   x   = 64 x 32 x 2  =  4096
+//   w   = 128 x 32 x 2 =  8192
+//   out = 64 x 128 x 4 = 32768   <- the accumulator's own width
+// OK-DAG: "pim.tile-wram-bytes" = 45056 : i64
 // OK: "pim.wram-bytes-used" =

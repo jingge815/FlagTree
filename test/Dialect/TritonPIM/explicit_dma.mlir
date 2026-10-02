@@ -196,3 +196,29 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// 起始地址只盖到结果张量那条 DMA（base_arg 是最后一个实参），输入那条不动。
+// 对齐是字节单位的起始地址对齐，不改变行内步幅，所以 elem_stride 仍是证明出的 1。
+// CHECK-LABEL: @offset_lands_on_the_result_only
+// CHECK: pim.dma_load
+// CHECK-SAME: base_arg = 0 : i64
+// CHECK-SAME: elem_stride = 1 : i64
+// CHECK-NOT: mram_offset
+// CHECK: pim.dma_store
+// CHECK-SAME: base_arg = 1 : i64
+// CHECK-SAME: elem_stride = 1 : i64
+// CHECK-SAME: mram_offset = 128 : i64
+module attributes {pim.placement = #pim.placement<kind = replicate, mramOffset = 128, alignBytes = 64>} {
+  tt.func public @offset_lands_on_the_result_only(%a_ptr: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+    %range = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
+    %ap = tt.splat %a_ptr : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %aaddr = tt.addptr %ap, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    %a = tt.load %aaddr : tensor<64x!tt.ptr<f32>>
+    %op = tt.splat %o : !tt.ptr<f32> -> tensor<64x!tt.ptr<f32>>
+    %oaddr = tt.addptr %op, %range : tensor<64x!tt.ptr<f32>>, tensor<64xi32>
+    tt.store %oaddr, %a : tensor<64x!tt.ptr<f32>>
+    tt.return
+  }
+}

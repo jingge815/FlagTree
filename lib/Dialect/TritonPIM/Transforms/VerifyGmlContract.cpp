@@ -305,7 +305,43 @@ struct TritonPIMVerifyGmlContractPass
       TritonPIMVerifyGmlContractPass>::TritonPIMVerifyGmlContractBase;
 
   void runOnOperation() override {
-    WalkResult result = getOperation().walk([&](Operation *fn) {
+    ModuleOp mod = getOperation();
+
+    auto placement = mod->getAttrOfType<PlacementSpecAttr>(AttrPlacementName);
+
+    // Is the placement even possible on this device? `verifyModulePlacement`
+    // checks the spread against the DPU count and the named ids, and it lived
+    // only at the exit of `-convert-triton-to-pim` -- which this chain never
+    // runs, so a placement over 4 DPUs naming ids 7/9/11 was accepted on a
+    // 2-DPU device with no diagnostic. Measured: zero warnings on this path.
+    //
+    // Checked before the layout comparison so that a module with no tensors at
+    // all still reports the hardware problem rather than "no tensor layout
+    // records a split". The declared value is read, not `lookupNumDpus`'s
+    // fallback: an undeclared count is "no constraint stated", not "the
+    // hardware has one DPU".
+    if (placement) {
+      std::optional<int64_t> numDpus = maybeLookupNumDpus(mod);
+      if (numDpus && failed(verifyModulePlacement(
+              mod, placement, static_cast<int>(*numDpus)))) {
+        signalPassFailure();
+        return;
+      }
+    }
+
+    // The Placement dimension has two carriers, and they can disagree: the
+    // module attribute says what the graph compiler decided, the tensor
+    // encodings say what was actually written down. This used to be checked
+    // only at the exit of `-convert-triton-to-pim`, which the operator-level
+    // chain never runs, so a drifted module passed that chain silently.
+    // Measured: a module declaring 4 DPUs whose encodings spread over 2
+    // converted with rc=0. The same check belongs at this chain's exit too.
+    if (placement && failed(verifyLayoutsMatchPlacement(mod, placement))) {
+      signalPassFailure();
+      return;
+    }
+
+    WalkResult result = mod.walk([&](Operation *fn) {
       // Only function-like scopes hold a phase chain; the module itself and the
       // ops inside a function are visited separately.
       if (!isa<FunctionOpInterface>(fn))

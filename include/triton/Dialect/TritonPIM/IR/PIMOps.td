@@ -137,7 +137,10 @@ def TTPIM_DmaLoadOp : TTPIM_Op<"dma_load", [
         `elem_stride` elements per index step;
       - `elem_stride`: that step, in elements;
       - `base_arg`: index of the `tt.func` argument the base address traces
-        back to.
+        back to;
+      - `mram_offset`: byte offset of this tensor from the base the pointer
+        traces back to. It is a property of the buffer, not of the access
+        pattern, so it is recorded even when the stride has not been proven.
 
     Their *absence carries meaning*: it says the transfer has not been proven
     expressible as a strided DMA, not that it is contiguous by default. A
@@ -167,14 +170,16 @@ def TTPIM_DmaLoadOp : TTPIM_Op<"dma_load", [
     TTPIM_WRAMMemDesc:$result,
     OptionalAttr<I64Attr>:$contiguous_dim,
     OptionalAttr<I64Attr>:$elem_stride,
-    OptionalAttr<I64Attr>:$base_arg
+    OptionalAttr<I64Attr>:$base_arg,
+    OptionalAttr<I64Attr>:$mram_offset
   );
 
   let builders = [
     OpBuilder<(ins "Value":$ptr, "Value":$mask, "Value":$other,
                    "Value":$result),
               [{ build($_builder, $_state, ptr, mask, other, result,
-                       IntegerAttr(), IntegerAttr(), IntegerAttr()); }]>
+                       IntegerAttr(), IntegerAttr(), IntegerAttr(),
+                       IntegerAttr()); }]>
   ];
 
   let extraClassDeclaration = [{
@@ -223,13 +228,15 @@ def TTPIM_DmaStoreOp : TTPIM_Op<"dma_store", [
     Optional<TT_BoolLike>:$mask,
     OptionalAttr<I64Attr>:$contiguous_dim,
     OptionalAttr<I64Attr>:$elem_stride,
-    OptionalAttr<I64Attr>:$base_arg
+    OptionalAttr<I64Attr>:$base_arg,
+    OptionalAttr<I64Attr>:$mram_offset
   );
 
   let builders = [
     OpBuilder<(ins "Value":$src, "Value":$ptr, "Value":$mask),
               [{ build($_builder, $_state, src, ptr, mask,
-                       IntegerAttr(), IntegerAttr(), IntegerAttr()); }]>
+                       IntegerAttr(), IntegerAttr(), IntegerAttr(),
+                       IntegerAttr()); }]>
   ];
 
   let extraClassDeclaration = [{

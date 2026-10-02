@@ -25,6 +25,7 @@ flagtree = flagOS 存算一体（PIM）体系的**算子编译器**：基于 Fla
 | `test/Dialect/TritonPIM/` | PIM lit 测试（行为边界真源） | `ops` `explicit_dma` `tile_to_budget` `lower_to_emitc` `operator_ops` `fuse_activation` `expand_phases` `phase_spec` `verify_gml_contract` | 抄 lit 命令/看期望 IR |
 | `test/Conversion/triton_to_pim.mlir` | 转换测试 | `convert-triton-to-pim` | 转换结果对照 |
 | `docs/triton-pim-support-20260818.md` | PIM 设计与现状（含问题清单） | `技术文档` `mermaid` | 快速理解整体设计 |
+| `docs/tile-to-budget-flaggems-linear-20261002.md` | grid 切分内核（FlagGems）只报分块不重建；位置参数折循环次数 | `技术文档` `mermaid` `tiling` | 查 A 路 tiling 行为 |
 | `include/triton/{Analysis,Dialect/Triton*,Conversion/TritonGPUToLLVM}`、`lib/{Analysis,Dialect/Triton*,Conversion/TritonGPUToLLVM,Target}` | Triton 公共核心/GPU 路径 | `TTIR` `TTGIR` `AxisInfo` | 对照 GPU 路径、公共基础设施 |
 | `python/triton/{language,compiler,runtime}` | Triton 前端/流水线/运行时 | `semantic.py` `compiler.py` `jit.py` | 前端/启动问题 |
 | `third_party/{nvidia,amd,ascend,enflame,mthreads,tsingmicro,iluvatar,xpu,tle,proton}` | 各硬件后端/TLE/Proton | `backend/compiler.py` | 后端适配问题 |
@@ -87,6 +88,7 @@ flagtree = flagOS 存算一体（PIM）体系的**算子编译器**：基于 Fla
 - 权值通路（int4/int8 绑权、内容指纹）→ `operator_ops.mlir` 的 `weight_binding` 段 + `PIMAttrDefs.td::WeightBindingAttr`
 - 激活融合/图格式约束 → `FuseActivation.cpp` + `fuse_activation.mlir`
 - WRAM 超预算 / tiling / M/N/K 推断 → `TileToBudget.cpp` + `tile_to_budget_*.mlir`
+- grid 切分内核（FlagGems，读 `tt.get_program_id`）超预算却不该被重建 → `TileToBudget.cpp::isGridPartitioned` + `tile_to_budget_grid_partitioned.mlir` + `docs/tile-to-budget-flaggems-linear-20261002.md`
 - EmitC/C 产物、numpy 执行 → `LowerPIMToEmitC.cpp` + `lower_to_emitc*.mlir`（外部 `opcompiler_bridge/driver.py`）
 - 算子级（整张量）内核降到 C、相位链怎么变成循环 → `lower_to_emitc_ops*.mlir` + `LowerPIMToEmitC.cpp` 的 operator-level 段
 - 分组归约 / 定点定标 / 逐元素乘 / 查表算子 → `PIMOps.td` 的 `global_pool` / `fpsu_scale` / `kantor` / `gather` + `operator_ops.mlir`

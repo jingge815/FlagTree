@@ -95,6 +95,23 @@ static void setPhaseSpec(Operation *op, int64_t index, RankedTensorType ty,
   op->setAttr("isPhased", UnitAttr::get(ctx));
 }
 
+// How a phase's result rejoins the chain that consumes it.
+//
+// Four of the five expansion sites below are intra-chain intermediates: the
+// value flows straight into the next phase and nothing merges with it, which is
+// exactly `straightforward`. The RoPE tail is the one real merge -- the cosine
+// and sine halves come back together there -- but it is still a merge of two
+// values computed in the same chain, not a residual arriving from earlier, so it
+// is `straightforward` too rather than `skip_connection`.
+//
+// Writing the honest value matters because the attribute now has a consumer:
+// `EltwiseOp::verify` requires `skip_connection` to be an add. Leaving these
+// null kept the field unreadable -- five producers passing a placeholder and no
+// reader anywhere in the dialect.
+static CombineModeAttr straightforward(MLIRContext *ctx) {
+  return CombineModeAttr::get(ctx, CombineMode::Straightforward);
+}
+
 static DatapathAttr floatDatapath(MLIRContext *ctx) {
   return DatapathAttr::get(ctx, NumericMode::FloatingPoint,
                            NumericMode::FloatingPoint,
@@ -405,7 +422,7 @@ static LogicalResult expandSoftmax(SoftmaxOp op) {
       loc, srcTy, /*phases=*/ArrayAttr{}, /*isPhased=*/UnitAttr{}, /*fpsu=*/FpsuSpecAttr{}, /*kantor=*/KantorSpecAttr{}, ValueRange{src, p0.getResult()},
       EltwiseKindAttr::get(ctx, EltwiseKind::Sub), floatDatapath(ctx),
       DatapathAttr{}, /*perSlotDatapath=*/ArrayAttr{}, ActSpecAttr{},
-      PoolSpecAttr{}, ContractionAttr{}, CombineModeAttr{}, /*rotateHalf=*/UnitAttr{}, /*transposePurpose=*/TransposePurposeAttr{}, /*sourceSubBlocks=*/ArrayAttr{}, /*sourceBroadcastSpec=*/BroadcastSpecAttr{}, unitFpsu);
+      PoolSpecAttr{}, ContractionAttr{}, straightforward(ctx), /*rotateHalf=*/UnitAttr{}, /*transposePurpose=*/TransposePurposeAttr{}, /*sourceSubBlocks=*/ArrayAttr{}, /*sourceBroadcastSpec=*/BroadcastSpecAttr{}, unitFpsu);
 
   auto expTy = sameShape(srcTy, f16);
   auto p1 = emitLut(b, loc, shifted.getResult(), ActivationKind::Exp,
@@ -437,7 +454,7 @@ static LogicalResult expandSoftmax(SoftmaxOp op) {
       loc, expTy, /*phases=*/ArrayAttr{}, /*isPhased=*/UnitAttr{}, /*fpsu=*/FpsuSpecAttr{}, /*kantor=*/KantorSpecAttr{}, ValueRange{p1.getResult(), p3.getResult()},
       EltwiseKindAttr::get(ctx, EltwiseKind::Mul), floatDatapath(ctx),
       DatapathAttr{}, /*perSlotDatapath=*/ArrayAttr{}, ActSpecAttr{},
-      PoolSpecAttr{}, ContractionAttr{}, CombineModeAttr{}, /*rotateHalf=*/UnitAttr{},
+      PoolSpecAttr{}, ContractionAttr{}, straightforward(ctx), /*rotateHalf=*/UnitAttr{},
       /*transposePurpose=*/TransposePurposeAttr{}, /*sourceSubBlocks=*/ArrayAttr{}, /*sourceBroadcastSpec=*/BroadcastSpecAttr{}, unitCombiner);
   setPhaseSpec(p4, 4, expTy, FunctionalUnit::Combiner, /*consecutive=*/false,
                /*reads=*/{1, 3});
@@ -467,7 +484,7 @@ static LogicalResult expandRope(RopeOp op) {
       loc, srcTy, /*phases=*/ArrayAttr{}, /*isPhased=*/UnitAttr{}, /*fpsu=*/FpsuSpecAttr{}, /*kantor=*/KantorSpecAttr{}, ValueRange{op.getSrc(), op.getCos()},
       EltwiseKindAttr::get(ctx, EltwiseKind::Mul), mulPath, DatapathAttr{},
       /*perSlotDatapath=*/ArrayAttr{}, ActSpecAttr{}, PoolSpecAttr{},
-      ContractionAttr{}, CombineModeAttr{}, /*rotateHalf=*/UnitAttr{},
+      ContractionAttr{}, straightforward(ctx), /*rotateHalf=*/UnitAttr{},
       /*transposePurpose=*/TransposePurposeAttr{}, /*sourceSubBlocks=*/ArrayAttr{}, /*sourceBroadcastSpec=*/BroadcastSpecAttr{}, unit);
   setPhaseSpec(mulCos, 0, srcTy, FunctionalUnit::Kantor, /*consecutive=*/true);
   setKantorSpec(mulCos, KantorMode::ElementwiseMulFp16, /*card=*/5);
@@ -477,7 +494,7 @@ static LogicalResult expandRope(RopeOp op) {
       loc, srcTy, /*phases=*/ArrayAttr{}, /*isPhased=*/UnitAttr{}, /*fpsu=*/FpsuSpecAttr{}, /*kantor=*/KantorSpecAttr{}, ValueRange{op.getSrc(), op.getSin()},
       EltwiseKindAttr::get(ctx, EltwiseKind::Mul), mulPath, DatapathAttr{},
       /*perSlotDatapath=*/ArrayAttr{}, ActSpecAttr{}, PoolSpecAttr{},
-      ContractionAttr{}, CombineModeAttr{}, /*rotateHalf=*/UnitAttr{},
+      ContractionAttr{}, straightforward(ctx), /*rotateHalf=*/UnitAttr{},
       /*transposePurpose=*/TransposePurposeAttr{}, /*sourceSubBlocks=*/ArrayAttr{}, /*sourceBroadcastSpec=*/BroadcastSpecAttr{}, unit);
   mulSin.setRotateHalf(true);
   setPhaseSpec(mulSin, 1, srcTy, FunctionalUnit::Kantor, /*consecutive=*/true);
@@ -488,7 +505,7 @@ static LogicalResult expandRope(RopeOp op) {
       loc, srcTy, /*phases=*/ArrayAttr{}, /*isPhased=*/UnitAttr{}, /*fpsu=*/FpsuSpecAttr{}, /*kantor=*/KantorSpecAttr{}, ValueRange{mulCos.getResult(), mulSin.getResult()},
       EltwiseKindAttr::get(ctx, EltwiseKind::Add), addPath, DatapathAttr{},
       /*perSlotDatapath=*/ArrayAttr{}, ActSpecAttr{}, PoolSpecAttr{},
-      ContractionAttr{}, CombineModeAttr{}, /*rotateHalf=*/UnitAttr{},
+      ContractionAttr{}, straightforward(ctx), /*rotateHalf=*/UnitAttr{},
       /*transposePurpose=*/TransposePurposeAttr{}, /*sourceSubBlocks=*/ArrayAttr{}, /*sourceBroadcastSpec=*/BroadcastSpecAttr{}, unit);
   setPhaseSpec(add, 2, srcTy, FunctionalUnit::Kantor, /*consecutive=*/true);
   // The add phase differs between the two RoPE chains: the K path requantizes
