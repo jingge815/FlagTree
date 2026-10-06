@@ -460,3 +460,21 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// 拆分轴前面还有维度（outer=2）时，每份结果的写回下标必须带上外层偏移。
+// 否则外层循环每转一圈都写回同一段，只有最后一块外层的数据留得下来。
+// CHECK-LABEL: func.func @split_heads_with_outer_dimension
+module {
+  tt.func @split_heads_with_outer_dimension(%x: tensor<2x4x8xf16>) {
+    // 写回下标是「外层序号 × 每份元素数 + 内层序号」，三行紧贴着落到
+    // 输出指针上。源侧的乘法左操作数是常量，写回侧是外层归纳变量，
+    // 按形态分开绑；写回退回成内层循环变量时，这三行不再相邻。
+    // CHECK: %[[BASE:.*]] = mul %arg{{.*}}, %{{.*}} : (i32, i32) -> i32
+    // CHECK-NEXT: %[[IDX:.*]] = add %[[BASE]], %{{.*}} : (i32, i32) -> i32
+    // CHECK-NEXT: subscript %arg1[%[[IDX]]]
+    %a, %b = pim.split_heads %x {axis = 1 : i64, numHeads = 2 : i64} : tensor<2x4x8xf16> -> tensor<2x2x8xf16>, tensor<2x2x8xf16>
+    tt.return
+  }
+}

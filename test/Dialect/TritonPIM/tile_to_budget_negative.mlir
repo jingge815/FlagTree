@@ -20,5 +20,5 @@ module {
 }
 
 // MISSING: error: pim-tile-to-budget requires pim.wram-bytes
-// OVER: error: no legal power-of-two tile fits: M=4 N=8 K=16 dtype_bytes=2 wram_bytes=128 mram_bytes=4294967296 dma_align=64; smallest tried was M=1 N=1 K=1
-// BADALIGN: error: no legal power-of-two tile fits: M=4 N=8 K=16 dtype_bytes=2 wram_bytes=65536 mram_bytes=4294967296 dma_align=256; smallest tried was M=1 N=1 K=1
+// OVER: error: no legal tile fits: M=4 N=8 K=16 dtype_bytes=2 wram_bytes=128 mram_bytes=4294967296 dma_align=64; smallest tried was M=1 N=1 K=1
+// BADALIGN: error: no legal tile fits: M=4 N=8 K=16 dtype_bytes=2 wram_bytes=65536 mram_bytes=4294967296 dma_align=256; smallest tried was M=1 N=1 K=1

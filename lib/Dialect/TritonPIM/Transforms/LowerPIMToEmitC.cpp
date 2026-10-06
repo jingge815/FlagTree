@@ -172,6 +172,19 @@ static float pim_f16_to_f32(uint16_t h) {
 static float pim_absf(float f) { return f < 0.0f ? -f : f; }
 static float pim_maxf(float a, float b) { return a > b ? a : b; }
 static float pim_i8_to_f32(int8_t v) { return (float)v; }
+static float pim_i32_to_f32(int32_t v) { return (float)v; }
+static int32_t pim_f32_to_i32(float f) {
+  if (f >= 2147483647.0f) return 2147483647;
+  if (f <= -2147483648.0f) return -2147483648;
+  return (int32_t)rintf(f);
+}
+// i64 用在位置索引上（attention 的掩码坐标），转换方向以 i64 -> f32 为主。
+static float pim_i64_to_f32(int64_t v) { return (float)v; }
+static int64_t pim_f32_to_i64(float f) {
+  if (f >= 9.2233720368547758e18f) return INT64_MAX;
+  if (f <= -9.2233720368547758e18f) return INT64_MIN;
+  return (int64_t)rintf(f);
+}
 // The remainder of an rms normalization. Spelled out rather than left to the
 // C library so the NumPy mirror can be checked against the same three steps.
 static float pim_rsqrtf(float x) { return 1.0f / sqrtf(x); }
@@ -243,9 +256,15 @@ static uint16_t pim_f32_to_f16(float f) {
 
 // Storage element type -> the C type the emitted pointer parameter uses.
 // f16 becomes uint16_t because C has no portable half (see above).
+// i32 becomes int32_t: the operator path reads and writes it through the
+// conversion helpers, which take a signed value, not a bare i32.
 static Type storageTypeFor(OpBuilder &b, Type elemTy) {
   if (elemTy.isF16())
     return b.getI16Type();
+  if (elemTy.isInteger(32))
+    return b.getI32Type();
+  if (elemTy.isInteger(64))
+    return b.getI64Type();
   return elemTy; // f32, i8
 }
 
@@ -466,6 +485,18 @@ struct OffsetAnalysis {
 // Buffer views
 //===----------------------------------------------------------------------===//
 
+// 把下标夹到 [0, limit)。limit 为 0 时不夹，保持原行为。越界时取最后一个
+// 合法下标，只为不越过分配范围；越界元素不参与结果，取值不影响数值。
+static Value clampIndex(OpBuilder &b, Location loc, Value index, int64_t limit) {
+  if (limit <= 0)
+    return index;
+  Type i32 = b.getI32Type();
+  Value hi = b.create<emitc::ConstantOp>(loc, i32, b.getI32IntegerAttr(limit - 1));
+  Value over = b.create<emitc::CmpOp>(loc, b.getI1Type(), emitc::CmpPredicate::gt,
+                                     index, hi);
+  return b.create<emitc::ConditionalOp>(loc, i32, over, hi, index);
+}
+
 // A tracked tensor SSA value: a 2-D tile of `rows x cols` elements in the
 // MRAM buffer reached through `ptr`, addressed as
 // `rowStride*row + colStride*col + constant`. `rows`/`cols` are the *full*
@@ -480,6 +511,10 @@ struct BufferView {
   int64_t colStride = 1;
   int64_t constant = 0;
   bool transposed = false;
+  // 逻辑维度的真实上界。0 表示不限制，与改动前的行为一致。分块不能整除维度时，
+  // 推导出的行列数会含尾块的越界部分，读取必须夹在这个上界内。
+  int64_t rowLimit = 0;
+  int64_t colLimit = 0;
   // MRAM storage element type (f16 or f32). Arithmetic is always f32; f16
   // buffers are read/written through the conversion helpers.
   Type elemTy;
@@ -490,6 +525,10 @@ struct BufferView {
   int64_t logicalCols() const { return transposed ? rows : cols; }
 
   Value elementOffset(OpBuilder &b, Location loc, Value row, Value col) const {
+    // row、col 是逻辑坐标，上界也得是逻辑轴的。tt.trans 里已经把
+    // rowLimit 与 colLimit 对调过，所以这里直接按逻辑轴取用。
+    row = clampIndex(b, loc, row, rowLimit);
+    col = clampIndex(b, loc, col, colLimit);
     auto i32 = b.getI32Type();
     auto cst = [&](int64_t v) -> Value {
       return b.create<emitc::ConstantOp>(loc, i32, b.getI32IntegerAttr(v));
@@ -521,11 +560,20 @@ makeView(Operation *op, Value ptr, int64_t tileRows, int64_t tileCols,
   v.elemTy = elemTy;
 
   for (auto &term : off.ivTerms) {
-    // Find this induction variable's trip count.
+    // 找这个归纳变量的循环次数。步长不能整除上界时，最后一趟是尾块，
+    // 推导出的整维比真实维度大，读取要夹在真实上界内。
     int64_t trip = 0;
+    std::optional<int64_t> realExtent;
     for (auto &l : loops)
-      if (l.iv == term.iv)
+      if (l.iv == term.iv) {
         trip = l.tripCount;
+        Value iv = l.iv;
+        auto forOp = cast<scf::ForOp>(iv.getParentBlock()->getParentOp());
+        auto step = OffsetAnalysis::constantInt(forOp.getStep());
+        auto ub = OffsetAnalysis::constantInt(forOp.getUpperBound());
+        if (step && ub && *ub % *step != 0)
+          realExtent = *ub;
+      }
     if (trip == 0)
       return op->emitError() << "pim-lower-to-emitc: address depends on "
                                 "a value that is not an enclosing tiled loop's "
@@ -541,9 +589,13 @@ makeView(Operation *op, Value ptr, int64_t tileRows, int64_t tileCols,
     switch (term.axis) {
     case Axis::Row:
       v.rows *= trip;
+      if (realExtent)
+        v.rowLimit = *realExtent;
       break;
     case Axis::Col:
       v.cols *= trip;
+      if (realExtent)
+        v.colLimit = *realExtent;
       break;
     case Axis::Unassigned:
       return op->emitError()
@@ -595,9 +647,8 @@ static std::optional<int64_t> tripCountOf(scf::ForOp forOp) {
   auto st = OffsetAnalysis::constantInt(forOp.getStep());
   if (!lb || !ub || !st || *st <= 0 || *lb != 0)
     return std::nullopt;
-  if (*ub % *st != 0)
-    return std::nullopt; // a partial tile would need masking
-  return *ub / *st;
+  // 向上取整。不能整除时最后一趟是尾块，越界的读取由 BufferView 的上界夹住。
+  return (*ub + *st - 1) / *st;
 }
 
 //===----------------------------------------------------------------------===//
@@ -715,9 +766,7 @@ struct TritonPIMLowerToEmitCPass
         if (!trip)
           return forOp.emitError()
                 << "pim-lower-to-emitc only handles tiling loops with "
-                   "static bounds starting at 0 and an evenly dividing step "
-                   "(a partial tile would need masking, which pim-explicit-dma "
-                   "cannot prove as a strided DMA)";
+                   "static bounds starting at 0";
         loops.push_back({forOp.getInductionVar(), *trip});
         if (failed(lowerRegion(*forOp.getBody(), newFunc, state, b, loops)))
           return failure();
@@ -807,6 +856,7 @@ struct TritonPIMLowerToEmitCPass
                                     "2-D transpose (order = [1, 0])";
       BufferView dst = *src;
       dst.transposed = !dst.transposed;
+      std::swap(dst.rowLimit, dst.colLimit);
       state.record(trans.getResult(), dst);
       return success();
     }
@@ -979,7 +1029,16 @@ struct TritonPIMLowerToEmitCPass
     // walked out of bounds on `w` after a tt.trans and corrupted the heap
     // (found as a segfault, not a wrong-answer -- see the mismatch between
     // rows=N,cols=K passed in vs. src.logicalRows()==K,logicalCols()==N).
-    int64_t cols = src.logicalCols();
+    // rowLimit、colLimit 记的就是逻辑轴的上界，直接取用。
+    int64_t logicalRowLimit = src.rowLimit;
+    int64_t logicalColLimit = src.colLimit;
+    int64_t cols = logicalColLimit > 0 ? logicalColLimit : src.logicalCols();
+    int64_t realRows = logicalRowLimit > 0 ? logicalRowLimit : src.logicalRows();
+    // 调用方按含尾块的虚尺寸传 rowCount，分配和拷贝都要收回到真实行数。
+    if (rowStart >= realRows)
+      rowCount = 0;
+    else if (rowStart + rowCount > realRows)
+      rowCount = realRows - rowStart;
     auto f32 = b.getF32Type();
     auto i32 = b.getI32Type();
     auto i64 = b.getI64Type();
@@ -1035,6 +1094,13 @@ struct TritonPIMLowerToEmitCPass
     auto cst = [&](int64_t v) -> Value {
       return b.create<emitc::ConstantOp>(loc, i32, b.getI32IntegerAttr(v));
     };
+    // 尾块时推导出的维度含越界部分，循环上界改用真实尺寸。
+    int64_t realM = aMram.rowLimit > 0 ? aMram.rowLimit : M;
+    int64_t realK = aMram.colLimit > 0 ? aMram.colLimit : K;
+    int64_t realN = out.colLimit > 0 ? out.colLimit : N;
+    M = realM;
+    K = realK;
+    N = realN;
     Value c0 = cst(0), c1 = cst(1), cN = cst(N), cK = cst(K);
 
     BufferView w = snapshotToLocal(b, loc, wMram, /*rowStart=*/0,
@@ -1205,6 +1271,8 @@ struct TritonPIMLowerToEmitCPass
     Type elemTy;
     bool isF16() const { return elemTy && elemTy.isF16(); }
     bool isI8() const { return elemTy && elemTy.isInteger(8); }
+    bool isI32() const { return elemTy && elemTy.isInteger(32); }
+    bool isI64() const { return elemTy && elemTy.isInteger(64); }
   };
 
   // `for (i = start; i < end; ++i)`.
@@ -1261,6 +1329,14 @@ struct TritonPIMLowerToEmitCPass
       return b.create<emitc::CallOpaqueOp>(loc, TypeRange{b.getF32Type()},
                                            "pim_i8_to_f32", ValueRange{raw})
           .getResult(0);
+    if (buf.isI32())
+      return b.create<emitc::CallOpaqueOp>(loc, TypeRange{b.getF32Type()},
+                                           "pim_i32_to_f32", ValueRange{raw})
+          .getResult(0);
+    if (buf.isI64())
+      return b.create<emitc::CallOpaqueOp>(loc, TypeRange{b.getF32Type()},
+                                           "pim_i64_to_f32", ValueRange{raw})
+          .getResult(0);
     return raw;
   }
 
@@ -1282,6 +1358,16 @@ struct TritonPIMLowerToEmitCPass
           b.create<emitc::CallOpaqueOp>(loc, TypeRange{storage},
                                         "pim_f32_to_i8", ValueRange{value})
               .getResult(0);
+    else if (buf.isI32())
+      toStore =
+          b.create<emitc::CallOpaqueOp>(loc, TypeRange{storage},
+                                        "pim_f32_to_i32", ValueRange{value})
+              .getResult(0);
+    else if (buf.isI64())
+      toStore =
+          b.create<emitc::CallOpaqueOp>(loc, TypeRange{storage},
+                                        "pim_f32_to_i64", ValueRange{value})
+              .getResult(0);
     b.create<emitc::AssignOp>(loc, lv, toStore);
   }
 
@@ -1302,6 +1388,7 @@ struct TritonPIMLowerToEmitCPass
     case ActivationKind::Reciprocal:
     case ActivationKind::Exp:
     case ActivationKind::Silu:
+    case ActivationKind::Rsqrt:
       return success();
     default:
       return op->emitOpError()
@@ -1321,6 +1408,7 @@ struct TritonPIMLowerToEmitCPass
     case ActivationKind::Reciprocal: fn = "pim_lut_reciprocal"; break;
     case ActivationKind::Exp:        fn = "pim_lut_exp"; break;
     case ActivationKind::Silu:       fn = "pim_lut_silu"; break;
+    case ActivationKind::Rsqrt:      fn = "pim_rsqrtf"; break;
     default:
       llvm_unreachable("checkFusedTail already rejected this kind");
     }
@@ -1601,13 +1689,14 @@ struct TritonPIMLowerToEmitCPass
         return lut.emitOpError()
                << "pim-lower-to-emitc has no C for a table-driven lut "
                   "(table / window / interpolation); the closed-form kinds "
-                  "are identity / reciprocal / exp / silu";
+                  "are identity / reciprocal / exp / silu / rsqrt";
       StringRef fn;
       switch (lut.getKind()) {
       case ActivationKind::Identity:   fn = "pim_lut_identity"; break;
       case ActivationKind::Reciprocal: fn = "pim_lut_reciprocal"; break;
       case ActivationKind::Exp:        fn = "pim_lut_exp"; break;
       case ActivationKind::Silu:       fn = "pim_lut_silu"; break;
+      case ActivationKind::Rsqrt:      fn = "pim_rsqrtf"; break;
       default:
         return lut.emitOpError()
                << "pim-lower-to-emitc has no C for activation "
@@ -2592,15 +2681,25 @@ struct TritonPIMLowerToEmitCPass
 
       for (auto [n, result] : llvm::enumerate(results)) {
         FlatBuffer dst = destination(op, result);
+        // 每份结果的元素数。写回下标必须带上外层偏移，否则外层循环每转一圈
+        // 都写回同一段，只有最后一块外层的数据留得下来。
+        int64_t piece = headSize * inner;
         emitFor(b, loc, 0, outer, [&](OpBuilder &ob, Value o) {
-          emitFor(ob, loc, 0, headSize * inner, [&](OpBuilder &ib, Value j) {
+          emitFor(ob, loc, 0, piece, [&](OpBuilder &ib, Value j) {
+            // 源下标 = 外层序号 × 整轴长度 + 第 n 份的起点 + 份内序号。
             Value srcIdx = ib.create<emitc::AddOp>(
                 loc, i32,
-                ib.create<emitc::MulOp>(loc, i32, o,
-                                        constI32(ib, loc, inner * extent)),
+                ib.create<emitc::MulOp>(loc, i32,
+                                        constI32(ib, loc, inner * extent), o),
                 ib.create<emitc::AddOp>(
-                    loc, i32, constI32(ib, loc, n * headSize * inner), j));
-            storeFlat(ib, loc, dst, j, loadFlat(ib, loc, src, srcIdx));
+                    loc, i32, constI32(ib, loc, n * piece), j));
+            Value loaded = loadFlat(ib, loc, src, srcIdx);
+            // 写回下标 = 外层序号 × 每份元素数 + 份内序号。
+            Value dstIdx = ib.create<emitc::AddOp>(
+                loc, i32, ib.create<emitc::MulOp>(loc, i32, o,
+                                                  constI32(ib, loc, piece)),
+                j);
+            storeFlat(ib, loc, dst, dstIdx, loaded);
           });
         });
       }

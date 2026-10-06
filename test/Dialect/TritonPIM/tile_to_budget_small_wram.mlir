@@ -18,7 +18,7 @@ module {
   }
 }
 
-// OVER: error: no legal power-of-two tile fits: M=64 N=128 K=32 dtype_bytes=2 wram_bytes=128 mram_bytes=4294967296 dma_align=64; smallest tried was M=1 N=1 K=1
+// OVER: error: no legal tile fits: M=64 N=128 K=32 dtype_bytes=2 wram_bytes=128 mram_bytes=4294967296 dma_align=64; smallest tried was M=1 N=1 K=1
 // OK-DAG: "pim.tile-m" = 64 : i64
 // OK-DAG: "pim.tile-n" = 128 : i64
 // OK-DAG: "pim.tile-k" = 32 : i64

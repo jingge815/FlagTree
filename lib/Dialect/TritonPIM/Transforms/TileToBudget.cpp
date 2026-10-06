@@ -28,10 +28,6 @@ struct TileShape {
   int64_t k = 0;
 };
 
-static bool isPowerOfTwo(int64_t value) {
-  return value > 0 && ((value & (value - 1)) == 0);
-}
-
 static std::optional<int64_t> constantInt(Value v) {
   if (auto cst = v.getDefiningOp<arith::ConstantOp>()) {
     if (auto dense = dyn_cast<DenseElementsAttr>(cst.getValue()))
@@ -702,10 +698,6 @@ static LogicalResult validateDot(triton::DotOp dot) {
   if (aTy.getShape()[0] <= 0 || bTy.getShape()[0] <= 0 ||
       dTy.getShape()[0] <= 0 || dTy.getShape()[1] <= 0)
     return dot.emitError() << "tt.dot shapes must be positive";
-  if (!isPowerOfTwo(aTy.getShape()[0]) || !isPowerOfTwo(bTy.getShape()[0]) ||
-      !isPowerOfTwo(aTy.getShape()[1]) || !isPowerOfTwo(dTy.getShape()[0]) ||
-      !isPowerOfTwo(dTy.getShape()[1]))
-    return dot.emitError() << "pim-tile-to-budget requires power-of-two tiles";
   return success();
 }
 
@@ -806,43 +798,52 @@ static bool fitsBudget(TileShape tile, int64_t elemBytes, int64_t accumBytes,
   return xBytes % dma == 0 && wBytes % dma == 0 && oBytes % dma == 0;
 }
 
-// Every power-of-two divisor of `full`, descending (largest first): used to
-// enumerate candidate tile sizes along one dimension.
-static SmallVector<int64_t, 8> powerOfTwoDivisorsDesc(int64_t full) {
+// Candidate tile sizes along one dimension, largest first: every power of two
+// up to `full`, then `full` itself when it is not one of them. The powers of
+// two guarantee a legal tile exists once WRAM is small enough; `full` keeps the
+// whole extent as a candidate so a dimension that already fits is not split.
+static SmallVector<int64_t, 8> candidateTilesDesc(int64_t full) {
   SmallVector<int64_t, 8> vals;
-  for (int64_t v = full; v >= 1; v /= 2)
+  if (full <= 0)
+    return vals;
+  int64_t top = 1;
+  while (top <= full / 2)
+    top *= 2;
+  for (int64_t v = top; v >= 1; v /= 2)
     vals.push_back(v);
+  if (full > top)
+    vals.push_back(full);
   return vals;
 }
 
 // Searches for a WRAM/DMA-legal tile no larger than `visible` in any
-// dimension. Exhaustive over the power-of-two lattice below `visible`
-// (bounded: at most log2(M)+1 * log2(N)+1 * log2(K)+1 candidates, a few
-// hundred at the largest realistic shapes) rather than greedily shrinking
-// one dimension to its floor before trying another -- a greedy single path
-// can dead-end: e.g. shrinking K first to fix a WRAM overage can make x's
-// per-tile byte count drop below `dma`, permanently failing the alignment
-// check for every smaller K, even though a *different* K paired with a
-// smaller N would satisfy both budget and alignment. Every candidate stays
-// a power of two dividing the corresponding full extent, since `visible`
-// and `full` are both already powers of two (guaranteed by `validateDot`
-// and the `_compiled_linear_supports` gate upstream). Symmetric across
-// M/N/K on purpose: nothing here assumes M is 1 or unsplit -- if a future
-// shape needs the M dimension tiled too, this same search already finds it.
-// Among all legal tiles, picks the one with the most elements (fewest loop
-// iterations over the untiled extents), preferring to keep K largest, then
-// N, then M when multiple tiles tie on element count -- matching the
-// design's stated preference order without needing a separate tie-break
-// pass. On failure, `*smallestTried` (if non-null) is left holding {1,1,1}
-// clamped to `visible`, for a diagnostic.
+// dimension. Exhaustive over the power-of-two lattice below `visible` plus
+// `visible` itself (bounded: at most log2(M)+2 * log2(N)+2 * log2(K)+2
+// candidates, a few hundred at the largest realistic shapes) rather than
+// greedily shrinking one dimension to its floor before trying another -- a
+// greedy single path can dead-end: e.g. shrinking K first to fix a WRAM
+// overage can make x's per-tile byte count drop below `dma`, permanently
+// failing the alignment check for every smaller K, even though a *different*
+// K paired with a smaller N would satisfy both budget and alignment. The
+// candidates are the powers of two up to the visible extent plus that extent
+// itself, so a dimension that is not a power of two still has the
+// whole-extent option and still bottoms out at 1. Symmetric across M/N/K on
+// purpose: nothing here assumes M is 1 or unsplit -- if a future shape needs
+// the M dimension tiled too, this same search already finds it. Among all
+// legal tiles, picks the one with the most elements (fewest loop iterations
+// over the untiled extents), preferring to keep K largest, then N, then M
+// when multiple tiles tie on element count -- matching the design's stated
+// preference order without needing a separate tie-break pass. On failure,
+// `*smallestTried` (if non-null) is left holding {1,1,1} clamped to
+// `visible`, for a diagnostic.
 static std::optional<TileShape> searchTile(TileShape visible, int64_t elemBytes,
                                            int64_t accumBytes, int64_t wram,
                                            int64_t dma,
                                            TileShape *smallestTried = nullptr) {
   std::optional<TileShape> best;
-  for (int64_t m : powerOfTwoDivisorsDesc(visible.m))
-    for (int64_t n : powerOfTwoDivisorsDesc(visible.n))
-      for (int64_t k : powerOfTwoDivisorsDesc(visible.k)) {
+  for (int64_t m : candidateTilesDesc(visible.m))
+    for (int64_t n : candidateTilesDesc(visible.n))
+      for (int64_t k : candidateTilesDesc(visible.k)) {
         TileShape tile{m, n, k};
         if (!fitsBudget(tile, elemBytes, accumBytes, wram, dma))
           continue;
@@ -985,7 +986,7 @@ public:
         auto found = searchTile(*visible, *bytes, accum, *wram, *dma, &smallestTried);
         if (!found) {
           dot.emitError()
-              << "no legal power-of-two tile fits: M=" << full->m
+              << "no legal tile fits: M=" << full->m
               << " N=" << full->n << " K=" << full->k << " dtype_bytes=" << *bytes
               << " wram_bytes=" << *wram << " mram_bytes=" << *mram
               << " dma_align=" << *dma << "; smallest tried was M="

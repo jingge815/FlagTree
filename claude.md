@@ -78,6 +78,7 @@ flagtree = flagOS 存算一体（PIM）体系的**算子编译器**：基于 Fla
 | GML 生成 | `0ed52a321` | 2026-09-15 | 算子级算子集/属性（datapath/kantor/quant_spec）+ `pim-fuse-activation` + L1/L2 |
 | GML 生成 | `62e28b5f0` | 2026-09-19 | 新增 `pim-expand-phases`（DQ4/Softmax5/RoPE3）；PIM 模块放宽 2 的幂限制 |
 | 测试修复 | `c4dc3eb95` | 2026-09-19 | 修正 `test/Triton/invalid.mlir` atomic_cas expected-error 文本 |
+| 分块放宽 | 工作区未提交 | 2026-10-04 | `pim-tile-to-budget` 不再要求维度是 2 的幂：候选分块是不超过上限的 2 的幂外加整维本身，余数由降级侧的尾块处理；`pim-lower-to-emitc` 的循环次数改成向上取整，越界下标夹到最后一个合法位置；存储类型补 i32 与 i64（位置索引的转换） | `lib/Dialect/TritonPIM/Transforms/TileToBudget.cpp`、`LowerPIMToEmitC.cpp`、`test/Dialect/TritonPIM/lower_to_emitc_ops.mlir` |
 
 ## 5. AI 检索指引（场景 → 目录）
 
@@ -102,6 +103,7 @@ flagtree = flagOS 存算一体（PIM）体系的**算子编译器**：基于 Fla
 - Python 侧 pass 调用/参数 → `python/src/passes.cc::init_triton_passes_pim`
 - 编译报错 “no registered dialect/pass” → `bin/RegisterTritonDialects.h`
 - 非 2 的幂 shape 被拒 → `lib/Dialect/Triton/IR/Traits.cpp::verifyTensorSize`
+- 非 2 的幂维度的分块与尾块 → `TileToBudget.cpp::candidateTilesDesc`（候选含整维）、`LowerPIMToEmitC.cpp` 的 `tripCountOf`（向上取整）与 `clampIndex`（越界下标夹取）；i32/i64 存储与转换 → `LowerPIMToEmitC.cpp::storageTypeFor`
 - verifier/layout 推导 → `lib/Dialect/TritonPIM/IR/{Ops,Dialect,Types}.cpp`
 - pass 顺序问题（如 tiling 晚于 DMA）→ `pim_sidecar.py::make_pimir` 注释 + lit 的 RUN 行
 - 构建/lit/安装失败 → `flagOS-installers/0-install-flagtree.sh`（唯一构建入口）、`<prefix>/env-flagtree.sh`、`Makefile`（`test-lit`）、`bin/CMakeLists.txt`
