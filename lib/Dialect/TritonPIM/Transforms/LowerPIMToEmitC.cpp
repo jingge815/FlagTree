@@ -1918,6 +1918,14 @@ struct TritonPIMLowerToEmitCPass
       for (int64_t d = 0; d < axis; ++d)
         outer *= srcTy.getDimSize(d);
 
+      // 加法归约按 128 个元素分段累加。一段的部分和先在自己的累加器里
+      // 算完，再加进总和。fp32 的尾数只有 23 位，4096 个几百量级的数从头
+      // 加到尾时，累加器涨到几十万，再加进来的数就被舍掉了，一行的和能偏
+      // 出 1 左右。分段后每段的累加器只到几万，舍入与 numpy 的分块求和同
+      // 一个量级。取最大值不受累加器量级影响，保持一次循环。
+      int64_t chunk = (!isMax && extent > 128) ? 128 : extent;
+      int64_t chunks = (extent + chunk - 1) / chunk;
+
       emitFor(b, loc, 0, outer, [&](OpBuilder &ob, Value o) {
         emitFor(ob, loc, 0, inner, [&](OpBuilder &ib, Value in) {
           Value acc = ib.create<emitc::VariableOp>(
@@ -1928,26 +1936,68 @@ struct TritonPIMLowerToEmitCPass
           ib.create<emitc::AssignOp>(
               loc, acc,
               constF32(ib, loc, isMax ? -3.4028234663852886e+38 : 0.0));
-          emitFor(ib, loc, 0, extent, [&](OpBuilder &kb, Value k) {
-            Value row = kb.create<emitc::AddOp>(
-                loc, i32,
-                kb.create<emitc::MulOp>(loc, i32, o,
-                                        constI32(kb, loc, extent)),
-                k);
-            Value idx = kb.create<emitc::AddOp>(
-                loc, i32,
-                kb.create<emitc::MulOp>(loc, i32, row,
-                                        constI32(kb, loc, inner)),
-                in);
-            Value v = loadFlat(kb, loc, src, idx);
-            Value cur = kb.create<emitc::LoadOp>(loc, f32, acc);
+          emitFor(ib, loc, 0, chunks, [&](OpBuilder &cb, Value c) {
+            Value partial = cb.create<emitc::VariableOp>(
+                loc, emitc::LValueType::get(f32),
+                emitc::OpaqueAttr::get(cb.getContext(), ""));
+            // 初值与总累加器一致：加法是 0，取最大是负无穷。用 0 给最大值做
+            // 初值会把全负的一行算成 0。
+            cb.create<emitc::AssignOp>(
+                loc, partial,
+                constF32(cb, loc, isMax ? -3.4028234663852886e+38 : 0.0));
+            emitFor(cb, loc, 0, chunk, [&](OpBuilder &kb, Value j) {
+              Value k = kb.create<emitc::AddOp>(
+                  loc, i32,
+                  kb.create<emitc::MulOp>(loc, i32, c, constI32(kb, loc, chunk)),
+                  j);
+              // 最后一段可能不满。越界时下标夹回最后一个合法元素，同时乘 0，
+              // 既不读出界也不把那个元素重复加进去。
+              Value inRange = kb.create<emitc::CmpOp>(
+                  loc, kb.getI1Type(), emitc::CmpPredicate::lt, k,
+                  constI32(kb, loc, extent));
+              Value safe = kb.create<emitc::ConditionalOp>(
+                  loc, i32, inRange, k, constI32(kb, loc, extent - 1));
+              Value row = kb.create<emitc::AddOp>(
+                  loc, i32,
+                  kb.create<emitc::MulOp>(loc, i32, o,
+                                          constI32(kb, loc, extent)),
+                  safe);
+              Value idx = kb.create<emitc::AddOp>(
+                  loc, i32,
+                  kb.create<emitc::MulOp>(loc, i32, row,
+                                          constI32(kb, loc, inner)),
+                  in);
+              Value v = loadFlat(kb, loc, src, idx);
+              Value cur = kb.create<emitc::LoadOp>(loc, f32, partial);
+              Value next;
+              if (isMax) {
+                // 越界时用当前累加值代替读到的元素，取最大不受影响。
+                Value chosen = kb.create<emitc::ConditionalOp>(
+                    loc, f32, inRange, v, cur);
+                next = kb.create<emitc::CallOpaqueOp>(
+                               loc, TypeRange{f32}, "pim_maxf",
+                               ValueRange{cur, chosen})
+                           .getResult(0);
+              } else {
+                // 越界乘 0，不把夹回的那个元素重复加进去。
+                Value gate = kb.create<emitc::ConditionalOp>(
+                    loc, f32, inRange, constF32(kb, loc, 1.0),
+                    constF32(kb, loc, 0.0));
+                next = kb.create<emitc::AddOp>(
+                    loc, f32, cur,
+                    kb.create<emitc::MulOp>(loc, f32, v, gate));
+              }
+              kb.create<emitc::AssignOp>(loc, partial, next);
+            });
+            Value cur = cb.create<emitc::LoadOp>(loc, f32, acc);
+            Value part = cb.create<emitc::LoadOp>(loc, f32, partial);
             Value next = isMax
-                             ? kb.create<emitc::CallOpaqueOp>(
+                             ? cb.create<emitc::CallOpaqueOp>(
                                       loc, TypeRange{f32}, "pim_maxf",
-                                      ValueRange{cur, v})
+                                      ValueRange{cur, part})
                                    .getResult(0)
-                             : kb.create<emitc::AddOp>(loc, f32, cur, v);
-            kb.create<emitc::AssignOp>(loc, acc, next);
+                             : cb.create<emitc::AddOp>(loc, f32, cur, part);
+            cb.create<emitc::AssignOp>(loc, acc, next);
           });
           Value oidx = ib.create<emitc::AddOp>(
               loc, i32,
