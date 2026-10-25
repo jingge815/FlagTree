@@ -1290,6 +1290,17 @@ struct TritonPIMLowerToEmitCPass
                            });
   }
 
+  // 同一件事，但上界是运行期的值：块表和序列长度只有到执行时才知道。
+  template <typename Body>
+  void emitFor(OpBuilder &b, Location loc, Value start, Value end, Value step,
+               Body body) {
+    b.create<emitc::ForOp>(loc, start, end, step,
+                           [&](OpBuilder &ib, Location, Value i) {
+                             body(ib, i);
+                             ib.create<emitc::YieldOp>(loc);
+                           });
+  }
+
   static Value constI32(OpBuilder &b, Location loc, int64_t v) {
     return b.create<emitc::ConstantOp>(loc, b.getI32Type(),
                                        b.getI32IntegerAttr(v));
@@ -1369,6 +1380,18 @@ struct TritonPIMLowerToEmitCPass
                                         "pim_f32_to_i64", ValueRange{value})
               .getResult(0);
     b.create<emitc::AssignOp>(loc, lv, toStore);
+  }
+
+  // 把一个 f32 值换成设备上落盘后的那个 f16 值，仍以 f32 返回。
+  // 相位链每相都落 f16，跨相读回时若不经过这一步，数值就比参考少一次取整。
+  static Value roundF16(OpBuilder &b, Location loc, Value value) {
+    auto bits = b.create<emitc::CallOpaqueOp>(
+        loc, TypeRange{b.getIntegerType(16)}, "pim_f32_to_f16",
+        ValueRange{value});
+    return b.create<emitc::CallOpaqueOp>(loc, TypeRange{b.getF32Type()},
+                                         "pim_f16_to_f32",
+                                         ValueRange{bits.getResult(0)})
+        .getResult(0);
   }
 
   // Apply a folded `activation` to one f32 value. The graph format keeps the
@@ -2643,6 +2666,263 @@ struct TritonPIMLowerToEmitCPass
           x = applyFixedPoint(ib, loc, x, biasAt(ib, i), scaleAt(ib, i),
                               /*shift=*/14);
         storeFlat(ib, loc, cache, dstIdx, x);
+      });
+      return success();
+    }
+
+    // 分页注意力：块表由内核自己读，逐物理槽完成 QK、softmax、PV。
+    // 数值口径与主机参考逐相对齐：点积 f32 累加后落 f16，softmax 五相各按
+    // 自己的存储类型取整，每块的 PV 先落 f16 再加进 f32 输出。
+    if (auto pa = dyn_cast<PagedAttnOp>(op)) {
+      FlatBuffer q = buffers.lookup(pa.getQ());
+      FlatBuffer cache = buffers.lookup(pa.getCache());
+      FlatBuffer bt = buffers.lookup(pa.getBlockTable());
+      auto qTy = cast<RankedTensorType>(pa.getQ().getType());
+      int64_t tokens = qTy.getDimSize(0);
+      int64_t headDim = qTy.getDimSize(1);
+      int64_t slotTokens = pa.getSlotTokens();
+      int64_t slotElems = pa.getSlotElems();
+      int64_t maxBlocks = cast<RankedTensorType>(pa.getBlockTable().getType())
+                              .getDimSize(0);
+      int64_t rowStride = maxBlocks * slotTokens;
+      // 缓存元素数按槽长切分，就是物理槽总数。
+      int64_t poolSlots = cache.count / slotElems;
+      double scale = pa.getScale().convertToDouble();
+
+      Value kOff = scalarValues.lookup(pa.getKOff());
+      Value vOff = scalarValues.lookup(pa.getVOff());
+      Value pos = scalarValues.lookup(pa.getPos());
+      Value numBlocks = scalarValues.lookup(pa.getNumBlocks());
+      Value numTokens = scalarValues.lookup(pa.getNumTokens());
+      if (!kOff || !vOff || !pos || !numBlocks || !numTokens)
+        return pa.emitOpError()
+               << "a scalar operand has no parameter slot; the kernel has to "
+                  "read it rather than the call site";
+
+      FlatBuffer dst = destination(op, pa.getResult());
+      FlatBuffer scores =
+          allocFlat(b, loc, tokens * rowStride, b.getF16Type(), temporaries);
+      FlatBuffer acc =
+          allocFlat(b, loc, tokens * headDim, b.getF32Type(), temporaries);
+
+      Type i32Ty = b.getI32Type();
+      Type f32Ty = b.getF32Type();
+      // 索引缓冲按它自己的整数类型读，不能走 loadFlat：那会把块号当浮点值。
+      auto rawLoad = [&](OpBuilder &ib, const FlatBuffer &buf, Value i) {
+        Type storage = storageTypeFor(ib, buf.elemTy);
+        Value lv = ib.create<emitc::SubscriptOp>(
+            loc, emitc::LValueType::get(storage), buf.ptr, ValueRange{i});
+        return ib.create<emitc::LoadOp>(loc, storage, lv);
+      };
+      auto minOf = [&](OpBuilder &ib, Value a, Value c) {
+        Value less = ib.create<emitc::CmpOp>(
+            loc, ib.getI1Type(), emitc::CmpPredicate::lt, a, c);
+        return ib.create<emitc::ConditionalOp>(loc, i32Ty, less, a, c);
+      };
+      // 历史长度 = 本步起点 + 本步 token 数；只有这段里的行会被读到。
+      Value hist = b.create<emitc::AddOp>(loc, i32Ty, pos, numTokens);
+
+      // 1. 输出累加器清零。
+      emitFor(b, loc, 0, tokens * headDim, [&](OpBuilder &ib, Value i) {
+        storeFlat(ib, loc, acc, i, constF32(ib, loc, 0.0));
+      });
+
+      // 2. QK：逐逻辑块解析物理槽，块内逐行与 q 做点积。
+      emitFor(b, loc, constI32(b, loc, 0), numBlocks, constI32(b, loc, 1),
+              [&](OpBuilder &bb, Value bi) {
+        // 块号越界在这里夹住：表尾的 -1 与坏数据只会落到槽 0，
+        // 不会把地址算到缓存之外。
+        Value slot = rawLoad(bb, bt, bi);
+        Value inRange = bb.create<emitc::CmpOp>(
+            loc, bb.getI1Type(), emitc::CmpPredicate::lt, slot,
+            constI32(bb, loc, poolSlots));
+        Value safe = bb.create<emitc::ConditionalOp>(
+            loc, i32Ty, inRange, slot, constI32(bb, loc, 0));
+        Value base = bb.create<emitc::AddOp>(
+            loc, i32Ty, kOff,
+            bb.create<emitc::MulOp>(loc, i32Ty, safe,
+                                    constI32(bb, loc, slotElems)));
+        Value blockStart = bb.create<emitc::MulOp>(
+            loc, i32Ty, bi, constI32(bb, loc, slotTokens));
+        Value blockEnd = bb.create<emitc::AddOp>(
+            loc, i32Ty, blockStart, constI32(bb, loc, slotTokens));
+        Value rowEnd = minOf(bb, blockEnd, hist);
+        emitFor(bb, loc, blockStart, rowEnd, constI32(bb, loc, 1),
+                [&](OpBuilder &jb, Value j) {
+          Value row = jb.create<emitc::SubOp>(loc, i32Ty, j, blockStart);
+          Value kRow = jb.create<emitc::AddOp>(
+              loc, i32Ty, base,
+              jb.create<emitc::MulOp>(loc, i32Ty, row,
+                                      constI32(jb, loc, headDim)));
+          emitFor(jb, loc, 0, tokens, [&](OpBuilder &tb, Value t) {
+            Value dot = tb.create<emitc::VariableOp>(
+                loc, emitc::LValueType::get(f32Ty),
+                emitc::OpaqueAttr::get(b.getContext(), ""));
+            tb.create<emitc::AssignOp>(loc, dot, constF32(tb, loc, 0.0));
+            Value qRow = tb.create<emitc::MulOp>(
+                loc, i32Ty, t, constI32(tb, loc, headDim));
+            emitFor(tb, loc, 0, headDim, [&](OpBuilder &db, Value d) {
+              Value prod = db.create<emitc::MulOp>(
+                  loc, f32Ty,
+                  loadFlat(db, loc, q,
+                           db.create<emitc::AddOp>(loc, i32Ty, qRow, d)),
+                  loadFlat(db, loc, cache,
+                           db.create<emitc::AddOp>(loc, i32Ty, kRow, d)));
+              db.create<emitc::AssignOp>(
+                  loc, dot,
+                  db.create<emitc::AddOp>(
+                      loc, f32Ty,
+                      db.create<emitc::LoadOp>(loc, f32Ty, dot), prod));
+            });
+            // 矩阵乘落 f16，乘 scale 后再落一次 f16（掩码那一相的存储），
+            // 与主机 matmul + add_mask 的链逐相对齐。
+            Value scaled = tb.create<emitc::MulOp>(
+                loc, f32Ty,
+                roundF16(tb, loc,
+                         tb.create<emitc::LoadOp>(loc, f32Ty, dot)),
+                constF32(tb, loc, scale));
+            Value visible = tb.create<emitc::CmpOp>(
+                loc, tb.getI1Type(), emitc::CmpPredicate::le, j,
+                tb.create<emitc::AddOp>(loc, i32Ty, pos, t));
+            Value masked = tb.create<emitc::ConditionalOp>(
+                loc, f32Ty, visible, scaled, constF32(tb, loc, -1.0e30));
+            storeFlat(tb, loc, scores,
+                      tb.create<emitc::AddOp>(
+                          loc, i32Ty,
+                          tb.create<emitc::MulOp>(loc, i32Ty, t,
+                                                  constI32(tb, loc, rowStride)),
+                          j),
+                      masked);
+          });
+        });
+      });
+
+      // 3. softmax：逐行五相（最大值、指数、求和、倒数、归一化）。
+      emitFor(b, loc, 0, tokens, [&](OpBuilder &tb, Value t) {
+        Value rowBase = tb.create<emitc::MulOp>(
+            loc, i32Ty, t, constI32(tb, loc, rowStride));
+        Value mx = tb.create<emitc::VariableOp>(
+            loc, emitc::LValueType::get(f32Ty),
+            emitc::OpaqueAttr::get(b.getContext(), ""));
+        tb.create<emitc::AssignOp>(loc, mx, constF32(tb, loc, -1.0e30));
+        emitFor(tb, loc, constI32(tb, loc, 0), hist, constI32(tb, loc, 1),
+                [&](OpBuilder &jb, Value j) {
+          Value v = loadFlat(jb, loc, scores,
+                             jb.create<emitc::AddOp>(loc, i32Ty, rowBase, j));
+          Value bigger = jb.create<emitc::CmpOp>(
+              loc, jb.getI1Type(), emitc::CmpPredicate::gt, v,
+              jb.create<emitc::LoadOp>(loc, f32Ty, mx));
+          jb.create<emitc::AssignOp>(
+              loc, mx,
+              jb.create<emitc::ConditionalOp>(
+                  loc, f32Ty, bigger, v,
+                  jb.create<emitc::LoadOp>(loc, f32Ty, mx)));
+        });
+        // 指数相：shift 在 f32 里做，结果落 f16。
+        emitFor(tb, loc, constI32(tb, loc, 0), hist, constI32(tb, loc, 1),
+                [&](OpBuilder &jb, Value j) {
+          Value idx = jb.create<emitc::AddOp>(loc, i32Ty, rowBase, j);
+          Value shifted = jb.create<emitc::SubOp>(
+              loc, f32Ty, loadFlat(jb, loc, scores, idx),
+              jb.create<emitc::LoadOp>(loc, f32Ty, mx));
+          Value e = jb.create<emitc::CallOpaqueOp>(
+              loc, TypeRange{f32Ty}, "pim_lut_exp", ValueRange{shifted})
+                        .getResult(0);
+          storeFlat(jb, loc, scores, idx, e);
+        });
+        Value sum = tb.create<emitc::VariableOp>(
+            loc, emitc::LValueType::get(f32Ty),
+            emitc::OpaqueAttr::get(b.getContext(), ""));
+        tb.create<emitc::AssignOp>(loc, sum, constF32(tb, loc, 0.0));
+        emitFor(tb, loc, constI32(tb, loc, 0), hist, constI32(tb, loc, 1),
+                [&](OpBuilder &jb, Value j) {
+          Value e = loadFlat(jb, loc, scores,
+                             jb.create<emitc::AddOp>(loc, i32Ty, rowBase, j));
+          jb.create<emitc::AssignOp>(
+              loc, sum,
+              jb.create<emitc::AddOp>(
+                  loc, f32Ty, jb.create<emitc::LoadOp>(loc, f32Ty, sum), e));
+        });
+        // 倒数相落 f16；零和返回 0（与 pim_lut_reciprocal 同一口径）。
+        Value recip = roundF16(
+            tb, loc,
+            tb.create<emitc::CallOpaqueOp>(
+                loc, TypeRange{f32Ty}, "pim_lut_reciprocal",
+                ValueRange{tb.create<emitc::LoadOp>(loc, f32Ty, sum)})
+                .getResult(0));
+        emitFor(tb, loc, constI32(tb, loc, 0), hist, constI32(tb, loc, 1),
+                [&](OpBuilder &jb, Value j) {
+          Value idx = jb.create<emitc::AddOp>(loc, i32Ty, rowBase, j);
+          storeFlat(jb, loc, scores, idx,
+                    jb.create<emitc::MulOp>(loc, f32Ty,
+                                            loadFlat(jb, loc, scores, idx),
+                                            recip));
+        });
+      });
+
+      // 4. PV：逐块算出该块的贡献，落 f16 后加进 f32 输出。
+      emitFor(b, loc, constI32(b, loc, 0), numBlocks, constI32(b, loc, 1),
+              [&](OpBuilder &bb, Value bi) {
+        Value slot = rawLoad(bb, bt, bi);
+        Value inRange = bb.create<emitc::CmpOp>(
+            loc, bb.getI1Type(), emitc::CmpPredicate::lt, slot,
+            constI32(bb, loc, poolSlots));
+        Value safe = bb.create<emitc::ConditionalOp>(
+            loc, i32Ty, inRange, slot, constI32(bb, loc, 0));
+        Value base = bb.create<emitc::AddOp>(
+            loc, i32Ty, vOff,
+            bb.create<emitc::MulOp>(loc, i32Ty, safe,
+                                    constI32(bb, loc, slotElems)));
+        Value blockStart = bb.create<emitc::MulOp>(
+            loc, i32Ty, bi, constI32(bb, loc, slotTokens));
+        Value blockEnd = bb.create<emitc::AddOp>(
+            loc, i32Ty, blockStart, constI32(bb, loc, slotTokens));
+        Value rowEnd = minOf(bb, blockEnd, hist);
+        emitFor(bb, loc, 0, tokens, [&](OpBuilder &tb, Value t) {
+          Value wRow = tb.create<emitc::MulOp>(
+              loc, i32Ty, t, constI32(tb, loc, rowStride));
+          Value aRow = tb.create<emitc::MulOp>(
+              loc, i32Ty, t, constI32(tb, loc, headDim));
+          emitFor(tb, loc, 0, headDim, [&](OpBuilder &db, Value d) {
+            Value dot = db.create<emitc::VariableOp>(
+                loc, emitc::LValueType::get(f32Ty),
+                emitc::OpaqueAttr::get(b.getContext(), ""));
+            db.create<emitc::AssignOp>(loc, dot, constF32(db, loc, 0.0));
+            emitFor(db, loc, blockStart, rowEnd, constI32(db, loc, 1),
+                    [&](OpBuilder &jb, Value j) {
+              Value row = jb.create<emitc::SubOp>(loc, i32Ty, j, blockStart);
+              Value vElem = jb.create<emitc::AddOp>(
+                  loc, i32Ty, base,
+                  jb.create<emitc::AddOp>(
+                      loc, i32Ty,
+                      jb.create<emitc::MulOp>(loc, i32Ty, row,
+                                              constI32(jb, loc, headDim)),
+                      d));
+              Value prod = jb.create<emitc::MulOp>(
+                  loc, f32Ty,
+                  loadFlat(jb, loc, scores,
+                           jb.create<emitc::AddOp>(loc, i32Ty, wRow, j)),
+                  loadFlat(jb, loc, cache, vElem));
+              jb.create<emitc::AssignOp>(
+                  loc, dot,
+                  jb.create<emitc::AddOp>(
+                      loc, f32Ty,
+                      jb.create<emitc::LoadOp>(loc, f32Ty, dot), prod));
+            });
+            Value aIdx = db.create<emitc::AddOp>(loc, i32Ty, aRow, d);
+            // 该块的贡献先落 f16，再与先前各块在 f32 里相加。
+            Value partial = roundF16(
+                db, loc, db.create<emitc::LoadOp>(loc, f32Ty, dot));
+            storeFlat(db, loc, acc, aIdx,
+                      db.create<emitc::AddOp>(
+                          loc, f32Ty, loadFlat(db, loc, acc, aIdx), partial));
+          });
+        });
+      });
+
+      // 5. 写回输出参数，落 f16。
+      emitFor(b, loc, 0, tokens * headDim, [&](OpBuilder &ib, Value i) {
+        storeFlat(ib, loc, dst, i, loadFlat(ib, loc, acc, i));
       });
       return success();
     }

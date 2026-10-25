@@ -1683,6 +1683,50 @@ LogicalResult KvCacheOp::verify() {
 }
 
 //===----------------------------------------------------------------------===//
+// PagedAttnOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult PagedAttnOp::verify() {
+  auto qTy = cast<RankedTensorType>(getQ().getType());
+  auto resTy = cast<RankedTensorType>(getResult().getType());
+  if (qTy.getRank() != 2)
+    return emitOpError("q must be two dimensional, got rank ") << qTy.getRank();
+  if (!qTy.getElementType().isF16())
+    return emitOpError("q must be f16, got ") << qTy.getElementType();
+  if (resTy != qTy)
+    return emitOpError("result type ") << resTy << " must match q " << qTy;
+
+  MemDescType cacheTy = getCache().getType();
+  if (!cacheTy.isMRAM())
+    return emitOpError("cache must live in MRAM");
+  if (cacheTy.getElementType() != qTy.getElementType())
+    return emitOpError("cache element type ")
+           << cacheTy.getElementType() << " must match q element type "
+           << qTy.getElementType();
+
+  auto btTy = cast<RankedTensorType>(getBlockTable().getType());
+  if (btTy.getRank() != 1)
+    return emitOpError("blockTable must be one dimensional, got rank ")
+           << btTy.getRank();
+  if (!btTy.getElementType().isInteger(32))
+    return emitOpError("blockTable must be i32, got ")
+           << btTy.getElementType();
+
+  if (getSlotTokens() <= 0 || getSlotElems() <= 0)
+    return emitOpError("slotTokens and slotElems must be positive");
+  if (getSlotElems() % getSlotTokens() != 0)
+    return emitOpError("slotElems ")
+           << getSlotElems() << " is not a whole number of rows of "
+           << getSlotTokens() << " tokens";
+  int64_t rowElems = getSlotElems() / getSlotTokens();
+  if (rowElems % qTy.getDimSize(1) != 0)
+    return emitOpError("one slot row is ")
+           << rowElems << " elements, not a whole number of head vectors of "
+           << qTy.getDimSize(1);
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
 // SplitHeadsOp
 //===----------------------------------------------------------------------===//
 

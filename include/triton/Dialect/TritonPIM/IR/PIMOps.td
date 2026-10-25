@@ -1613,6 +1613,60 @@ def TTPIM_KvCacheOp : TTPIM_Op<"kv_cache", [
   let hasVerifier = 1;
 }
 
+def TTPIM_PagedAttnOp : TTPIM_Op<"paged_attn", [Pure]> {
+  let summary = "attention over the physical slots a block table names";
+
+  let description = [{
+    Computes one head's attention over a KV cache addressed through a block
+    table. `blockTable` holds the physical slot of each logical block; the
+    kernel reads it itself, so the host does not resolve the mapping.
+
+    The cache is one flat MRAM span: `kOff` and `vOff` are element offsets into
+    it for this head's key and value planes, and `slotElems` is the stride from
+    one physical slot to the next. `pos` is where this step's tokens start and
+    `numTokens` how many there are, so the rows read end at `pos + numTokens`.
+
+    The arithmetic matches the host-side reference element for element: a dot
+    product accumulates in f32 and rounds to f16, softmax is the same five
+    phases with the same per-phase storage types, and each block's value
+    product is rounded to f16 before being added to the f32 output.
+
+    Example:
+
+    ```mlir
+    %y = pim.paged_attn %q, %cache, %bt, %ko, %vo, %pos, %nb, %nt
+        {slotTokens = 16 : i64, slotElems = 65536 : i64,
+         scale = 0.08838834764831845 : f64}
+        : tensor<1x128xf16>, !pim.memdesc<16777216xf16, #pim.mram>,
+          tensor<256xi32>, i32, i32, i32, i32, i32 -> tensor<1x128xf16>
+    ```
+  }];
+
+  let arguments = (ins
+    TT_Tensor:$q,
+    TTPIM_MemDescType:$cache,
+    TT_Tensor:$blockTable,
+    I32:$kOff,
+    I32:$vOff,
+    I32:$pos,
+    I32:$numBlocks,
+    I32:$numTokens,
+    I64Attr:$slotTokens,
+    I64Attr:$slotElems,
+    F64Attr:$scale
+  );
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $q `,` $cache `,` $blockTable `,` $kOff `,` $vOff `,` $pos `,`
+    $numBlocks `,` $numTokens attr-dict
+    `:` type($q) `,` qualified(type($cache)) `,` type($blockTable) `,`
+    type($kOff) `,` type($vOff) `,` type($pos) `,` type($numBlocks) `,`
+    type($numTokens) `->` type($result)
+  }];
+  let hasVerifier = 1;
+}
+
 def TTPIM_SplitHeadsOp : TTPIM_Op<"split_heads", [Pure]> {
   let summary = "split a packed projection into per-head tensors";
 
