@@ -225,6 +225,14 @@ LogicalResult DmaLoadOp::verify() {
 // DmaStoreOp
 //===----------------------------------------------------------------------===//
 
+// barrier 没有操作数，副作用挂在默认资源上：它的作用就是让前后的
+// 访存不能越过它，所以只要被认成「有副作用」就不会被当成死代码删掉。
+void BarrierOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  effects.emplace_back(MemoryEffects::Write::get());
+}
+
 void DmaStoreOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {

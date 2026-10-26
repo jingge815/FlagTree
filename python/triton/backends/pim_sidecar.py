@@ -79,17 +79,21 @@ def make_pimir(ttir_mod):
         dma_align=opts["dma_align"],
         enable_source_remat=False,
     )
-    # pim-tile-to-budget 必须排在 pim-explicit-dma 之前：前者负责把超出 WRAM
-    # 预算的 tile 切小，后者按最终 tile 建 WRAM staging buffer 并在超预算时
-    # signalPassFailure()。反过来排的话 explicit-dma 先按未切分的大 tile 建
-    # buffer 就直接失败，tile 切分根本没机会跑（lit 测试
-    # tile_to_budget_m_split.mlir / tile_to_budget_small_wram.mlir 用的都是
-    # `-pim-tile-to-budget -pim-explicit-dma` 这个顺序）。
-    #
-    # 且该 pass 硬性要求至少一个 tt.dot（"requires at least one tt.dot"），
-    # 对纯逐元素 kernel 跑它只会报错，故按 IR 里有没有 tt.dot 判断。
-    if "tt.dot" in str(ttir_mod):
-        passes.pim.add_tile_to_budget(pm)
+    # 五类优化插在转换与显式 DMA 之间，顺序与
+    # flagos-pim-compiler 的 opcompiler_bridge.pipeline.a_path_passes 一致。
+    # 本文件不引那个仓，所以按同一顺序内联，由测试钉住两边不漂移。
+    # canonicalizer 与 cse 先清一遍 TTIR 里的 arith。
+    # 分块必须排在 explicit-dma 之前，否则后者按未切分的大 tile 建 buffer
+    # 直接失败。没有点积也没有可切循环时它保持原样，所以无条件加入。
+    passes.common.add_canonicalizer(pm)
+    passes.common.add_cse(pm)
+    # 循环不变量外提，与 a_path_passes 同一位置。
+    passes.common.add_licm(pm)
+    passes.pim.add_constant_fold(pm)
+    passes.pim.add_pim_cse(pm)
+    passes.pim.add_fuse_activation(pm)
+    passes.pim.add_pim_dce(pm)
+    passes.pim.add_tile_to_budget(pm)
     passes.pim.add_explicit_dma(pm)
     pm.run(mod)
     return mod

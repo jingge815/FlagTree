@@ -4,6 +4,8 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -36,6 +38,8 @@ static std::optional<int64_t> constantInt(Value v) {
     if (auto i = dyn_cast<IntegerAttr>(cst.getValue()))
       return i.getInt();
   }
+  if (auto cst = v.getDefiningOp<arith::ConstantIndexOp>())
+    return cst.value();
   return std::nullopt;
 }
 
@@ -612,8 +616,12 @@ private:
                                           /*isVolatile=*/false);
 
     Value wBlkT = b.create<triton::TransOp>(loc, wBlk, ArrayRef<int32_t>{1, 0});
-    return b.create<triton::DotOp>(loc, xBlk, wBlkT, acc,
-                                   triton::InputPrecision::IEEE, 0u);
+    auto newDot = b.create<triton::DotOp>(loc, xBlk, wBlkT, acc,
+                                          triton::InputPrecision::IEEE, 0u);
+    // 融合折进 dot 的 activation 属性带进重建的 dot，否则链删了属性也没了。
+    if (auto activation = dot->getAttr("activation"))
+      newDot->setAttr("activation", activation);
+    return newDot;
   }
 
   // `rowOffs[:,None]*stride + colOffs[None,:]`, matching kernel_src.py's
@@ -836,16 +844,19 @@ static SmallVector<int64_t, 8> candidateTilesDesc(int64_t full) {
 // preference order without needing a separate tie-break pass. On failure,
 // `*smallestTried` (if non-null) is left holding {1,1,1} clamped to
 // `visible`, for a diagnostic.
-static std::optional<TileShape> searchTile(TileShape visible, int64_t elemBytes,
-                                           int64_t accumBytes, int64_t wram,
-                                           int64_t dma,
-                                           TileShape *smallestTried = nullptr) {
+static std::optional<TileShape>
+searchTile(TileShape visible, int64_t elemBytes, int64_t accumBytes,
+           int64_t wram, int64_t dma, TileShape *smallestTried = nullptr,
+           llvm::function_ref<bool(TileShape)> accept = nullptr) {
   std::optional<TileShape> best;
   for (int64_t m : candidateTilesDesc(visible.m))
     for (int64_t n : candidateTilesDesc(visible.n))
       for (int64_t k : candidateTilesDesc(visible.k)) {
         TileShape tile{m, n, k};
         if (!fitsBudget(tile, elemBytes, accumBytes, wram, dma))
+          continue;
+        // 调用方的额外约束，B 路用它要求 tile 整除各维。
+        if (accept && !accept(tile))
           continue;
         if (!best || m * n * k > best->m * best->n * best->k ||
             (m * n * k == best->m * best->n * best->k &&
@@ -857,6 +868,647 @@ static std::optional<TileShape> searchTile(TileShape visible, int64_t elemBytes,
   if (smallestTried)
     *smallestTried = TileShape{1, 1, 1};
   return std::nullopt;
+}
+
+
+// 循环体里有没有张量运算。只有标量运算的循环拆了不减工作集，不处理。
+static bool loopBodyHasTensorOp(scf::ForOp forOp) {
+  bool found = false;
+  forOp.getBody()->walk([&](Operation *op) {
+    if (llvm::any_of(op->getOperandTypes(),
+                     [](Type t) { return isa<RankedTensorType>(t); }))
+      found = true;
+  });
+  return found;
+}
+
+// 把张量类型的形状第一维改成 `extent`，其余维度不动。
+static RankedTensorType withLeadingExtent(RankedTensorType ty, int64_t extent) {
+  SmallVector<int64_t> shape(ty.getShape());
+  shape[0] = extent;
+  return RankedTensorType::get(shape, ty.getElementType(), ty.getEncoding());
+}
+
+// 循环体按新步长重建：把「基址 + 长度为 1 的偏移」改成「基址 + 一段范围」，
+// 一段覆盖 `tile` 个元素。认得出两种寻址：splat 出的偏移直接进 addptr，
+// 以及真实 kernel 的行主序，即 splat 之后经过 expand_dims、muli、broadcast、
+// addi 才到 addptr。认不出就返回空，调用方据此放弃这条循环。
+// `reason` 非空时写入认不出的原因，供调用方给出诊断。
+static FailureOr<scf::ForOp> rebuildLoopBody(scf::ForOp forOp, int64_t tile,
+                                              int64_t newStep,
+                                              std::string *reason = nullptr) {
+  auto fail = [&](const char *why) -> FailureOr<scf::ForOp> {
+    if (reason)
+      *reason = why;
+    return failure();
+  };
+  Block *body = forOp.getBody();
+  Value iv = forOp.getInductionVar();
+  // 归纳变量有两种形态。index 型先 index_cast 成 i32 再 splat；真实 kernel
+  // 的循环边界就是 i32，归纳变量直接 splat，中间没有 index_cast。
+  Value scalar;
+  arith::IndexCastOp cast = nullptr;
+  if (iv.getType().isIndex()) {
+    cast = dyn_cast_or_null<arith::IndexCastOp>(
+        iv.hasOneUse() ? iv.use_begin()->getOwner() : nullptr);
+    if (!cast || !cast.getResult().hasOneUse())
+      return fail("induction variable is not index_cast then splat");
+    scalar = cast.getResult();
+  } else if (iv.getType().isInteger(32)) {
+    scalar = iv;
+  } else {
+    return fail("induction variable is not index_cast then splat");
+  }
+  auto splat = dyn_cast_or_null<SplatOp>(
+      scalar.hasOneUse() ? scalar.use_begin()->getOwner() : nullptr);
+  if (!splat)
+    return fail("induction variable is not index_cast then splat");
+  auto splatTy = dyn_cast<RankedTensorType>(splat.getType());
+  if (!splatTy || splatTy.getRank() < 1 || splatTy.getDimSize(0) != 1)
+    return fail("splat offset is not a leading extent of 1");
+
+  // 从 splat 往下找消费它的 addptr。中间只允许 expand_dims、muli、
+  // broadcast、addi 这四种不改元素值的运算，穿过它们定位到指针运算。
+  SmallVector<AddPtrOp> addptrs;
+  SmallVector<Operation *> frontier{splat.getOperation()};
+  DenseSet<Operation *> seen;
+  bool blocked = false;
+  while (!frontier.empty()) {
+    Operation *op = frontier.pop_back_val();
+    if (!seen.insert(op).second)
+      continue;
+    for (Operation *user : op->getUsers()) {
+      if (isa<AddPtrOp>(user))
+        addptrs.push_back(dyn_cast<AddPtrOp>(user));
+      else if (isa<ExpandDimsOp, arith::MulIOp, BroadcastOp, arith::AddIOp>(user))
+        frontier.push_back(user);
+      else
+        blocked = true;
+    }
+  }
+  if (blocked || addptrs.empty())
+    return fail("addressing is not splat or row-major");
+  // 重建只把首维从 1 改成 tile。偏移首维已大于 1 时一轮处理多行，
+  // 改首维会换掉这些行指向的地址。
+  for (AddPtrOp addptr : addptrs) {
+    auto offTy = dyn_cast<RankedTensorType>(addptr.getOffset().getType());
+    if (!offTy || offTy.getDimSize(0) != 1)
+      return fail("offset leading extent is not 1");
+  }
+
+  // 重建只认「行号先乘行距、再加列偏移」。乘法落在加法之后时列偏移也被
+  // 乘了，重建会把行距再乘一次，按程序顺序向下传播「已过加法」来识别。
+  DenseSet<Value> afterAdd;
+  for (Operation &op : body->without_terminator()) {
+    if (!seen.count(&op))
+      continue;
+    bool fed = llvm::any_of(op.getOperands(),
+                            [&](Value v) { return afterAdd.contains(v); });
+    if (fed && isa<arith::MulIOp>(op))
+      return fail("row stride is applied after the column offset");
+    if (fed || isa<arith::AddIOp>(op))
+      for (Value result : op.getResults())
+        afterAdd.insert(result);
+  }
+
+  // 行主序的行距是 dense 常量，沿地址链找乘法，重建时照原样乘回去。
+  // splat 直连 addptr 的形态没有行距，按 1 处理，覆盖的地址集合与原循环相同。
+  DenseMap<Operation *, int64_t> mulStride;
+  for (Operation *op : seen) {
+    auto mul = dyn_cast<arith::MulIOp>(op);
+    if (!mul)
+      continue;
+    Value other = nullptr;
+    for (Value operand : mul->getOperands())
+      if (!seen.count(operand.getDefiningOp()))
+        other = operand;
+    auto cst = other ? other.getDefiningOp<arith::ConstantOp>() : nullptr;
+    auto dense = cst ? dyn_cast<DenseElementsAttr>(cst.getValue()) : nullptr;
+    if (!dense || !dense.isSplat())
+      return fail("row stride is not a constant");
+    mulStride[op] = dense.getSplatValue<APInt>().getSExtValue();
+  }
+  // 每个 addptr 沿自己的地址链反向收集行距。重建只有一份新偏移，
+  // 各链行距不同时套用任何一个都会把别的链地址改错，只能放弃。
+  std::optional<int64_t> chainStride;
+  for (AddPtrOp addptr : addptrs) {
+    int64_t s = 1;
+    SmallVector<Value> work{addptr.getOffset()};
+    DenseSet<Operation *> visited;
+    while (!work.empty()) {
+      Operation *def = work.pop_back_val().getDefiningOp();
+      if (!def || !seen.count(def) || !visited.insert(def).second)
+        continue;
+      if (mulStride.count(def))
+        s *= mulStride.lookup(def);
+      for (Value operand : def->getOperands())
+        work.push_back(operand);
+    }
+    if (chainStride && *chainStride != s)
+      return fail("address chains use different row strides");
+    chainStride = s;
+  }
+  int64_t stride = chainStride.value_or(1);
+
+  // 重建只把首维为 1 的结果拉长到 tile。归约、变形、控制流这类算子
+  // 拉长后语义会变，只放行地址链、加载存储和逐元素运算。
+  for (Operation &op : body->without_terminator()) {
+    if (seen.count(&op) || &op == cast)
+      continue;
+    if (isa<AddPtrOp, triton::LoadOp, triton::StoreOp, SplatOp>(op))
+      continue;
+    if (op.getNumRegions() == 0 && op.hasTrait<OpTrait::Elementwise>())
+      continue;
+    if (auto cst = dyn_cast<arith::ConstantOp>(op)) {
+      auto ty = dyn_cast<RankedTensorType>(cst.getType());
+      if (!ty || ty.getDimSize(0) != 1)
+        continue;
+    }
+    return fail("loop body has an op the rebuild cannot widen");
+  }
+
+  // 只有从归纳变量出发的值才随新偏移拉长。其余首维为 1 的张量若在循环内
+  // 产生，拉长会改掉它的含义；scalar 的 splat 拉长后值不变，可以放行。
+  // 加载存储的指针必须由归纳变量驱动，否则同一地址在一块里被读写多次。
+  DenseSet<Value> driven;
+  for (Operation &op : body->without_terminator()) {
+    if (&op == cast)
+      continue;
+    bool fed = &op == splat.getOperation() ||
+               llvm::any_of(op.getOperands(),
+                            [&](Value v) { return driven.contains(v); });
+    if (fed) {
+      for (Value result : op.getResults())
+        driven.insert(result);
+      continue;
+    }
+    if (isa<SplatOp>(op))
+      continue;
+    bool leadingOne = llvm::any_of(op.getResultTypes(), [](Type t) {
+      auto ty = dyn_cast<RankedTensorType>(t);
+      return ty && ty.getDimSize(0) == 1;
+    });
+    if (leadingOne)
+      return fail("loop body has a tensor value outside the induction-variable chain");
+  }
+  for (Operation &op : body->without_terminator()) {
+    Value ptr;
+    if (auto load = dyn_cast<triton::LoadOp>(op))
+      ptr = load.getPtr();
+    else if (auto store = dyn_cast<triton::StoreOp>(op))
+      ptr = store.getPtr();
+    if (ptr && !driven.contains(ptr))
+      return fail("loop body has a tensor value outside the induction-variable chain");
+  }
+
+  // 原循环带 iter_args 时，重建出的循环没有结果，替换会触发断言。
+  // 这种循环不重建，调用方保持原样。
+  if (!forOp.getRegionIterArgs().empty())
+    return fail("loop carries iter_args");
+
+  // 直接建在原循环前面。重建失败时把新建的循环和步长删掉，
+  // 原循环保持不动。
+  OpBuilder builder(forOp);
+  Location loc = forOp.getLoc();
+  // 新步长的类型跟原循环一致：index 型用 index，真实 kernel 的 i32 循环用 i32。
+  Type ivTy = forOp.getInductionVar().getType();
+  Value stepVal = builder.create<arith::ConstantOp>(
+      loc, builder.getIntegerAttr(ivTy, newStep));
+  auto widened = builder.create<scf::ForOp>(loc, forOp.getLowerBound(),
+                                             forOp.getUpperBound(), stepVal);
+  OpBuilder inner(widened.getBody(), widened.getBody()->begin());
+  // 新偏移沿第一维覆盖 tile 个元素。列偏移可能在循环外、秩比 splat 高，
+  // 新偏移要跟它同秩，否则后面的 addi 两侧形状对不上。
+  RankedTensorType fullTy = splatTy;
+  for (AddPtrOp addptr : addptrs) {
+    Value off = addptr.getOffset();
+    auto offTy = dyn_cast<RankedTensorType>(off.getType());
+    if (offTy && offTy.getRank() > fullTy.getRank())
+      fullTy = offTy;
+  }
+  SmallVector<int64_t> shape(fullTy.getShape());
+  shape[0] = tile;
+  auto fullOff = RankedTensorType::get(shape, splatTy.getElementType(),
+                                        splatTy.getEncoding());
+  Value base = widened.getInductionVar();
+  if (base.getType().isIndex())
+    base = inner.create<arith::IndexCastOp>(loc, builder.getI32Type(), base);
+  Value baseTensor = inner.create<SplatOp>(loc, fullOff, base);
+  auto rangeTy = RankedTensorType::get({tile}, splatTy.getElementType(),
+                                        splatTy.getEncoding());
+  Value range = inner.create<MakeRangeOp>(
+      loc, rangeTy, 0, static_cast<int32_t>(tile));
+  Value expanded = range;
+  if (fullOff.getRank() > 1) {
+    SmallVector<int64_t> rowShape(fullOff.getRank(), 1);
+    rowShape[0] = tile;
+    auto rowTy = RankedTensorType::get(rowShape, splatTy.getElementType(),
+                                        splatTy.getEncoding());
+    expanded = inner.create<mlir::triton::ReshapeOp>(loc, rowTy, range);
+    expanded = inner.create<BroadcastOp>(loc, fullOff, expanded);
+  }
+  Value offs = inner.create<arith::AddIOp>(loc, baseTensor, expanded);
+  if (stride != 1) {
+    Value strideVal = inner.create<arith::ConstantOp>(
+        loc, DenseElementsAttr::get(fullOff, builder.getI32IntegerAttr(stride)));
+    offs = inner.create<arith::MulIOp>(loc, offs, strideVal);
+  }
+
+  IRMapping mapping;
+  mapping.map(splat.getResult(), offs);
+  // 真实 kernel 的归纳变量是 i32，直接被 splat。新循环的归纳变量也是
+  // i32，原 splat 被跳过，所以把原归纳变量映射到新的，克隆才找得到定义。
+  if (!cast)
+    mapping.map(iv, widened.getInductionVar());
+  // 列偏移在循环外，可能隔着 broadcast 才到加法。先收集地址链上
+  // 不在链内的操作数，再在新循环内广播到 tile 长。
+  DenseSet<Value> replaced;
+  SmallVector<Value> outside;
+  DenseSet<Operation *> chain(seen.begin(), seen.end());
+  for (Operation *op : seen)
+    for (Value operand : op->getOperands())
+      if (!chain.count(operand.getDefiningOp()) && operand != scalar)
+        outside.push_back(operand);
+  // 循环不变的 bias、被外提的指针 splat 也要广播到 tile 长，
+  // 否则与被拉长的另一侧形状对不上。
+  for (Operation &op : body->without_terminator())
+    for (Value operand : op.getOperands())
+      if (forOp.isDefinedOutsideOfLoop(operand))
+        outside.push_back(operand);
+  for (Value off : outside) {
+    auto offTy = dyn_cast<RankedTensorType>(off.getType());
+    if (!offTy || offTy.getDimSize(0) != 1 || mapping.contains(off))
+      continue;
+    auto wide = withLeadingExtent(offTy, tile);
+    mapping.map(off, inner.create<BroadcastOp>(loc, wide, off));
+    replaced.insert(off);
+  }
+  // 从 splat 的结果沿数据流正向走，记录「这一步的结果等于新偏移」的值。
+  // 不能靠遍历顺序：muli 的两个操作数都在地址链上时，行距那个可能先被
+  // 处理，乘法就判不成由新偏移喂入，行距会被乘第二次。
+  DenseSet<Value> isOffs;
+  isOffs.insert(splat.getResult());
+  for (Operation &op : body->without_terminator()) {
+    if (&op == cast || &op == splat || isa<scf::YieldOp>(op))
+      continue;
+    // 行号到行距乘法这一段已被新偏移取代。expand_dims、muli、broadcast
+    // 只搬运行号，跳过；addi 还要加上列偏移，必须留下。
+    bool fedByNewOffs = false;
+    for (Value operand : op.getOperands())
+      if (isOffs.contains(operand))
+        fedByNewOffs = true;
+
+    if (fedByNewOffs && isa<ExpandDimsOp, arith::MulIOp, BroadcastOp>(op)) {
+      for (Value result : op.getResults())
+        isOffs.insert(result);
+      for (Value result : op.getResults())
+        mapping.map(result, offs);
+      continue;
+    }
+    // 地址链上的加法改用广播后的列偏移，原加法的结果不再被使用。
+    if (fedByNewOffs && isa<arith::AddIOp>(op)) {
+      Value column = nullptr;
+      for (Value operand : op.getOperands())
+        if (replaced.contains(operand))
+          column = mapping.lookup(operand);
+      if (column) {
+        Value sum = inner.create<arith::AddIOp>(loc, offs, column);
+        for (Value result : op.getResults())
+          mapping.map(result, sum);
+        continue;
+      }
+    }
+    Operation *cloned = inner.clone(op, mapping);
+    // 指针与加载结果的张量长度跟着偏移一起变。
+    for (auto [oldRes, newRes] : llvm::zip(op.getResults(), cloned->getResults())) {
+      auto oldTy = dyn_cast<RankedTensorType>(oldRes.getType());
+      if (!oldTy || oldTy.getDimSize(0) != 1)
+        continue;
+      newRes.setType(withLeadingExtent(oldTy, tile));
+    }
+  }
+  // 新循环的 yield 由 scf.for 的构建器放好，原循环的终止符不克隆。
+  // 新循环验证不过就整体撤回，验证的报错不外泄，改由调用方给诊断。
+  bool valid;
+  {
+    ScopedDiagnosticHandler silence(forOp.getContext(),
+                                    [](Diagnostic &) { return success(); });
+    valid = succeeded(verify(widened));
+  }
+  if (!valid) {
+    widened.erase();
+    stepVal.getDefiningOp()->erase();
+    return fail("rebuilt loop fails verification");
+  }
+  return widened;
+}
+
+// 循环结果是否不随迭代次数变化：每个 iter_arg 原样被 yield 回去。
+// 内存副作用不在这里判断——只改步长的路径不能有副作用，而按新步长
+// 重建循环体的路径允许 load 与 store。
+static bool stepInvariant(scf::ForOp forOp) {
+  auto yield = cast<scf::YieldOp>(forOp.getBody()->getTerminator());
+  return yield.getOperands() == forOp.getRegionIterArgs();
+}
+
+// 循环体里有没有内存副作用。
+static bool bodyHasEffect(scf::ForOp forOp) {
+  bool hasEffect = false;
+  forOp.getBody()->walk([&](Operation *op) {
+    if (!isMemoryEffectFree(op))
+      hasEffect = true;
+  });
+  return hasEffect;
+}
+
+// 通用循环分块。返回 success 表示这条路径适用（含「预算内不改」），
+// failure 表示没有可处理的循环，调用方回退到报错。
+static LogicalResult tileGenericLoops(ModuleOp mod, int64_t wram,
+                                      bool gridPartitioned) {
+  SmallVector<scf::ForOp> loops;
+  mod.walk([&](scf::ForOp forOp) {
+    if (constantInt(forOp.getLowerBound()) &&
+        constantInt(forOp.getUpperBound()) &&
+        constantInt(forOp.getStep()) && loopBodyHasTensorOp(forOp))
+      loops.push_back(forOp);
+  });
+  if (loops.empty()) {
+    return failure();
+  }
+
+  // 矩阵乘已写过 pim.tile-m 时以它为准，tile 不同的循环保持原样，
+  // 否则模块头的 tile-m 与 tile-n/k 描述的不是同一个算子。
+  std::optional<int64_t> chosen;
+  if (auto attr = mod->getAttrOfType<IntegerAttr>(AttrTileMName))
+    chosen = attr.getInt();
+  // 矩阵乘各自切开却没写模块头时，模块头已描述不了全部算子，循环也不切，
+  // 模块头保持原状。
+  bool blockedByMatmulTile =
+      !chosen && mod.walk([](MatmulOp mm) {
+                      return mm.getTileAttr() ? WalkResult::interrupt()
+                                              : WalkResult::advance();
+                    }).wasInterrupted();
+  for (scf::ForOp forOp : loops) {
+    int64_t lower = *constantInt(forOp.getLowerBound());
+    int64_t upper = *constantInt(forOp.getUpperBound());
+    int64_t step = *constantInt(forOp.getStep());
+    int64_t extent = upper - lower;
+    if (step <= 0 || extent <= 0)
+      continue;
+    int64_t trips = std::max<int64_t>(extent / step, 1);
+    // 一次迭代里被加载或存储的数据张量都要同时待在 WRAM 里，所以按
+    // 它们的字节数相加，与 tt.dot 路径把输入、权重、累加三块相加同一口径。
+    // 只取最大的一块会少算同时驻留的其余块，切出超预算的步长。
+    // 指针张量不参与：它的元素宽度不代表搬运的数据量。
+    bool sawTransfer = false;
+    int64_t bytes = 0;
+    forOp.getBody()->walk([&](Operation *op) {
+      Type data;
+      if (auto load = dyn_cast<triton::LoadOp>(op))
+        data = load.getType();
+      else if (auto store = dyn_cast<triton::StoreOp>(op))
+        data = store.getValue().getType();
+      else
+        return;
+      sawTransfer = true;
+      auto tensor = dyn_cast<RankedTensorType>(data);
+      if (tensor && tensor.getElementType().isIntOrFloat())
+        bytes += tensor.getNumElements() * tensor.getElementTypeBitWidth() / 8;
+    });
+    // 没有 load 与 store 时退回统计操作数里的数值张量。这类张量跨全部迭代
+    // 共用，所以按迭代次数摊薄，覆盖只搬运 iter_arg 的空转循环。
+    if (!sawTransfer)
+      forOp.getBody()->walk([&](Operation *op) {
+        for (Type type : op->getOperandTypes())
+          if (auto tensor = dyn_cast<RankedTensorType>(type))
+            if (tensor.getElementType().isIntOrFloat())
+              bytes = std::max(bytes, tensor.getNumElements() *
+                                          tensor.getElementTypeBitWidth() / 8);
+      });
+    if (bytes == 0)
+      continue;
+    int64_t perIter = sawTransfer ? bytes : std::max<int64_t>(bytes / trips, 1);
+    // 与 tt.dot 路径同一个评估模型：「原样」是整段循环，整段搬运量装得下
+    // 就不切，下面各条不改写的路径都保持静默；装不下再按单轮工作集选
+    // 预算内块数最少的 tile。
+    if (perIter * trips <= wram)
+      continue;
+    // 以下都是超预算的循环。切不了就给诊断：超预算却没切与预算内不切的
+    // 产物一模一样，不给诊断两者无法区分。
+    auto leave = [&](StringRef why) {
+      forOp.emitRemark("pim-tile-to-budget left this loop untiled: ") << why;
+    };
+    if (step >= extent) {
+      leave("loop runs a single iteration");
+      continue;
+    }
+    // 结果依赖迭代次数时不改步长：只改步长不改循环体，语义会变。
+    if (!stepInvariant(forOp)) {
+      leave("loop carries iter_args");
+      continue;
+    }
+    // grid 内核每个 program 只算一块，启动网格不变时重建循环会改掉语义，
+    // 与 tt.dot 路径同一条约定（见 `isGridPartitioned`）。
+    if (gridPartitioned) {
+      leave("grid-partitioned kernel");
+      continue;
+    }
+    // 非 2 的幂的边界只挡「只改步长」那条路径：它不重建循环体，尾块形状
+    // 对不齐。重建路径按整除回退选 tile，不在这里跳过。
+    bool oddExtent = extent & (extent - 1);
+    if (oddExtent && forOp.getInductionVar().use_empty()) {
+      leave("loop extent is not a power of two");
+      continue;
+    }
+    int64_t maxTile = 1;
+    while (maxTile * 2 <= extent && maxTile * 2 * perIter <= wram)
+      maxTile *= 2;
+    // 预算内最大的 tile 不整除跨度时向下回退，取第一个能整除的。
+    int64_t tile = maxTile;
+    while (tile > 1 && extent % (step * tile) != 0)
+      tile /= 2;
+    int64_t newStep = step * tile;
+    // 原步长不是 1 时，连续的 tile 个位置不等于原循环这 tile 轮访问的
+    // 位置，重建会换掉访问集合。
+    if (step != 1) {
+      forOp.emitRemark("pim-tile-to-budget left this loop untiled: ")
+          << "loop step is not 1";
+      continue;
+    }
+    // 新步长必须整除跨度。不能整除时最后一轮读过上界，而重建没有掩码
+    // 也没有收尾循环。搜索过的 tile 都不整除时回退到 1，在这里报出。
+    if (maxTile > 1 && tile == 1) {
+      forOp.emitRemark("pim-tile-to-budget left this loop untiled: ")
+          << "no searched tile divides the loop extent";
+      continue;
+    }
+    // 超预算却没切与预算内不切的产物一模一样，必须给出诊断。单轮放得下
+    // 只是两轮放不下时，原因不是单轮超预算，分开报。
+    if (newStep == step) {
+      forOp.emitRemark("pim-tile-to-budget left this loop untiled: ")
+          << (perIter > wram
+                  ? "one iteration exceeds the WRAM budget"
+                  : "no tile larger than one iteration fits the WRAM budget");
+      continue;
+    }
+    // 模块只有一个 pim.tile-m，各循环 tile 不同时属性描述不了全部循环，
+    // 后面的循环保持原样。
+    if (blockedByMatmulTile) {
+      leave("module matmuls carry their own tiles");
+      continue;
+    }
+    if (chosen && *chosen != tile) {
+      leave("module already tiles another loop with a different tile");
+      continue;
+    }
+    // 循环体不读归纳变量时只改步长，但有副作用就不能只改步长；
+    // 读了归纳变量就把循环体按新步长重建，每轮覆盖 tile 个元素。
+    // 重建不了就给出诊断：超预算却没切和预算内不切必须能区分。
+    if (forOp.getInductionVar().use_empty()) {
+      if (bodyHasEffect(forOp)) {
+        leave("loop has side effects but does not read its induction variable");
+        continue;
+      }
+      // 步长类型跟随归纳变量，i32 循环用 index 步长会验证失败。
+      OpBuilder builder(forOp);
+      Type ivTy = forOp.getInductionVar().getType();
+      auto stepConst = builder.create<arith::ConstantOp>(
+          forOp.getLoc(), ivTy.isIndex()
+                              ? builder.getIndexAttr(newStep)
+                              : builder.getIntegerAttr(ivTy, newStep));
+      forOp.setStep(stepConst);
+    } else {
+      // 带掩码的加载和存储不能重建：指针被拉长到 tile，掩码仍是原长，
+      // 两侧形状不同，tt.load 验证直接失败。
+      bool masked = false;
+      forOp.getBody()->walk([&](Operation *op) {
+        if (auto load = dyn_cast<triton::LoadOp>(op))
+          masked |= (bool)load.getMask();
+        else if (auto store = dyn_cast<triton::StoreOp>(op))
+          masked |= (bool)store.getMask();
+      });
+      if (masked) {
+        forOp.emitRemark("pim-tile-to-budget left this loop untiled: ")
+            << "masked load or store";
+        continue;
+      }
+      // 重建只改顶层算子的结果类型，内层循环里的加载不会跟着拉长；
+      // 删原循环时内层循环也随之删掉。含嵌套循环的保持原样。
+      bool nested = false;
+      forOp.getBody()->walk([&](scf::ForOp) { nested = true; });
+      if (nested) {
+        forOp.emitRemark("pim-tile-to-budget left this loop untiled: ")
+            << "loop contains a nested scf.for";
+        continue;
+      }
+      std::string reason;
+      auto rebuilt = rebuildLoopBody(forOp, tile, newStep, &reason);
+      if (failed(rebuilt)) {
+        // 超预算却没切时产物与预算内的循环一模一样，必须给出诊断。
+        // 设计明确不支持的形态（带 iter_args、偏移长度不是 1）也记一笔，
+        // 否则它和预算内不切无法区分。
+        forOp.emitRemark("pim-tile-to-budget left this loop untiled: ")
+            << reason;
+        continue;
+      }
+      forOp.replaceAllUsesWith(rebuilt->getResults());
+      forOp.erase();
+    }
+    chosen = tile;
+  }
+  if (chosen) {
+    Builder b(mod.getContext());
+    mod->setAttr(AttrTileMName, b.getI64IntegerAttr(*chosen));
+  }
+  return success();
+}
+
+// B 路的整算子矩阵乘没有循环，按形状选 tile，写在算子的 `tile` 属性上，
+// 循环由 `-pim-lower-to-emitc` 按它生成。评估模型与 tt.dot 路径相同；
+// tile 还要整除 M、N 与组宽，组内分段累加才与不分块逐位一致。
+static LogicalResult tileWholeMatmuls(ModuleOp mod, int64_t wram,
+                                      int64_t mram) {
+  // 输出块放两个 f32 累加器：总数与当前组，各 4 字节。
+  constexpr int64_t kAccumBytes = 8;
+  // 模块头只有一组 tile 属性，只有模块里每个矩阵乘都切成同一个 tile、
+  // 同样字节数时才写；有一个不同（含预算内不切的）就不写，各算子照用自己的 tile。
+  std::optional<TileShape> chosen;
+  int64_t chosenBytes = 0;
+  bool uniform = true;
+  WalkResult walked = mod.walk([&](MatmulOp mm) -> WalkResult {
+    auto aTy = cast<RankedTensorType>(mm.getA().getType());
+    auto bTy = cast<RankedTensorType>(mm.getB().getType());
+    auto bytes = inferDtypeSize(mm.getA());
+    auto outBytes = inferDtypeSize(mm.getResult());
+    // 二维与组宽整除由 verifier 保证。元素宽度不是整字节时评估模型算不了
+    // 工作集，保持原样；模块里有矩阵乘没切，模块头就不写。
+    if (aTy.getRank() != 2 || bTy.getRank() != 2 || !bytes || !outBytes) {
+      mm.emitRemark("pim-tile-to-budget left this matmul untiled: ")
+          << "element width is not a whole number of bytes";
+      uniform = false;
+      return WalkResult::advance();
+    }
+    int64_t m = aTy.getDimSize(0), k = aTy.getDimSize(1);
+    int64_t n = bTy.getDimSize(mm.getTransposeB() ? 0 : 1);
+    int64_t group = mm.getDatapath().getGroupDequantAccum()
+                        ? mm.getDatapath().getGroupSize()
+                        : k;
+    if (group <= 0 || k % group != 0) {
+      uniform = false;
+      return WalkResult::advance();
+    }
+
+    int64_t footprint = (m * k + n * k) * *bytes + m * n * *outBytes;
+    if (footprint > mram) {
+      mm.emitError() << "matmul footprint " << footprint
+                     << " exceeds mram-bytes " << mram << " (per DPU)";
+      return WalkResult::interrupt();
+    }
+    // 整块是否要切只比 WRAM 字节数：B 路没有 DMA，对齐不满足不等于超预算。
+    if (bytesFor(TileShape{m, n, k}, *bytes, kAccumBytes) <= wram) {
+      uniform = false;
+      return WalkResult::advance();
+    }
+    // B 路没有 DMA，候选也不受对齐约束，对齐参数取 1。
+    auto found = searchTile(
+        TileShape{m, n, group}, *bytes, kAccumBytes, wram, 1, nullptr,
+        [&](TileShape t) {
+          return m % t.m == 0 && n % t.n == 0 && group % t.k == 0;
+        });
+    // 超预算却切不了时与预算内不切产物相同，必须给出诊断。
+    if (!found) {
+      mm.emitRemark("pim-tile-to-budget left this matmul untiled: ")
+          << "no tile divides M, N and the group within the WRAM budget";
+      uniform = false;
+      return WalkResult::advance();
+    }
+    mm.setTileAttr(DenseI64ArrayAttr::get(mod.getContext(),
+                                          {found->m, found->n, found->k}));
+    int64_t used = bytesFor(*found, *bytes, kAccumBytes);
+    if (!chosen) {
+      chosen = found;
+      chosenBytes = used;
+    } else if (chosen->m != found->m || chosen->n != found->n ||
+               chosen->k != found->k || chosenBytes != used) {
+      uniform = false;
+    }
+    return WalkResult::advance();
+  });
+  if (walked.wasInterrupted())
+    return failure();
+  if (chosen && !uniform) {
+    mod.emitRemark("pim-tile-to-budget wrote no module tile attributes: ")
+        << "not every matmul in the module uses the same tile";
+    return success();
+  }
+  if (chosen) {
+    Builder b(mod.getContext());
+    mod->setAttr(AttrTileMName, b.getI64IntegerAttr(chosen->m));
+    mod->setAttr(AttrTileNName, b.getI64IntegerAttr(chosen->n));
+    mod->setAttr(AttrTileKName, b.getI64IntegerAttr(chosen->k));
+    mod->setAttr(AttrTileWramBytesName, b.getI64IntegerAttr(chosenBytes));
+  }
+  return success();
 }
 
 class TritonPIMTileToBudget
@@ -890,8 +1542,12 @@ public:
     SmallVector<triton::DotOp> dots;
     mod.walk([&](triton::DotOp dot) { dots.push_back(dot); });
     if (dots.empty()) {
-      mod.emitError() << "pim-tile-to-budget requires at least one tt.dot";
-      return signalPassFailure();
+      // 没有 tt.dot 时先按形状切整算子矩阵乘，再按循环结构分块。没有可切的
+      // 对象就保持原样：纯逐元素 kernel 也要能跑这个 pass。
+      if (failed(tileWholeMatmuls(mod, *wram, *mram)))
+        return signalPassFailure();
+      (void)tileGenericLoops(mod, *wram, gridPartitioned);
+      return;
     }
 
     std::optional<TileShape> chosen;

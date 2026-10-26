@@ -314,7 +314,10 @@ def TTPIM_WRAMStoreOp : TTPIM_Op<"wram_store", [
 // Synchronization
 //===----------------------------------------------------------------------===//
 
-def TTPIM_BarrierOp : TTPIM_Op<"barrier"> {
+// 声明内存副作用接口：barrier 没有结果，不声明的话死代码消除会把它
+// 当成无用户的纯算子删掉，任务线程间的同步点就没了。
+def TTPIM_BarrierOp : TTPIM_Op<"barrier", [
+    DeclareOpInterfaceMethods<MemoryEffectsOpInterface>]> {
   let summary = "barrier across the tasklets of a DPU";
 
   let description = [{
@@ -619,7 +622,11 @@ def TTPIM_MatmulOp : TTPIM_OperatorOp<"matmul", [AttrSizedOperandSegments]> {
     OptionalAttr<TTPIM_StationarityAttr>:$stationarity,
     UnitAttr:$transposeB,
     UnitAttr:$bIsActivation,
-    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit
+    OptionalAttr<TTPIM_FunctionalUnitAttr>:$unit,
+    // The [M, N, K] block `-pim-tile-to-budget` chose so one block fits WRAM.
+    // `-pim-lower-to-emitc` emits the blocked loops from it; absent means
+    // the whole operator already fits.
+    OptionalAttr<DenseI64ArrayAttr>:$tile
   ));
   let results = (outs TT_Tensor:$result);
 

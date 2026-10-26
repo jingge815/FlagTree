@@ -69,8 +69,8 @@ module {
 // of the lookup, so a missing one has to be reported rather than approximated.
 module {
   tt.func @unknown_activation_kind(%x: tensor<1x32xf16>) {
-    // expected-error @below {{has no C for activation gelu}}
-    %y = pim.lut %x {kind = #pim.activation<gelu>, phases = [#pim.phase_spec<index = 0, bytes = 64, unit = cstl>]} : tensor<1x32xf16> -> tensor<1x32xf16>
+    // expected-error @below {{has no C for activation relu_x}}
+    %y = pim.lut %x {kind = #pim.activation<relu_x>, phases = [#pim.phase_spec<index = 0, bytes = 64, unit = cstl>]} : tensor<1x32xf16> -> tensor<1x32xf16>
     tt.return
   }
 }

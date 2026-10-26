@@ -142,6 +142,9 @@ void init_triton_passes_pim(py::module &&m) {
   // invariants that span more than one attribute. The graph compiler drives
   // these through `triton-opt` rather than in-process, so the wrappers are for
   // debugging and for callers that already hold a ModuleOp.
+  ADD_PASS_WRAPPER_0("add_constant_fold", pim::createTritonPIMConstantFold);
+  ADD_PASS_WRAPPER_0("add_pim_cse", pim::createTritonPIMCSE);
+  ADD_PASS_WRAPPER_0("add_pim_dce", pim::createTritonPIMDCE);
   ADD_PASS_WRAPPER_0("add_fuse_activation", pim::createTritonPIMFuseActivation);
   ADD_PASS_WRAPPER_0("add_expand_phases", pim::createTritonPIMExpandPhases);
   ADD_PASS_WRAPPER_0("add_verify_gml_contract",

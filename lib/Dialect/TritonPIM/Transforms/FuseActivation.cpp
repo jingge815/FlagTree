@@ -13,11 +13,15 @@
 
 #include "triton/Dialect/TritonPIM/Transforms/Passes.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Math/IR/Math.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/TritonPIM/IR/Dialect.h"
 
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 namespace mlir::triton::pim {
@@ -31,12 +35,18 @@ using namespace mlir::triton::pim;
 
 namespace {
 
-// The operators whose node can hold a folded activation. These are exactly the
-// ones that carry `activation` and `fusedPool` attributes.
-// 与 flagos-pim-compiler 的 contracts/fusion_contract.py 同步；改一边必须改另一边。
-// conv 也在：图编译器那张表没有它，只是因为目标模型没有卷积，不是禁止 conv 折激活。
+// 能持有折入激活的算子，按有没有 `activation` 属性位判定，不按名字。
+// 当前声明了这个属性位的是 matmul、conv、eltwise 三个，与原先按名字
+// 判定的名单相同；以后新增带该属性位的算子不用再改这里。
+// 与 flagos-pim-compiler 的 contracts/fusion_contract.py 同步，改一边必须改另一边。
 static bool isFusionTarget(Operation *op) {
-  return isa<MatmulOp, ConvOp, EltwiseOp>(op);
+  // 带 activation 属性位的算子才能承接折入的激活。属性要么已经写上了，
+  // 要么在 ODS 里声明了这个名字。
+  if (op->getAttr("activation"))
+    return true;
+  if (auto info = op->getRegisteredInfo())
+    return llvm::is_contained(info->getAttributeNames(), "activation");
+  return false;
 }
 
 // Reads the `activation` attribute of a fusion target, whichever op it is.
@@ -49,8 +59,8 @@ static ActSpecAttr getActivationOf(Operation *op) {
 static bool hasSingleUse(Value value) { return value.hasOneUse(); }
 
 // The activation configuration a `pim.lut` describes, as it would sit on the
-// producing operator. Returns null when the lut carries a table operand: a table
-// is data, and an attribute has nowhere to put an SSA value.
+// producing operator. A table operand is not part of the attribute: `fuse` moves
+// it onto a matmul, and the caller rejects a table on any other producer.
 static ActSpecAttr activationSpecOf(LutOp lut) {
   return ActSpecAttr::get(lut.getContext(), lut.getKind(), lut.getMode(),
                           lut.getAlphaAttr(), lut.getClipMinAttr(),
@@ -62,6 +72,127 @@ static ActSpecAttr activationSpecOf(LutOp lut) {
 static PoolSpecAttr poolSpecOf(PoolOp pool) {
   return PoolSpecAttr::get(pool.getContext(), pool.getKind(),
                            pool.getWindowAttr());
+}
+
+
+// A splat f32 constant with exactly this value. The TTIR chain's 0 and 1 are
+// dense splats, not scalar constants.
+static bool isSplatConstant(Value v, double value) {
+  auto cst = v.getDefiningOp<arith::ConstantOp>();
+  if (!cst)
+    return false;
+  auto dense = dyn_cast<SplatElementsAttr>(cst.getValue());
+  if (!dense || !dense.getElementType().isF32())
+    return false;
+  return dense.getSplatValue<APFloat>().convertToDouble() == value;
+}
+
+// Triton 对 `sigmoid(r)` 展开出的四连：0-r -> exp -> 1+e -> 1/(1+e)。
+// 从 subf 开始认，每个中间结果单用户；返回四个算子，认不出返回空。
+static SmallVector<Operation *> matchSigmoidFrom(arith::SubFOp subf,
+                                                 Value root) {
+  if (!subf.getResult().hasOneUse() || subf.getRhs() != root ||
+      !isSplatConstant(subf.getLhs(), 0.0))
+    return {};
+  auto exp = dyn_cast<math::ExpOp>(*subf.getResult().user_begin());
+  if (!exp || !exp.getResult().hasOneUse())
+    return {};
+  auto addf = dyn_cast<arith::AddFOp>(*exp.getResult().user_begin());
+  if (!addf || !addf.getResult().hasOneUse())
+    return {};
+  Value one = addf.getLhs() == exp.getResult() ? addf.getRhs() : addf.getLhs();
+  if (!isSplatConstant(one, 1.0))
+    return {};
+  auto divf = dyn_cast<arith::DivFOp>(*addf.getResult().user_begin());
+  if (!divf || divf.getRhs() != addf.getResult() ||
+      !isSplatConstant(divf.getLhs(), 1.0))
+    return {};
+  return {subf.getOperation(), exp.getOperation(), addf.getOperation(),
+          divf.getOperation()};
+}
+
+// dot 结果上的尾部激活。按链的结构判定种类，不按名字：
+//   relu    = max(r, 0)
+//   sigmoid = 上面的四连
+//   silu    = r * sigmoid(r)，链根另有一个 mulf 用户
+// 返回种类与链上算子（最后一个是链尾），认不出返回空链。
+// 种类与 pim-compiler 的 contracts/fusion_contract.py 里
+// LINEAR_TAIL_ACTIVATIONS 同步，改一边必须改另一边。
+static std::pair<ActivationKind, SmallVector<Operation *>>
+matchTtirActivation(Value root) {
+  SmallVector<Operation *> users(root.getUsers());
+  // relu：唯一用户是与 0 取大。
+  if (users.size() == 1)
+    if (auto max = dyn_cast<arith::MaxNumFOp>(users[0])) {
+      Value other = max.getLhs() == root ? max.getRhs() : max.getLhs();
+      if (isSplatConstant(other, 0.0))
+        return {ActivationKind::Relu, {max.getOperation()}};
+      return {};
+    }
+  // sigmoid：唯一用户是四连的开头。
+  if (users.size() == 1)
+    if (auto subf = dyn_cast<arith::SubFOp>(users[0])) {
+      auto chain = matchSigmoidFrom(subf, root);
+      if (!chain.empty())
+        return {ActivationKind::Sigmoid, chain};
+      return {};
+    }
+  // silu：两个用户，一个是四连开头，一个是乘回链根的 mulf。
+  if (users.size() != 2)
+    return {};
+  auto subf = dyn_cast<arith::SubFOp>(users[0]);
+  auto mulf = dyn_cast<arith::MulFOp>(users[1]);
+  if (!subf || !mulf) {
+    subf = dyn_cast<arith::SubFOp>(users[1]);
+    mulf = dyn_cast<arith::MulFOp>(users[0]);
+  }
+  if (!subf || !mulf)
+    return {};
+  auto chain = matchSigmoidFrom(subf, root);
+  if (chain.empty())
+    return {};
+  Value sig = chain.back()->getResult(0);
+  if (!sig.hasOneUse() || *sig.user_begin() != mulf.getOperation())
+    return {};
+  Value other = mulf.getLhs() == root ? mulf.getRhs() : mulf.getLhs();
+  if (other != sig)
+    return {};
+  chain.push_back(mulf.getOperation());
+  return {ActivationKind::Silu, chain};
+}
+
+// 尾部激活挂在哪个值上：dot 结果直接出去时就是它，被 K 循环携带出去时
+// 是循环结果。
+static Value activationChainRoot(triton::DotOp dot) {
+  Value acc = dot.getResult();
+  // 链根就是 dot 结果本身；dot 结果被 K 循环携带出去时（唯一用户是
+  // yield），链根换成循环结果——链在循环外面，读的是携带值。
+  if (acc.hasOneUse()) {
+    auto yield = dyn_cast<scf::YieldOp>(*acc.getUses().begin()->getOwner());
+    if (yield) {
+      // 只认单携带值循环：多携带值认不出下标就不猜。
+      if (yield.getNumOperands() != 1)
+        return {};
+      auto forOp = dyn_cast<scf::ForOp>(yield->getParentOp());
+      if (!forOp || forOp.getNumResults() != 1)
+        return {};
+      return forOp.getResult(0);
+    }
+  }
+  // dot 的累加器是所在循环的携带值时，链在 K 循环里面、每轮都激活；降到 C
+  // 时整段 K 归约完只激活一次，折进去会改数值。
+  if (auto arg = dyn_cast<BlockArgument>(dot.getC()))
+    if (isa<scf::ForOp>(arg.getOwner()->getParentOp()))
+      return {};
+  return acc;
+}
+
+// 链上每个算子都要和链根在同一个块里。链在 scf.if 等嵌套区域里时只按条件
+// 执行，折进 dot 会让激活无条件生效。
+static bool chainInRootBlock(Value root, ArrayRef<Operation *> chain) {
+  Block *block = root.getParentBlock();
+  return llvm::all_of(chain,
+                      [&](Operation *op) { return op->getBlock() == block; });
 }
 
 //===----------------------------------------------------------------------===//
@@ -218,6 +349,28 @@ struct TritonPIMFuseActivationPass
       }
 
       fuse(producer, lut, activation, pool, pooling);
+    }
+
+    // A 路形态：tt.dot 后接尾部激活的算术链。dot 没有 activation 属性位，
+    // 链由 arith/math 算子组成，所以走这条独立的识别路径。
+    SmallVector<triton::DotOp> dots;
+    getOperation().walk([&](triton::DotOp dot) { dots.push_back(dot); });
+    for (triton::DotOp dot : dots) {
+      if (getActivationOf(dot))
+        continue;
+      Value root = activationChainRoot(dot);
+      if (!root)
+        continue;
+      auto [kind, chain] = matchTtirActivation(root);
+      if (chain.empty() || !chainInRootBlock(root, chain))
+        continue;
+      dot->setAttr("activation",
+                   ActSpecAttr::get(dot.getContext(), kind, LutMode::Regular,
+                                    nullptr, nullptr, nullptr));
+      // 链尾结果改接链根：下游 truncf/store 读的就是循环携带值或 dot 结果。
+      chain.back()->getResult(0).replaceAllUsesWith(root);
+      for (Operation *op : llvm::reverse(chain))
+        op->erase();
     }
   }
 };

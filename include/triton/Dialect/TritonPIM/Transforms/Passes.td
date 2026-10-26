@@ -128,6 +128,34 @@ def TritonPIMTileToBudget : Pass<"pim-tile-to-budget", "mlir::ModuleOp"> {
     the corresponding structural inference for every `tt.dot` in the
     module. A negative value (the default) means "not supplied", falling
     back to structural inference as before.
+
+    When the module has no `tt.dot`, whole-operator `pim.matmul` ops (the
+    B path) are tiled first: a matmul that does not fit `pim.wram-bytes`
+    gets a `tile = [M, N, K]` attribute from the same search as the
+    `tt.dot` path, restricted to tiles dividing M, N and the group width;
+    the B path has no DMA, so `pim.dma-align` takes no part in choosing
+    the tile. `-pim-lower-to-emitc` turns it into block loops. The module head carries
+    one `pim.tile-m/n/k` and `pim.tile-wram-bytes`, written only when every
+    matmul in the module is tiled with the same tile and the same bytes;
+    otherwise each matmul keeps its own `tile` and the head is left out,
+    with a remark.
+
+    The pass then tiles `scf.for` loops whose bounds and step are constant
+    and whose body carries tensor ops. A loop is tiled when the whole loop
+    (bytes moved per iteration times the trip count) exceeds
+    `pim.wram-bytes`; the rebuilt step is the original step times the
+    largest power-of-two tile whose block still fits, falling back to
+    smaller powers of two until one divides the extent. Only `pim.tile-m`
+    is written -- a single loop extent has no N or K -- and a loop whose
+    tile differs from a tile already in the module head is left unchanged.
+    A loop is left unchanged, with a remark, when its step is not 1, when
+    no searched tile divides the extent, when a load or store carries a
+    mask, when its body contains a nested `scf.for`, when an offset already
+    covers more than one row, when one iteration exceeds the budget, or
+    when one iteration fits but no larger tile does. A module with nothing
+    tileable is left unchanged. The pass requires the module to carry
+    `pim.wram-bytes`, `pim.mram-bytes` and `pim.dma-align`, and fails
+    otherwise.
   }];
 
   let dependentDialects = [
@@ -149,6 +177,66 @@ def TritonPIMTileToBudget : Pass<"pim-tile-to-budget", "mlir::ModuleOp"> {
            "the operator's untiled K, from the real launch args; -1 means"
            " infer from IR structure">,
   ];
+}
+
+def TritonPIMConstantFold : Pass<"pim-constant-fold", "mlir::ModuleOp"> {
+  let summary = "Fold PIM and arith ops whose operands are all constants";
+
+  let description = [{
+    Evaluates `pim.eltwise`, `pim.lut` and `arith.addi`, `arith.subi` and
+    `arith.muli` whose operands are all `arith.constant`, and replaces them
+    with the result. The integer ops cover both scalars and dense i32
+    tensors, which is the form address offsets take after an A-path kernel
+    is converted to PIM. `pim.param`
+    carries only a name and no value, so it is not foldable here.
+
+    The upstream canonicalizer cannot do this: the PIM ops have no `hasFolder`
+    and are not marked `Pure`. `pim.matmul` is deliberately left alone -- one
+    operand is a whole weight tensor, and folding it would move a matrix
+    multiply into compile time.
+  }];
+
+  let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::triton::pim::TritonPIMDialect"
+  ];
+}
+
+def TritonPIMCSE : Pass<"pim-cse", "mlir::ModuleOp"> {
+  let summary = "Merge identical pure PIM ops inside one basic block";
+
+  let description = [{
+    Keeps the first of two `pim.*` ops that share an opcode, attributes and
+    operands, and rewires the second's users to it.
+
+    The upstream CSE only touches ops marked `Pure`, which `matmul`, `eltwise`
+    and `lut` are not. Ops with memory effects (`dma_load`, `kv_cache`,
+    `wram_alloc`) are skipped, as are ops in different blocks.
+  }];
+
+  let dependentDialects = ["mlir::triton::pim::TritonPIMDialect"];
+}
+
+def TritonPIMDCE : Pass<"pim-dce", "mlir::ModuleOp"> {
+  let summary = "Erase pure PIM ops whose results have no users";
+
+  let description = [{
+    Erases a pure op whose every result has no user. In an operator-level
+    function (first argument is a whole tensor or an on-chip buffer) the kernel
+    output is the last batch of unused tensor results, the same rule
+    `pim-lower-to-emitc` uses; the op producing it is kept whichever dialect it
+    belongs to. Unused tensor results of `pim.*` ops are kept as well because
+    they can be read out of band. A-path functions take pointers and hand their
+    results out with `tt.store` or `tt.return`, so there every pure op is
+    erased even when it produces tensors. `dma_store` and `kv_cache` survive
+    because they have memory effects, not because their names are on an
+    exclusion list.
+
+    The upstream `symbol-dce` only removes unused symbols, so it cannot clean up
+    dead ops inside a function body.
+  }];
+
+  let dependentDialects = ["mlir::triton::pim::TritonPIMDialect"];
 }
 
 def TritonPIMFuseActivation : Pass<"pim-fuse-activation", "mlir::ModuleOp"> {

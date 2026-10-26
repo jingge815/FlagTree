@@ -96,6 +96,7 @@
 
 #include <algorithm>
 #include "pim_silu_lut.h"
+#include "PimPure.h"
 
 #include "triton/Dialect/TritonPIM/Transforms/Passes.h"
 
@@ -206,6 +207,23 @@ static float pim_lut_exp(float x) { return expf(x); }
    闭式公式两边都绿，但绿在参考产物并不执行的那个公式上。 */
 static const float pim_silu_slope[32] = {SLOPE_PLACEHOLDER};
 static const float pim_silu_intercept[32] = {INTERCEPT_PLACEHOLDER};
+static float pim_lut_relu(float x) { return x > 0.0f ? x : 0.0f; }
+static float pim_lut_sigmoid(float x) {
+  /* 与 silu 同样先夹住指数，避免 expf 溢出。 */
+  float z = -x;
+  if (z > 80.0f) z = 80.0f;
+  if (z < -80.0f) z = -80.0f;
+  return 1.0f / (1.0f + expf(z));
+}
+static float pim_lut_tanh(float x) { return tanhf(x); }
+/* tanh 近似，与 numpy 镜像 runtime/kernels_pim.py 同一条公式。 */
+static float pim_lut_gelu(float x) {
+  return 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+}
+static float pim_lut_sqrt(float x) { return sqrtf(x); }
+static float pim_lut_leaky_relu(float x, float alpha) {
+  return x > 0.0f ? x : alpha * x;
+}
 static float pim_lut_silu(float x) {
   /* 闭式，与 numpy 镜像同一条公式。31 段弦线在 32 层里累积后，logits
      与 torch 的闭式差到 1 以上。表仍由 synth_silu 合成并写入 GML 产物，
@@ -709,8 +727,7 @@ struct TritonPIMLowerToEmitCPass
   LogicalResult lowerFunc(triton::FuncOp oldFunc) {
     // Whole tensors in, whole tensors out: this is a kernel the graph compiler
     // emitted, not one derived from TTIR, and it has no DMA to lower.
-    if (oldFunc.getNumArguments() > 0 &&
-        isa<RankedTensorType>(oldFunc.getArgument(0).getType()))
+    if (isOperatorLevelFunc(oldFunc))
       return lowerOperatorFunc(oldFunc);
 
     MLIRContext *ctx = &getContext();
@@ -732,6 +749,11 @@ struct TritonPIMLowerToEmitCPass
       if (ptrTy.getPointeeType().isF16())
         needsF16Helpers = true;
     }
+    // 激活函数 pim_lut_* 也写在这段辅助文本里，f32 内核折入激活时同样要输出。
+    oldFunc.walk([&](Operation *op) {
+      if (op->getAttr("activation"))
+        needsF16Helpers = true;
+    });
 
     b.setInsertionPoint(oldFunc);
     // f16 storage needs the conversion helpers ahead of the kernel; C has no
@@ -919,7 +941,9 @@ struct TritonPIMLowerToEmitCPass
       if (failed(out))
         return failure();
 
-      emitDotLoops(b, loc, *a, *w, *out, M, K, N, *seed);
+      if (failed(checkFusedTail(dot)))
+        return failure();
+      emitDotLoops(b, loc, dot, *a, *w, *out, M, K, N, *seed);
       state.record(dot.getResult(), *out);
       return success();
     }
@@ -1086,9 +1110,10 @@ struct TritonPIMLowerToEmitCPass
   // range of `a` before writing that same row range of `out`, which is what
   // keeps the out-aliases-a safety property (see snapshotToLocal's comment)
   // intact when M is split.
-  void emitDotLoops(OpBuilder &b, Location loc, const BufferView &aMram,
-                    const BufferView &wMram, const BufferView &out,
-                    int64_t M, int64_t K, int64_t N, APFloat seed) {
+  void emitDotLoops(OpBuilder &b, Location loc, Operation *dotOp,
+                    const BufferView &aMram, const BufferView &wMram,
+                    const BufferView &out, int64_t M, int64_t K, int64_t N,
+                    APFloat seed) {
     auto i32 = b.getI32Type();
     auto f32 = b.getF32Type();
     auto cst = [&](int64_t v) -> Value {
@@ -1166,7 +1191,9 @@ struct TritonPIMLowerToEmitCPass
                         kb.create<emitc::YieldOp>(loc);
                       });
                   storeAt(nb, out, m, n,
-                          nb.create<emitc::LoadOp>(loc, f32, acc));
+                          applyActivation(nb, loc, dotOp,
+                                          nb.create<emitc::LoadOp>(loc, f32,
+                                                                   acc)));
                   nb.create<emitc::YieldOp>(loc);
                 });
             mb.create<emitc::YieldOp>(loc);
@@ -1387,6 +1414,12 @@ struct TritonPIMLowerToEmitCPass
     case ActivationKind::Identity:
     case ActivationKind::Reciprocal:
     case ActivationKind::Exp:
+    case ActivationKind::Relu:
+    case ActivationKind::Sigmoid:
+    case ActivationKind::Tanh:
+    case ActivationKind::Gelu:
+    case ActivationKind::Sqrt:
+    case ActivationKind::LeakyRelu:
     case ActivationKind::Silu:
     case ActivationKind::Rsqrt:
       return success();
@@ -1407,6 +1440,13 @@ struct TritonPIMLowerToEmitCPass
     case ActivationKind::Identity:   fn = "pim_lut_identity"; break;
     case ActivationKind::Reciprocal: fn = "pim_lut_reciprocal"; break;
     case ActivationKind::Exp:        fn = "pim_lut_exp"; break;
+    case ActivationKind::Relu:       fn = "pim_lut_relu"; break;
+    case ActivationKind::Sigmoid:    fn = "pim_lut_sigmoid"; break;
+    case ActivationKind::Tanh:       fn = "pim_lut_tanh"; break;
+    case ActivationKind::Gelu:       fn = "pim_lut_gelu"; break;
+    case ActivationKind::Sqrt:       fn = "pim_lut_sqrt"; break;
+    case ActivationKind::LeakyRelu:
+      return leakyRelu(b, loc, value, spec.getAlpha());
     case ActivationKind::Silu:       fn = "pim_lut_silu"; break;
     case ActivationKind::Rsqrt:      fn = "pim_rsqrtf"; break;
     default:
@@ -1414,6 +1454,16 @@ struct TritonPIMLowerToEmitCPass
     }
     return b.create<emitc::CallOpaqueOp>(loc, TypeRange{b.getF32Type()}, fn,
                                          ValueRange{value})
+        .getResult(0);
+  }
+
+  // leaky_relu 的斜率是属性上的常数，没写时按 0，与 relu 相同。
+  static Value leakyRelu(OpBuilder &b, Location loc, Value value,
+                         FloatAttr alpha) {
+    float slope = alpha ? (float)alpha.getValueAsDouble() : 0.0f;
+    return b.create<emitc::CallOpaqueOp>(
+                loc, TypeRange{b.getF32Type()}, "pim_lut_leaky_relu",
+                ValueRange{value, constF32(b, loc, slope)})
         .getResult(0);
   }
 
@@ -1601,6 +1651,92 @@ struct TritonPIMLowerToEmitCPass
     helpersEmitted = true;
   }
 
+  // 按 `tile` 属性分块的矩阵乘：每个 M×N 输出块用两个 f32 累加数组，K 按
+  // tile 分段累加进当前组。同一输出元素的加法顺序与不分块相同，结果逐位一致。
+  LogicalResult lowerTiledMatmul(MatmulOp mm, OpBuilder &b,
+                                 ArrayRef<int64_t> tile, int64_t m, int64_t n,
+                                 int64_t k, int64_t groupSize, bool grouped,
+                                 double guard, const FlatBuffer &lhs,
+                                 const FlatBuffer &rhs,
+                                 const FlatBuffer &scales,
+                                 const FlatBuffer &dst,
+                                 SmallVectorImpl<FlatBuffer> &temporaries) {
+    Location loc = mm.getLoc();
+    if (tile.size() != 3 || tile[0] <= 0 || tile[1] <= 0 || tile[2] <= 0 ||
+        m % tile[0] || n % tile[1] || groupSize % tile[2])
+      return mm.emitOpError()
+             << "tile must divide M, N and the group width";
+    int64_t tm = tile[0], tn = tile[1], tk = tile[2];
+    Type f32 = b.getF32Type(), i32 = b.getI32Type();
+    bool transposeB = mm.getTransposeB();
+    FlatBuffer total = allocFlat(b, loc, tm * tn, f32, temporaries);
+    FlatBuffer group = allocFlat(b, loc, tm * tn, f32, temporaries);
+    // `a * c + d`，下标运算全用 i32。
+    auto mulAdd = [&](OpBuilder &ib, Value a, int64_t c, Value d) -> Value {
+      return ib.create<emitc::AddOp>(
+          loc, i32, ib.create<emitc::MulOp>(loc, i32, a, constI32(ib, loc, c)),
+          d);
+    };
+    auto fill = [&](OpBuilder &ib, const FlatBuffer &buf) {
+      emitFor(ib, loc, 0, tm * tn, [&](OpBuilder &eb, Value e) {
+        storeFlat(eb, loc, buf, e, constF32(eb, loc, 0.0));
+      });
+    };
+    // 遍历块内每个输出元素，回调拿到全局行列号和块内下标。
+    auto eachOut = [&](OpBuilder &ib, Value mt, Value nt, auto body) {
+      emitFor(ib, loc, 0, tm, [&](OpBuilder &rb, Value i) {
+        emitFor(rb, loc, 0, tn, [&](OpBuilder &cb, Value j) {
+          body(cb, mulAdd(cb, mt, tm, i), mulAdd(cb, nt, tn, j),
+               mulAdd(cb, i, tn, j));
+        });
+      });
+    };
+
+    // 1. 遍历输出块，总数清零。
+    emitFor(b, loc, 0, m / tm, [&](OpBuilder &mb, Value mt) {
+      emitFor(mb, loc, 0, n / tn, [&](OpBuilder &nb, Value nt) {
+        fill(nb, total);
+        // 2. 逐组：组内按 K 块分段累加，组边界反量化后折进总数。
+        emitFor(nb, loc, 0, k / groupSize, [&](OpBuilder &gb, Value gi) {
+          fill(gb, group);
+          emitFor(gb, loc, 0, groupSize / tk, [&](OpBuilder &kb, Value kt) {
+            eachOut(kb, mt, nt, [&](OpBuilder &ob, Value row, Value col,
+                                    Value e) {
+              emitFor(ob, loc, 0, tk, [&](OpBuilder &ib, Value kk) {
+                Value kAbs = mulAdd(ib, gi, groupSize, mulAdd(ib, kt, tk, kk));
+                Value ai = mulAdd(ib, row, k, kAbs);
+                Value bj = transposeB ? mulAdd(ib, col, k, kAbs)
+                                      : mulAdd(ib, kAbs, n, col);
+                Value prod = ib.create<emitc::MulOp>(
+                    loc, f32, loadFlat(ib, loc, lhs, ai),
+                    loadFlat(ib, loc, rhs, bj));
+                storeFlat(ib, loc, group, e,
+                          ib.create<emitc::AddOp>(
+                              loc, f32, loadFlat(ib, loc, group, e), prod));
+              });
+            });
+          });
+          eachOut(gb, mt, nt, [&](OpBuilder &ob, Value, Value col, Value e) {
+            Value factor = grouped
+                               ? loadFlat(ob, loc, scales, mulAdd(ob, gi, n, col))
+                               : constF32(ob, loc, guard);
+            Value scaled = ob.create<emitc::MulOp>(
+                loc, f32, loadFlat(ob, loc, group, e), factor);
+            storeFlat(ob, loc, total, e,
+                      ob.create<emitc::AddOp>(
+                          loc, f32, loadFlat(ob, loc, total, e), scaled));
+          });
+        });
+        // 3. 激活后写回输出。
+        eachOut(nb, mt, nt, [&](OpBuilder &ob, Value row, Value col, Value e) {
+          storeFlat(ob, loc, dst, mulAdd(ob, row, n, col),
+                    applyActivation(ob, loc, mm, loadFlat(ob, loc, total, e)));
+        });
+      });
+    });
+    return success();
+  }
+
   LogicalResult lowerOperatorOp(Operation *op, OpBuilder &b,
                                 DenseMap<Value, FlatBuffer> &buffers,
                                 const DenseMap<Value, FlatBuffer> &outs,
@@ -1695,6 +1831,11 @@ struct TritonPIMLowerToEmitCPass
       case ActivationKind::Identity:   fn = "pim_lut_identity"; break;
       case ActivationKind::Reciprocal: fn = "pim_lut_reciprocal"; break;
       case ActivationKind::Exp:        fn = "pim_lut_exp"; break;
+      case ActivationKind::Relu:       fn = "pim_lut_relu"; break;
+      case ActivationKind::Sigmoid:    fn = "pim_lut_sigmoid"; break;
+      case ActivationKind::Tanh:       fn = "pim_lut_tanh"; break;
+      case ActivationKind::Gelu:       fn = "pim_lut_gelu"; break;
+      case ActivationKind::Sqrt:       fn = "pim_lut_sqrt"; break;
       case ActivationKind::Silu:       fn = "pim_lut_silu"; break;
       case ActivationKind::Rsqrt:      fn = "pim_rsqrtf"; break;
       default:
@@ -2097,6 +2238,11 @@ struct TritonPIMLowerToEmitCPass
       bool transposeB = mm.getTransposeB();
       if (failed(checkFusedTail(op)))
         return failure();
+
+      if (auto tile = mm.getTileAttr())
+        return lowerTiledMatmul(mm, b, tile.asArrayRef(), m, n, k, groupSize,
+                                grouped, guard, lhs, rhs, scales, dst,
+                                temporaries);
 
       emitFor(b, loc, 0, m, [&](OpBuilder &mb, Value mi) {
         emitFor(mb, loc, 0, n, [&](OpBuilder &nb, Value ni) {
