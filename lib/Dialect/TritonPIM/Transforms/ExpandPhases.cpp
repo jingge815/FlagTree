@@ -7,6 +7,12 @@
 //   pim.softmax             ->  5 phases (max, exp, sum, reciprocal, mul)
 //   pim.rope                ->  3 phases (mul-cos, mul-sin, add)
 //
+// Two operators are annotated instead of expanded, because their lowering owns
+// the loop nest and splitting them would re-emit a different kernel:
+//
+//   pim.matmul              ->  1 phase (the MAC array), configuration only
+//   pim.paged_attn          ->  6 phases stamped on the op that stays fused
+//
 // Templates are op-local and hardcoded against the llama2 W4A8 reference
 // artifact. Other operators are left alone. Each produced op carries
 // `#pim.phase_spec` (its `bytes` field is the logical buffer size); L2 offsets
@@ -74,18 +80,29 @@ static int64_t elementBytes(Type elem) {
 // consumes, which is how the fan-out survives: dynamic quantization's phases 1
 // and 2 both read phase 0, and a consumer that assumed a chain would put the
 // reciprocal off by 256x.
-static void setPhaseSpec(Operation *op, int64_t index, RankedTensorType ty,
-                         FunctionalUnit unit, bool consecutive = false,
-                         ArrayRef<int64_t> reads = {}) {
-  MLIRContext *ctx = op->getContext();
+// One phase entry. Separate from `setPhaseSpec` below because a stamped op owns
+// several traversals in one place, while every op of an expanded chain owns one.
+static PhaseSpecAttr makePhase(MLIRContext *ctx, int64_t index, int64_t bytes,
+                               FunctionalUnit unit, bool consecutive = false,
+                               ArrayRef<int64_t> reads = {},
+                               bool perBlock = false, int64_t poolBytes = 0) {
   SmallVector<Attribute> readAttrs;
   for (int64_t read : reads)
     readAttrs.push_back(IntegerAttr::get(IntegerType::get(ctx, 64), read));
 
-  auto spec = PhaseSpecAttr::get(
-      ctx, index, elementCount(ty) * elementBytes(ty.getElementType()), unit,
-      consecutive,
-      readAttrs.empty() ? ArrayAttr{} : ArrayAttr::get(ctx, readAttrs));
+  return PhaseSpecAttr::get(
+      ctx, index, bytes, unit, consecutive,
+      readAttrs.empty() ? ArrayAttr{} : ArrayAttr::get(ctx, readAttrs),
+      perBlock, poolBytes);
+}
+
+static void setPhaseSpec(Operation *op, int64_t index, RankedTensorType ty,
+                         FunctionalUnit unit, bool consecutive = false,
+                         ArrayRef<int64_t> reads = {}) {
+  MLIRContext *ctx = op->getContext();
+  auto spec = makePhase(ctx, index,
+                        elementCount(ty) * elementBytes(ty.getElementType()),
+                        unit, consecutive, reads);
   op->setAttr("phases", ArrayAttr::get(ctx, {spec}));
   // Whether this op is phase-shaped, said outright rather than inferred. The
   // target's revision field is not a usable proxy: 37 nodes carry it while 69
@@ -570,6 +587,68 @@ static void stampMatmul(MatmulOp op) {
 }
 
 //===----------------------------------------------------------------------===//
+// Paged attention: 6 phases stamped on the op, never expanded.
+//
+// This op is lowered straight to C by `pim-lower-to-emitc`, and that C is the
+// block-table walk plus a single-pass online softmax. Its temporaries are the
+// six traversals stamped below -- one block of scores, the running max, the exp
+// of that block, the running sum, the fp32 output accumulator, and the
+// normalized result -- so the stamp can be read back against the lowering
+// instead of against a second model. Expanding it into ops would re-emit the
+// kernel phase by phase and lose the fusion the op exists for.
+//
+// `bytes` follows the same rule as the expanded chains above: the logical
+// buffer the traversal streams. The loop trip count (blocks x slot tokens) is
+// deliberately not folded in -- it is the history length, which `pos +
+// numTokens` decides at run time, and a compile-time upper bound here would
+// read as the real size. What the stamp does say is *which* phases repeat:
+// 0-4 run once per history block (`perBlock`), 5 runs once per operator, and
+// 0 and 4 additionally name the KV pool block they stream (`poolBytes`).
+//===----------------------------------------------------------------------===//
+
+static void stampPagedAttn(PagedAttnOp op) {
+  MLIRContext *ctx = op->getContext();
+  auto qTy = cast<RankedTensorType>(op.getQ().getType());
+  int64_t tokens = qTy.getDimSize(0);
+  int64_t headDim = qTy.getDimSize(1);
+  int64_t elemBytes = elementBytes(qTy.getElementType());
+
+  // 单遍 softmax 只留一块的分数，不再按整行开满；归一化前后的输出与 q 同宽。
+  int64_t scoresBytes = tokens * op.getSlotTokens() * elemBytes;
+  int64_t outBytes = tokens * headDim * elemBytes;
+  // 累加器与 running 统计全程是 fp32，单遍算法不让中间量落到 f16。
+  int64_t accBytes = tokens * headDim * 4;
+  int64_t statBytes = tokens * 4;
+
+  // 一块 K 或 V 的字节数：块内每个 token 一个 head 的向量。
+  int64_t kvBlockBytes = op.getSlotTokens() * headDim * elemBytes;
+
+  SmallVector<Attribute> phases{
+      // 0 QK：逐块 QK，掩码后落 f16 分数。乘加阵列。读一块 K。
+      makePhase(ctx, /*index=*/0, scoresBytes, FunctionalUnit::NMU, false, {},
+                /*perBlock=*/true, kvBlockBytes),
+      // 1 本块最大值 → running max。向量单元的逐 token 扫描。
+      makePhase(ctx, 1, statBytes, FunctionalUnit::VPU, false, {0},
+                /*perBlock=*/true),
+      // 2 exp(x - mNew)，原地写回分数；alpha 也在这里算（expf(mOld - mNew)）。
+      makePhase(ctx, 2, scoresBytes, FunctionalUnit::Activation, false, {0, 1},
+                /*perBlock=*/true),
+      // 3 本块求和 → running sum。
+      makePhase(ctx, 3, statBytes, FunctionalUnit::VPU, false, {2},
+                /*perBlock=*/true),
+      // 4 PV：累加器先按 alpha 重标定，再加本块的未归一化贡献。读一块 V。
+      makePhase(ctx, 4, accBytes, FunctionalUnit::NMU, false, {2},
+                /*perBlock=*/true, kvBlockBytes),
+      // 5 除以 running sum 写回。与 softmax 链的末相共用一个块，整算子只跑一次。
+      makePhase(ctx, 5, outBytes, FunctionalUnit::Combiner, false, {3, 4}),
+  };
+  op->setAttr("phases", ArrayAttr::get(ctx, phases));
+  op->setAttr("isPhased", UnitAttr::get(ctx));
+  // 不写算子级的 `unit`：展开出来的相位 op 也都只带这张表，单元归属逐相写在
+  // `phases` 里。这个算子横跨三个单元，再给整算子记一个只会是个假答案。
+}
+
+//===----------------------------------------------------------------------===//
 // Pass
 //===----------------------------------------------------------------------===//
 
@@ -586,6 +665,7 @@ struct TritonPIMExpandPhasesPass
     SmallVector<SoftmaxOp> sms;
     SmallVector<RopeOp> ropes;
     SmallVector<MatmulOp> matmuls;
+    SmallVector<PagedAttnOp> pagedAttns;
     getOperation().walk([&](Operation *op) {
       if (auto q = dyn_cast<QuantizeOp>(op))
         dqs.push_back(q);
@@ -597,12 +677,19 @@ struct TritonPIMExpandPhasesPass
         ropes.push_back(r);
       else if (auto m = dyn_cast<MatmulOp>(op))
         matmuls.push_back(m);
+      else if (auto pa = dyn_cast<PagedAttnOp>(op))
+        pagedAttns.push_back(pa);
     });
 
     // Matmul is single-phase: annotate in place, never expand. Do it before the
     // expansions so a matmul fed by an expanded op is untouched by this walk.
     for (auto m : matmuls)
       stampMatmul(m);
+
+    // Paged attention is kept whole for the same reason: its lowering owns the
+    // block-table walk, so only the per-traversal accounting is stamped.
+    for (auto pa : pagedAttns)
+      stampPagedAttn(pa);
 
     for (auto q : dqs)
       if (failed(expandQuantize(q)))

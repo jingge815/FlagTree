@@ -68,6 +68,33 @@ module {
 
 // -----
 
+// The KV pool is read once per history block, so a pool read outside the block
+// loop describes traffic nothing schedules -- and a cost model would bill it
+// once instead of once per block.
+module {
+  tt.func @pool_read_without_a_block_loop(%x: tensor<1x32xf16>) {
+    // expected-error @+2 {{reads the KV pool but is not perBlock}}
+    %a = pim.lut %x {kind = #pim.activation<exp>,
+                     phases = [#pim.phase_spec<index = 0, bytes = 64, unit = cstl, poolBytes = 4096>]}
+        : tensor<1x32xf16> -> tensor<1x32xf16>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @negative_pool_bytes(%x: tensor<1x32xf16>) {
+    // expected-error @+2 {{phase poolBytes must be non-negative}}
+    %a = pim.lut %x {kind = #pim.activation<exp>,
+                     phases = [#pim.phase_spec<index = 0, bytes = 64, unit = cstl, perBlock = true, poolBytes = -1>]}
+        : tensor<1x32xf16> -> tensor<1x32xf16>
+    tt.return
+  }
+}
+
+// -----
+
 // `phases` is declared on the shared operator base class, so the dialect
 // rejects a value of the wrong shape instead of accepting it and leaving the
 // consumer to read nothing back. Before the declaration this compiled: the

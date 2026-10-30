@@ -135,6 +135,14 @@ SmallVector<SmallVector<Phase>> groupIntoChains(ArrayRef<Phase> phases) {
     indexOf[phases[i].op] = i;
 
   ChainDSU dsu(phases.size());
+  // 挂在同一个 op 上的多条相位天然是同一条链：它就是一次展开的相位号序列，
+  // 编号本来就在自己这条链内数。不先并起来，下面按 def-use 走不到任何边
+  // （这类 op 的操作数都是函数参数），每条相位会被当成独立的单相链，
+  // `verifyIndicesInOneChain` 就会把 index 1..n 报成「0 缺号」。
+  for (unsigned i = 0; i < phases.size(); ++i)
+    for (unsigned j = i + 1; j < phases.size(); ++j)
+      if (phases[i].op == phases[j].op)
+        dsu.join(i, j);
   // Softmax 的稳定化 `sub` 不带 phase_spec（它折进 exp 相），但仍在相 0
   // 与相 1 之间传值。只看带相位的 def-use 会把一条链拆开，相 0 变成「缺号」。
   // 所以沿操作数向上走，穿过无相位的中间 op，直到碰到另一个相位 op。
