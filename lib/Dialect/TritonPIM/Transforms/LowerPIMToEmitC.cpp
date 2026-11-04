@@ -2200,6 +2200,10 @@ struct TritonPIMLowerToEmitCPass
       if (mm.getBias())
         return mm.emitOpError()
                << "pim-lower-to-emitc has no C for the bias operand";
+      if (auto fpsu = mm.getFpsu();
+          fpsu && fpsu->getMode() == FpsuMode::Fixed2Float)
+        return mm.emitOpError()
+               << "pim-lower-to-emitc has no C for fpsu mode fixed2float";
 
       int64_t m = aTy.getDimSize(0), k = aTy.getDimSize(1);
       int64_t n = bTy.getDimSize(mm.getTransposeB() ? 0 : 1);

@@ -731,6 +731,9 @@ def TTPIM_WeightBindingAttr : TritonPIM_Attr<"WeightBinding", "weight_binding"> 
     How one operand of `pim.matmul` is staged on the weight path.
 
     `elemBits` is 4 for a model weight and 8 for an activation used as one.
+    A model weight may also be 8 bits on the statically quantized path (the
+    output head): `pim.matmul` then requires `nmuMode = fixed_point` and
+    `fpsu = fixed2float`.
     **int4 is stored one byte per element**, sign-extended over the range
     `[-8, 7]` -- there is no nibble packing and no special alignment. That is
     the opposite of what the width suggests, and getting it wrong produces a
@@ -820,10 +823,14 @@ def TTPIM_KantorSpecAttr : TritonPIM_Attr<"KantorSpec", "kantor_spec"> {
 def TTPIM_FpsuFloating   : I32EnumAttrCase<"FloatingPoint",   0, "floating_point">;
 def TTPIM_FpsuFloating32 : I32EnumAttrCase<"FloatingPoint32", 1, "floating_point_32">;
 def TTPIM_FpsuFixed      : I32EnumAttrCase<"FixedPoint",      2, "fixed_point">;
+// The statically quantized output head accumulates in fixed point and has this
+// unit convert the accumulator back to float on the way out.
+def TTPIM_FpsuFixed2Float : I32EnumAttrCase<"Fixed2Float",    3, "fixed2float">;
 
 def TTPIM_FpsuMode : I32EnumAttr<"FpsuMode",
   "Numeric format the fixed-point rescaling unit works in", [
-    TTPIM_FpsuFloating, TTPIM_FpsuFloating32, TTPIM_FpsuFixed
+    TTPIM_FpsuFloating, TTPIM_FpsuFloating32, TTPIM_FpsuFixed,
+    TTPIM_FpsuFixed2Float
   ]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::mlir::triton::pim";

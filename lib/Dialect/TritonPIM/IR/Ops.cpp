@@ -515,6 +515,31 @@ LogicalResult MatmulOp::verify() {
                          "with transposeB");
   }
 
+  // An int8 model weight is the statically quantized path: it needs a
+  // fixed-point accumulator. A floating-point NMU reads int4 model weights.
+  if (auto binding = getWeightBinding()) {
+    if (binding->getRole() == WeightRole::ModelWeight &&
+        binding->getElemBits() == 8 &&
+        getDatapath().getNmuMode() != NumericMode::FixedPoint)
+      return emitOpError("an int8 model weight needs nmuMode = fixed_point; got ")
+             << stringifyNumericMode(getDatapath().getNmuMode());
+    // The fixed-point accumulator goes back to float through fixed2float. A
+    // missing mode would be stamped to the 32-bit float default, so it is
+    // rejected here too.
+    auto fpsu = getFpsu();
+    if (binding->getRole() == WeightRole::ModelWeight &&
+        binding->getElemBits() == 8 &&
+        (!fpsu || fpsu->getMode() != FpsuMode::Fixed2Float))
+      return emitOpError("an int8 model weight needs fpsu mode fixed2float; got ")
+             << (fpsu ? stringifyFpsuMode(fpsu->getMode()) : StringRef("none"));
+  }
+  // fixed2float converts a fixed-point accumulator back to float.
+  if (auto fpsu = getFpsu()) {
+    if (fpsu->getMode() == FpsuMode::Fixed2Float &&
+        getDatapath().getNmuMode() != NumericMode::FixedPoint)
+      return emitOpError("fpsu mode fixed2float needs nmuMode = fixed_point");
+  }
+
   // A weight-role quant spec states the value range the weight was stored in;
   // the binding states the element width. Both describe the same storage, so a
   // range outside what the width can hold means one of them is wrong -- and the

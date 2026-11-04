@@ -129,3 +129,15 @@ module {
     tt.return
   }
 }
+
+// -----
+
+// The output head's fixed2float conversion has no C yet; lowering it as the
+// default float path would compute a different function.
+module {
+  tt.func @matmul_fixed2float_has_no_c(%a: tensor<1x8xi8>, %b: tensor<8x4xi8>) {
+    // expected-error @below {{pim-lower-to-emitc has no C for fpsu mode fixed2float}}
+    %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>, fpsu = #pim.fpsu_spec<mode = fixed2float>} : tensor<1x8xi8>, tensor<8x4xi8> -> tensor<1x4xf16>
+    tt.return
+  }
+}

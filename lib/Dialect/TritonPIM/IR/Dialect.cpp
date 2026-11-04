@@ -556,12 +556,13 @@ LogicalResult WeightBindingAttr::verify(
   // int4 is stored one byte per element, so there is no packing width to get
   // wrong -- but there are exactly two widths a weight path operand has.
   if (elemBits != 4 && elemBits != 8)
-    return emitError() << "elemBits is 4 (model weight) or 8 (activation used "
-                          "as a weight); got "
+    return emitError() << "elemBits is 4 or 8 for a model weight (8 only on the "
+                          "statically quantized path) and 8 for an activation "
+                          "used as a weight; got "
                        << elemBits;
 
-  if (role == WeightRole::ModelWeight && elemBits != 4)
-    return emitError() << "a model weight is int4; got elemBits = " << elemBits;
+  // A model weight is int4, except on the statically quantized output head
+  // where it is int8; whether the datapath allows int8 is MatmulOp's check.
   if (role == WeightRole::ActivationAsWeight && elemBits != 8)
     return emitError()
            << "an activation used as a weight is int8; got elemBits = "

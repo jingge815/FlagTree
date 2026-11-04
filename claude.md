@@ -38,6 +38,7 @@ flagtree = flagOS 存算一体（PIM）体系的**算子编译器**：基于 Fla
 - `include/triton/Dialect/TritonPIM/IR/PIMOps.td`：存储类算子 `pim.tasklet_id/dpu_id/wram_alloc/dma_load/dma_store/wram_load/wram_store/barrier/convert_layout`；GML 算子 `pim.quantize/dequantize/matmul/conv/lut/eltwise/pool/reduce_axis/rope/normalize/softmax`；结构算子 `pim.buffer_alloc/buffer_copy/decompress_weight/param/transpose/reshape/split/concat/mask/kv_cache/split_heads`。
 - `PIMAttrDefs.td`：`tasklet_tiled`、`quant_spec`（含 role/fpDtype/range）、`kantor_block`、`kantor_spec`、`datapath`、`act_spec`、`pool_spec`、`phase_spec`、`fpsu_spec`、`weight_binding`、`contraction`、FunctionalUnit(**9 值**：nmu/vpu/cstl/dma 序数冻结 + fpsu/kantor/pooling/activation/combiner)、FpsuMode、GlobalPoolKind、PoolDType、WeightFormat/Role、QuantRole、ContractionForm。
 - `PIMTypes.td` / `PIMDialect.td`：`!pim.memdesc`（wram/mram/l1/l2）、方言定义。
+- `FpsuMode` 追加 `fixed2float`，旧枚举序号不变；int8 模型权重要求 `nmuMode = fixed_point` 与显式 `fpsu = fixed2float`，由 `Ops.cpp::MatmulOp::verify` 联合校验。
 - 模块属性名常量集中在 `lib/Dialect/TritonPIM/IR/Dialect.h`（`AttrNumTaskletsName` 等 + `lookupNumTasklets`/`maybeLookupWramBytes`）。
 
 **核心实现**
@@ -60,7 +61,10 @@ flagtree = flagOS 存算一体（PIM）体系的**算子编译器**：基于 Fla
 4. GPU sidecar：`FLAGTREE_EMIT_PIM=1` 时 NVIDIA `make_ttir` 末尾 clone TTIR 走 2，产物 `$TRITON_DUMP_DIR/pim-<hash>/<kernel>.pimir`
 5. Python pass 入口：`passes.pim.add_convert_to_pim(pm, target, num_dpus=1, num_tasklets=16, wram_bytes=65536, mram_bytes=..., dma_align=8)` / `add_tile_to_budget(pm, full_m=-1, full_n=-1, full_k=-1)` / `add_explicit_dma(pm)`
 
+输出头静态 int8 路径：`ExpandPhases.cpp::stampMatmul` 保留显式 FPSU 模式，仅在缺失时补默认值；`fixed2float` 用于 GML 交接，`LowerPIMToEmitC.cpp` 明确拒绝该模式，尚无对应 C 实现。
+
 **构建/运行（唯一入口：`flagOS-installers/0-install-flagtree.sh`，勿自造流程）**
+
 - 安装/重装：`bash 0-install-flagtree.sh [--source-dir <repo>] [--prefix <dir>] [--max-jobs N] [--skip-test]`；源码有未提交改动需 `ALLOW_DIRTY_FLAGTREE_SOURCE=1`
 - 使用前每个 shell 必须 `source <prefix>/env-flagtree.sh`（PATH/LLVM_SYSPATH/TRITON_BUILD_DIR/TRITON_DUMP_DIR 等）
 - triton-opt：`$TRITON_BUILD_DIR/bin/triton-opt`；lit：源码目录 `make test-lit`；C++ 增量：`ninja -C $TRITON_BUILD_DIR triton-opt`；**Python 改动需重跑安装脚本或重装 `<prefix>/wheels/flagtree-*.whl`**
@@ -82,6 +86,7 @@ flagtree = flagOS 存算一体（PIM）体系的**算子编译器**：基于 Fla
 
 ## 5. AI 检索指引（场景 → 目录）
 
+- 输出头 int8 模型权重、`fixed2float` 与显式 FPSU 保留 → `PIMAttrDefs.td`、`Ops.cpp::MatmulOp::verify`、`ExpandPhases.cpp::stampMatmul`；正反例见 `expand_phases.mlir`、`operator_ops_negative.mlir`、`lower_to_emitc_ops_negative.mlir`。
 - 算子 lowering / DMA 改写 → `lib/Dialect/TritonPIM/Transforms/ExplicitDMA.cpp` + `test/Dialect/TritonPIM/explicit_dma.mlir`
 - GML/算子级算子定义、属性含义 → `include/triton/Dialect/TritonPIM/IR/PIMOps.td`、`PIMAttrDefs.td` + `operator_*.mlir`
 - 相位展开（量化/softmax/rope）→ `ExpandPhases.cpp` + `expand_phases*.mlir`

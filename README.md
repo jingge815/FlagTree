@@ -2,7 +2,7 @@
 
 > 本文件是 flagOS 存算一体（PIM）编译体系中 **flagtree 算子编译器** 的代码索引。
 > **维护约定：每次代码提交必须同步更新本文件与根目录 `claude.md`（目录索引、核心模块说明、提交记录）。**
-> 最近更新：2026-09-21，对应 HEAD `c4dc3eb95`。
+> 最近更新：2026-11-03，补充当前工作区的 CEVA 输出头静态量化能力；尚未提交。
 
 ## 1. 仓库概述
 
@@ -30,6 +30,10 @@ flagtree 是 flagOS 存算一体编译器体系中的**算子编译器核心模�
 11. **PIM 目标校验放宽**：`lib/Dialect/Triton/IR/Traits.cpp::verifyTensorSize` 对带 `pim.target` 的模块取消“元素数必须为 2 的幂”限制（模型维度如 llama2 MLP 11008），其他后端行为不变。
 
 ## 3. 目录结构索引
+
+CEVA 输出头的 int8 静态量化：`weight_binding` 允许 int8 模型权重，但必须同时声明 `nmuMode = fixed_point` 和 `fpsu = fixed2float`。`FpsuMode` 在旧值之后追加该模式；`Ops.cpp::MatmulOp::verify` 拒绝缺失或矛盾的配套属性。`ExpandPhases.cpp::stampMatmul` 保留显式 FPSU，仅在没有声明时填默认值。该路径用于生成 GML 硬件属性，EmitC 尚未实现 `fixed2float`，遇到它明确报错。
+
+对应测试：`test/Dialect/TritonPIM/expand_phases.mlir` 的 `head_keeps_fixed2float`，以及 `operator_ops_negative.mlir`、`lower_to_emitc_ops_negative.mlir` 的配套约束与拒绝用例。检索入口见 `claude.md` §3、§5。
 
 粒度统一到**二级目录**；未列出的三级目录请按此表定位后再 `glob/grep`。
 本表以 `include/triton`、`lib/Dialect`、`python/triton` 等**源码根**为一级目录，以其直接子目录（如 `Dialect/TritonPIM`、`Conversion/TritonToTritonPIM`）为二级目录展开，保证索引落到实际模块；仓库顶层无二级结构的目录（`bin`、`cmake`、`scripts` 等）单列。

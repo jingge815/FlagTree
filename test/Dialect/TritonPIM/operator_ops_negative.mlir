@@ -443,7 +443,7 @@ module {
 // Two element widths exist on the weight path and no others.
 module {
   tt.func @weight_bits_must_be_4_or_8(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
-    // expected-error @below {{elemBits is 4 (model weight) or 8 (activation used as a weight); got 3}}
+    // expected-error @below {{elemBits is 4 or 8 for a model weight (8 only on the statically quantized path) and 8 for an activation used as a weight; got 3}}
     %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, weightBinding = #pim.weight_binding<format = weight, role = model_weight, elemBits = 3>} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xi8>
     tt.return
   }
@@ -451,12 +451,48 @@ module {
 
 // -----
 
-// A model weight is int4; the role and the width have to agree, or the buffer
-// comes out the wrong size for what the reader expects of the role.
+// An int8 model weight exists only on the statically quantized path (the
+// output head): a floating-point NMU reads int4 weights, so the two have to
+// agree or the buffer comes out the wrong size for the reader.
 module {
-  tt.func @model_weight_is_int4(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
-    // expected-error @below {{a model weight is int4; got elemBits = 8}}
+  tt.func @int8_model_weight_needs_fixed_point(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
+    // expected-error @below {{an int8 model weight needs nmuMode = fixed_point; got floating_point}}
     %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, weightBinding = #pim.weight_binding<format = weight, role = model_weight, elemBits = 8>} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xi8>
+    tt.return
+  }
+}
+
+// -----
+
+// The int8 output head accumulates in fixed point and converts back through a
+// fixed2float FPSU. Without an explicit FPSU the stamp would fill in the 32-bit
+// float default, so the verifier rejects both a missing and a wrong mode.
+module {
+  tt.func @int8_model_weight_needs_fixed2float(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
+    // expected-error @below {{an int8 model weight needs fpsu mode fixed2float; got none}}
+    %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>, weightBinding = #pim.weight_binding<format = weight, role = model_weight, elemBits = 8>} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xf16>
+    tt.return
+  }
+}
+
+// -----
+
+module {
+  tt.func @int8_model_weight_rejects_float32_fpsu(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
+    // expected-error @below {{an int8 model weight needs fpsu mode fixed2float; got floating_point_32}}
+    %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>, fpsu = #pim.fpsu_spec<mode = floating_point_32>, weightBinding = #pim.weight_binding<format = weight, role = model_weight, elemBits = 8>} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xf16>
+    tt.return
+  }
+}
+
+// -----
+
+// fixed2float converts a fixed-point accumulator; on a floating-point NMU there
+// is nothing to convert.
+module {
+  tt.func @fixed2float_needs_fixed_point_nmu(%a: tensor<4x8xi8>, %b: tensor<8x4xi8>) {
+    // expected-error @below {{fpsu mode fixed2float needs nmuMode = fixed_point}}
+    %m = pim.matmul %a, %b {datapath = #pim.datapath<nmuMode = floating_point, scaleMode = floating_point>, fpsu = #pim.fpsu_spec<mode = fixed2float>} : tensor<4x8xi8>, tensor<8x4xi8> -> tensor<4x4xf16>
     tt.return
   }
 }

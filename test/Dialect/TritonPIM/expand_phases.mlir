@@ -237,3 +237,24 @@ module {
 // CHECK: %[[P2:.+]] = pim.lut %[[P0]] {{.*}}kind = #pim.activation<reciprocal>
 // CHECK: %[[P3:.+]] = pim.kantor %{{.*}} scale %[[P2]] {{.*}}shift = -8 : i8
 // CHECK: tt.return %[[P3]], %[[P1]]
+
+// -----
+
+// The output head is int8 statically quantized: an int8 model weight, a
+// fixed-point NMU, and a FPSU that converts the fixed-point accumulator back to
+// float. The explicit FPSU mode is the operator's own numeric decision and the
+// stamp must keep it instead of resetting it to the 32-bit float default.
+
+// CHECK-LABEL: @head_keeps_fixed2float
+module {
+  tt.func @head_keeps_fixed2float(%a: tensor<1x4096xi8>, %w: tensor<4096x32000xi8>) {
+    // CHECK: pim.matmul {{.*}}fpsu = #pim.fpsu_spec<mode = fixed2float>
+    // CHECK-SAME: #pim.weight_binding<format = weight, role = model_weight, elemBits = 8>
+    %m = pim.matmul %a, %w
+       {datapath = #pim.datapath<nmuMode = fixed_point, scaleMode = fixed_point>,
+        fpsu = #pim.fpsu_spec<mode = fixed2float>,
+        weightBinding = #pim.weight_binding<format = weight, role = model_weight, elemBits = 8>}
+       : tensor<1x4096xi8>, tensor<4096x32000xi8> -> tensor<1x32000xf16>
+    tt.return
+  }
+}

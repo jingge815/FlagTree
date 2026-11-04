@@ -557,8 +557,11 @@ static LogicalResult expandRope(RopeOp op) {
 
 static void stampMatmul(MatmulOp op) {
   // Accumulation for the matmul family runs on the 32-bit float FPSU
-  // (card value 2), unlike the phase pipelines which use value 1.
-  setFpsuSpec(op, 2);
+  // (card value 2), unlike the phase pipelines which use value 1. An explicit
+  // setting (the output head's fixed2float) is the operator's own numeric
+  // choice and is kept.
+  if (!op.getFpsuAttr())
+    setFpsuSpec(op, 2);
 
   auto act = op.getActivationAttr();
   if (!act)
