@@ -473,7 +473,8 @@ SpcSpg deriveHardwareAxes(QuantSpecAttr spec, HardwareBlock block) {
 LogicalResult
 PhaseSpecAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                       int64_t index, int64_t bytes, FunctionalUnit unit,
-                      bool forceConsecutive, ArrayAttr reads) {
+                      bool forceConsecutive, ArrayAttr reads, bool perBlock,
+                      int64_t poolBytes) {
   if (index < 0)
     return emitError() << "phase index must be non-negative; got " << index;
 
@@ -497,6 +498,16 @@ PhaseSpecAttr::verify(function_ref<InFlightDiagnostic()> emitError,
                            << "; reads must name a strictly earlier phase";
     }
   }
+
+  // The pool is read once per KV block, so a pool read outside the block loop
+  // describes traffic nothing schedules -- and a cost model would bill it once.
+  if (poolBytes < 0)
+    return emitError() << "phase poolBytes must be non-negative; got "
+                       << poolBytes;
+  if (poolBytes > 0 && !perBlock)
+    return emitError() << "phase " << index
+                       << " reads the KV pool but is not perBlock; pool reads "
+                          "happen once per history block";
 
   return success();
 }

@@ -327,11 +327,20 @@ def TTPIM_PhaseSpecAttr : TritonPIM_Attr<"PhaseSpec", "phase_spec"> {
     so a self-reference or a forward reference would describe a cycle the
     hardware cannot schedule.
 
+    `perBlock` marks a phase that runs inside the KV-block loop -- once per
+    history block rather than once per operator. The trip count is a run-time
+    quantity (the request's history length), so it is not recorded here.
+
+    `poolBytes` is what one such traversal reads from the KV slot pool, K block
+    or V block. It is separate from `bytes` because the pool is not the
+    operator's own buffer, and only a `perBlock` phase can read it.
+
     Example:
 
     ```mlir
     phases = [#pim.phase_spec<index = 0, bytes = 64, unit = vpu>]
     #pim.phase_spec<index = 1, bytes = 64, unit = activation, reads = [0]>
+    #pim.phase_spec<index = 2, bytes = 2048, unit = nmu, perBlock = true, poolBytes = 4096>
     ```
   }];
 
@@ -340,7 +349,9 @@ def TTPIM_PhaseSpecAttr : TritonPIM_Attr<"PhaseSpec", "phase_spec"> {
     "int64_t":$bytes,
     EnumParameter<TTPIM_FunctionalUnit>:$unit,
     DefaultValuedParameter<"bool", "false">:$forceConsecutive,
-    OptionalParameter<"::mlir::ArrayAttr">:$reads
+    OptionalParameter<"::mlir::ArrayAttr">:$reads,
+    DefaultValuedParameter<"bool", "false">:$perBlock,
+    DefaultValuedParameter<"int64_t", "0">:$poolBytes
   );
 
   let assemblyFormat = "`<` struct(params) `>`";
