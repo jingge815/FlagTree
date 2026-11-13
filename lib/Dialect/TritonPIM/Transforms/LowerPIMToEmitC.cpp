@@ -1692,8 +1692,15 @@ struct TritonPIMLowerToEmitCPass
       });
     };
 
-    // 1. 遍历输出块，总数清零。
-    emitFor(b, loc, 0, m / tm, [&](OpBuilder &mb, Value mt) {
+    // 1. 按 tasklet 切 M 的输出块；块内临时缓冲顺序复用。
+    int64_t mTiles = m / tm;
+    int64_t tilesPerTasklet = (mTiles + numTasklets - 1) / numTasklets;
+    for (int64_t tid = 0; tid < numTasklets; ++tid) {
+      int64_t tileStart = tid * tilesPerTasklet;
+      if (tileStart >= mTiles)
+        break;
+      int64_t tileEnd = std::min(tileStart + tilesPerTasklet, mTiles);
+      emitFor(b, loc, tileStart, tileEnd, [&](OpBuilder &mb, Value mt) {
       emitFor(mb, loc, 0, n / tn, [&](OpBuilder &nb, Value nt) {
         fill(nb, total);
         // 2. 逐组：组内按 K 块分段累加，组边界反量化后折进总数。
@@ -1733,7 +1740,8 @@ struct TritonPIMLowerToEmitCPass
                     applyActivation(ob, loc, mm, loadFlat(ob, loc, total, e)));
         });
       });
-    });
+      });
+    }
     return success();
   }
 
@@ -2248,7 +2256,13 @@ struct TritonPIMLowerToEmitCPass
                                 grouped, guard, lhs, rhs, scales, dst,
                                 temporaries);
 
-      emitFor(b, loc, 0, m, [&](OpBuilder &mb, Value mi) {
+      int64_t rowsPerTasklet = (m + numTasklets - 1) / numTasklets;
+      for (int64_t tid = 0; tid < numTasklets; ++tid) {
+        int64_t rowStart = tid * rowsPerTasklet;
+        if (rowStart >= m)
+          break;
+        int64_t rowEnd = std::min(rowStart + rowsPerTasklet, m);
+        emitFor(b, loc, rowStart, rowEnd, [&](OpBuilder &mb, Value mi) {
         emitFor(mb, loc, 0, n, [&](OpBuilder &nb, Value ni) {
           Value total = nb.create<emitc::VariableOp>(
               loc, emitc::LValueType::get(f32),
@@ -2318,7 +2332,8 @@ struct TritonPIMLowerToEmitCPass
                     applyActivation(nb, loc, op,
                                     nb.create<emitc::LoadOp>(loc, f32, total)));
         });
-      });
+        });
+      }
       return success();
     }
 
